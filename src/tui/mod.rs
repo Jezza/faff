@@ -1,0 +1,950 @@
+//! The faf dashboard TUI: unified revision view, browse/session modes, and the
+//! orchestration actions. See spec §11. Pure logic lives in the submodules
+//! (input, session, model); this file is the app state, event loop, and
+//! rendering glue.
+
+mod input;
+mod model;
+mod session;
+
+use crate::domain::{Autonomy, Task, TaskId, TaskStatus};
+use crate::graph::{self, GraphRow};
+use crate::store::Store;
+use crate::{config, events, jj, title, wezterm, workspace};
+use anyhow::{Context, Result};
+use input::Action;
+use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind};
+use ratatui::crossterm::{execute, terminal};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::{Frame, Terminal};
+use std::io::{Stdout, stdout};
+use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
+
+type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
+
+/// Fixed display width of the change-id column (jj pads its shortest id to 8).
+const ID_W: usize = 8;
+
+/// Entry point for the `Tui` command.
+pub fn run(repo: Option<PathBuf>) -> Result<()> {
+    let repo = resolve_repo(repo)?;
+    let mut app = App::new(repo)?;
+    install_panic_hook();
+    let mut term = setup_terminal()?;
+    let result = app.event_loop(&mut term);
+    restore_terminal(&mut term)?;
+    result
+}
+
+/// Restore the terminal on panic before the default hook prints, so a crash on the
+/// render/event hot path never leaves the terminal in raw mode + alternate screen.
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(stdout(), terminal::LeaveAlternateScreen);
+        prev(info);
+    }));
+}
+
+/// Resolve the master repo root: explicit path, else discover from the cwd via jj.
+fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(r) = repo {
+        return Ok(r);
+    }
+    // `jj workspace root` from the cwd finds the repo root.
+    let out = std::process::Command::new("jj")
+        .args(["workspace", "root"])
+        .output()
+        .context("running jj workspace root")?;
+    if out.status.success() {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    std::env::current_dir().context("getting current dir")
+}
+
+fn setup_terminal() -> Result<Term> {
+    terminal::enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, terminal::EnterAlternateScreen)?;
+    let term = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
+    Ok(term)
+}
+
+fn restore_terminal(term: &mut Term) -> Result<()> {
+    terminal::disable_raw_mode()?;
+    execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
+    term.show_cursor()?;
+    Ok(())
+}
+
+struct App {
+    repo: PathBuf,
+    faf_exe: PathBuf,
+    socket: PathBuf,
+    db: PathBuf,
+    store: Store,
+    events_rx: Receiver<events::Event>,
+    title_tx: Sender<(TaskId, String)>,
+    title_rx: Receiver<(TaskId, String)>,
+    faf_pane: Option<u64>,
+
+    // View state (owned; recomputed on refresh).
+    tasks: Vec<Task>,
+    rows: Vec<GraphRow>,
+    task_of_node: Vec<Option<TaskId>>,
+    task_order: Vec<TaskId>,
+    /// Live tasks with no distinct graph node (workspace inlined into master, or a
+    /// stale row). Still selectable/removable; shown in a "detached" footer list.
+    detached: Vec<TaskId>,
+    selected: usize,
+    open_pane: Option<u64>,
+    /// change_id -> (unique prefix, padding rest) for the id column, from jj.
+    id_display: std::collections::HashMap<String, (String, String)>,
+    /// Tasks a title job has already been dispatched for (avoid re-dispatching).
+    title_requested: std::collections::HashSet<TaskId>,
+    status: String,
+    should_quit: bool,
+    last_refresh: Instant,
+    /// Set when an event/title arrived; coalesces bursts into a throttled refresh.
+    pending_refresh: bool,
+}
+
+impl App {
+    fn new(repo: PathBuf) -> Result<App> {
+        let db = config::db_path(&repo)?;
+        let store = Store::open(&db)?;
+        let socket = events::socket_path(&repo);
+        let events_rx = events::spawn_listener(&socket)?;
+        let (title_tx, title_rx) = channel();
+        let faf_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faf"));
+        let faf_pane = std::env::var("WEZTERM_PANE")
+            .ok()
+            .and_then(|s| s.parse().ok());
+
+        let mut app = App {
+            repo,
+            faf_exe,
+            socket,
+            db,
+            store,
+            events_rx,
+            title_tx,
+            title_rx,
+            faf_pane,
+            tasks: Vec::new(),
+            rows: Vec::new(),
+            task_of_node: Vec::new(),
+            task_order: Vec::new(),
+            detached: Vec::new(),
+            selected: 0,
+            open_pane: None,
+            id_display: std::collections::HashMap::new(),
+            title_requested: std::collections::HashSet::new(),
+            status: "ready".to_string(),
+            should_quit: false,
+            last_refresh: Instant::now(),
+            pending_refresh: false,
+        };
+        app.refresh();
+        Ok(app)
+    }
+
+    fn event_loop(&mut self, term: &mut Term) -> Result<()> {
+        // Rebuilding the graph shells out to jj/wezterm; throttle it. Idle cadence is
+        // ~1s; a pending event refreshes sooner but no more often than min_gap, so a
+        // chatty agent can't drive unbounded subprocess churn.
+        let idle = Duration::from_millis(1000);
+        let min_gap = Duration::from_millis(400);
+        while !self.should_quit {
+            term.draw(|f| self.render(f))?;
+            if self.drain_channels() {
+                self.pending_refresh = true;
+            }
+            if event::poll(Duration::from_millis(250))?
+                && let CtEvent::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key);
+            }
+            let elapsed = self.last_refresh.elapsed();
+            if elapsed >= idle || (self.pending_refresh && elapsed >= min_gap) {
+                self.refresh();
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain the socket nudge channel and completed title jobs. Hook events are
+    /// persisted to the store by `report-event` itself, so socket messages are only
+    /// refresh nudges here (not re-applied). Returns whether anything arrived.
+    fn drain_channels(&mut self) -> bool {
+        let mut any = false;
+        while self.events_rx.try_recv().is_ok() {
+            any = true; // report-event already wrote the store; just nudge a refresh
+        }
+        while let Ok((id, title)) = self.title_rx.try_recv() {
+            any = true;
+            let _ = self.store.set_title(id, &title);
+            // Reflect the title on the agent's WezTerm tab too.
+            if let Ok(t) = self.store.get_task(id)
+                && let Some(pane) = t.pane_id
+            {
+                let _ = wezterm::set_tab_title(pane, &format!("#{} {title}", id.0));
+            }
+        }
+        any
+    }
+
+    fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        match input::map_key(key) {
+            Action::Quit => self.should_quit = true,
+            Action::Up => self.move_selection(-1),
+            Action::Down => self.move_selection(1),
+            Action::NewTask => self.new_task(),
+            Action::ToggleSession => self.toggle_session(),
+            Action::Remove => self.remove_selected(),
+            Action::None => {}
+        }
+    }
+
+    fn selected_task(&self) -> Option<Task> {
+        let id = self.task_order.get(self.selected)?;
+        self.tasks.iter().find(|t| &t.id == id).cloned()
+    }
+
+    /// The task whose agent pane is currently docked beside faf (the focused session).
+    fn open_task_id(&self) -> Option<TaskId> {
+        let open = self.open_pane?;
+        self.tasks
+            .iter()
+            .find(|t| t.pane_id == Some(open))
+            .map(|t| t.id)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.task_order.is_empty() {
+            return;
+        }
+        let n = self.task_order.len() as isize;
+        let cur = self.selected as isize;
+        self.selected = ((cur + delta).rem_euclid(n)) as usize;
+    }
+
+    // ---- orchestration actions ----
+
+    /// `n`: create an empty task, fork its workspace, spawn a bare `claude`, and open
+    /// it beside faf so the user types their task straight into the session. The task
+    /// prompt (and title) are captured later from the first UserPromptSubmit hook.
+    fn new_task(&mut self) {
+        match self.try_new_task() {
+            Ok(id) => {
+                self.status = format!("new task #{id} — type your task in the pane");
+            }
+            Err(e) => self.status = format!("new task failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    fn try_new_task(&mut self) -> Result<TaskId> {
+        let faf = self
+            .faf_pane
+            .context("run faf inside WezTerm to spawn agents")?;
+        let task = self.store.create_task("", 0, Autonomy::Inherit)?;
+        // Roll the row back if workspace prep fails (no invisible zombie).
+        if let Err(e) = self.prepare_workspace(task.id, "") {
+            let _ = self.store.delete_task(task.id);
+            return Err(e);
+        }
+        let t = self.store.get_task(task.id)?;
+        match self.spawn_claude(&t) {
+            Ok(pane) => {
+                let _ = self.store.set_pane(task.id, Some(pane));
+                // Awaiting the user's first prompt — literally needs their input.
+                let _ = self.store.update_status(task.id, TaskStatus::NeedsInput);
+                // Dock it beside faf (detaching any already-open session first) and
+                // focus it — a new task lands the user in the agent to type the task.
+                self.open_session(faf, pane, true);
+                Ok(task.id)
+            }
+            Err(e) => {
+                // Full rollback: tear the workspace back down and drop the row.
+                if let (Some(n), Some(p), Some(f)) = (&t.ws_name, &t.ws_path, &t.fork_point) {
+                    let _ = workspace::teardown(&self.repo, n, p, f);
+                }
+                let _ = self.store.delete_task(task.id);
+                Err(e)
+            }
+        }
+    }
+
+    fn prepare_workspace(&self, id: TaskId, prompt: &str) -> Result<()> {
+        let slug = config::slugify(prompt, 4);
+        let name = format!("faf-task-{}", id.0);
+        let path = config::task_workspace_dir(&self.repo, id.0, &slug)?;
+        let ws = workspace::create(&self.repo, &name, &path)?;
+        // The workspace now exists on disk + in jj. If recording it fails, tear it
+        // back down so we don't leak an untracked jj workspace (the DB row is rolled
+        // back separately by the caller).
+        if let Err(e) =
+            self.store
+                .set_workspace(id, &ws.name, &ws.path, &ws.change_id, &ws.fork_point)
+        {
+            let _ = workspace::teardown(&self.repo, &ws.name, &ws.path, &ws.fork_point);
+            return Err(e);
+        }
+        // Best-effort: memory seed, hook injection, and pre-trust the workspace dir
+        // so the agent doesn't hit the "trust this folder?" dialog on spawn.
+        let _ = workspace::seed_memory(&workspace::claude_projects_dir(), &self.repo, &ws.path);
+        let _ = workspace::write_hooks(&ws.path, id.0, &self.faf_exe, &self.socket, &self.db);
+        let _ = workspace::trust_workspace(&ws.path);
+        Ok(())
+    }
+
+    /// Launch a `claude` pane in the task's workspace and title its tab. A task created
+    /// via `n` spawns bare so the user types the task live; the prompt is passed as the
+    /// initial message only if the task already has one. `--permission-mode` is passed
+    /// only for an explicit override — otherwise the user's own default (e.g.
+    /// `permissions.defaultMode=auto`) is inherited.
+    fn spawn_claude(&self, t: &Task) -> Result<u64> {
+        let ws_path = t.ws_path.clone().context("task has no workspace")?;
+        let mut prog: Vec<&str> = vec!["claude"];
+        if let Some(mode) = t.autonomy.permission_mode() {
+            prog.push("--permission-mode");
+            prog.push(mode);
+        }
+        if !t.prompt.is_empty() {
+            prog.push(&t.prompt);
+        }
+        let pane = wezterm::spawn(&ws_path, &prog)?;
+        let _ = wezterm::set_tab_title(pane, &format!("#{} {}", t.id.0, t.label()));
+        // `wezterm cli spawn` activates the new tab, stealing focus from faf. Return
+        // focus to faf so spawning an agent never yanks the user out of the TUI (a new
+        // task re-focuses its own pane afterward — see open_session).
+        if let Some(faf) = self.faf_pane {
+            let _ = wezterm::activate_pane(faf);
+        }
+        Ok(pane)
+    }
+
+    /// Dock `pane` beside faf, ensuring only one session is ever docked: any
+    /// currently-open session is detached first. Idempotent if `pane` is already open.
+    /// `focus` decides where the cursor lands: a new task focuses its fresh agent so
+    /// the user can type the task straight away; every other dock leaves focus on faf
+    /// (the user swaps with their own WezTerm keybinds).
+    fn open_session(&mut self, faf: u64, pane: u64, focus: bool) {
+        if let Some(prev) = self.open_pane
+            && prev != pane
+        {
+            let _ = wezterm::detach(prev);
+        }
+        if wezterm::open_beside(faf, pane).is_ok() {
+            self.open_pane = Some(pane);
+            // open_beside activates the moved pane; set focus explicitly either way.
+            let _ = wezterm::activate_pane(if focus { pane } else { faf });
+        }
+    }
+
+    fn toggle_session(&mut self) {
+        let selected_pane = self.selected_task().and_then(|t| t.pane_id);
+        let Some(faf) = self.faf_pane else {
+            self.status = "no WEZTERM_PANE; run faf inside WezTerm".to_string();
+            return;
+        };
+        match session::decide(self.open_pane, selected_pane) {
+            session::Toggle::Nothing => self.status = "no session for this task".to_string(),
+            // Open and Retarget both route through open_session (which detaches any
+            // currently-docked session first).
+            session::Toggle::Open(p) | session::Toggle::Retarget { open: p, .. } => {
+                // Docking to view an existing agent keeps focus on faf.
+                self.open_session(faf, p, false)
+            }
+            session::Toggle::Detach(p) => {
+                if wezterm::detach(p).is_ok() {
+                    self.open_pane = None;
+                    // Ejecting the pane to a new tab activates it; stay on faf.
+                    let _ = wezterm::activate_pane(faf);
+                }
+            }
+        }
+    }
+
+    /// Remove the selected task: kill its pane, tear down its jj workspace, and drop the
+    /// row from the store. There is no archive/history — a removed task is gone.
+    fn remove_selected(&mut self) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        if let Some(p) = t.pane_id {
+            if self.open_pane == Some(p) {
+                self.open_pane = None;
+            }
+            let _ = wezterm::kill_pane(p);
+        }
+        if let (Some(name), Some(path), Some(fork)) =
+            (t.ws_name.clone(), t.ws_path.clone(), t.fork_point.clone())
+        {
+            let _ = workspace::teardown(&self.repo, &name, &path, &fork);
+        }
+        let _ = self.store.delete_task(t.id);
+        self.status = format!("removed #{}", t.id.0);
+        self.refresh();
+    }
+
+    /// Kick off the async title job for any task that has a prompt (captured from its
+    /// first UserPromptSubmit) but no title yet — once per task.
+    fn maybe_generate_titles(&mut self) {
+        for t in &self.tasks {
+            if t.title.is_none()
+                && !t.prompt.trim().is_empty()
+                && !self.title_requested.contains(&t.id)
+            {
+                self.title_requested.insert(t.id);
+                title::spawn_title_job(t.id, t.prompt.clone(), self.title_tx.clone());
+            }
+        }
+    }
+
+    // ---- refresh (recompute view from store + jj) ----
+
+    fn refresh(&mut self) {
+        self.pending_refresh = false;
+        // Preserve the selected task by identity across the rebuild.
+        let prev_selected = self.task_order.get(self.selected).copied();
+
+        self.tasks = self.store.list_tasks().unwrap_or_default();
+
+        // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
+        let ws_list = jj::workspace_list(&self.repo).ok();
+
+        // Heal orphans so stale rows don't linger forever or misreport their status.
+        let panes = wezterm::list().ok();
+        if let Some(p) = &panes {
+            self.reconcile_panes(p);
+        }
+        if let Some(ws) = &ws_list {
+            self.reconcile_workspaces(ws);
+        }
+        // Reload to reflect any status changes the reconcile passes made.
+        self.tasks = self.store.list_tasks().unwrap_or_default();
+
+        // Recover which agent (if any) is already docked beside faf. Derived from the
+        // live layout each refresh, so a restart — where `open_pane` starts `None` —
+        // doesn't leave faf blind to an already-docked session and re-open (double) it.
+        if let Some(p) = &panes {
+            self.open_pane = self.detect_open_pane(p);
+        }
+
+        // Generate titles for tasks that captured a prompt but have no title yet.
+        self.maybe_generate_titles();
+
+        // Build the revision graph from the (already-fetched) workspace list.
+        if let Some(ws) = &ws_list {
+            match self.build_rows(ws) {
+                Ok((rows, task_of, id_display)) => {
+                    self.rows = rows;
+                    self.task_of_node = task_of;
+                    self.id_display = id_display;
+                }
+                Err(e) => self.status = format!("jj error: {e}"),
+            }
+        }
+
+        // Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
+        // appear as graph nodes first (in graph order), then any detached tasks
+        // (workspace inlined into master, or otherwise not a distinct node). This keeps
+        // every task selectable/removable even after its change is integrated.
+        let graph_tasks: Vec<TaskId> = self.task_of_node.iter().flatten().copied().collect();
+        let in_graph: std::collections::HashSet<TaskId> = graph_tasks.iter().copied().collect();
+        self.detached = self
+            .tasks
+            .iter()
+            .filter(|t| !in_graph.contains(&t.id))
+            .map(|t| t.id)
+            .collect();
+        self.task_order = graph_tasks;
+        self.task_order.extend(self.detached.iter().copied());
+
+        self.selected = prev_selected
+            .and_then(|id| self.task_order.iter().position(|x| *x == id))
+            .unwrap_or_else(|| self.selected.min(self.task_order.len().saturating_sub(1)));
+        self.last_refresh = Instant::now();
+    }
+
+    /// Heal orphaned tasks so their status stays honest. Both cases below are flipped
+    /// back to `Idle` (and any dead pane cleared):
+    /// - a task whose agent pane has vanished (finished/died while we weren't looking);
+    /// - a `Working` task that never got a pane (its `wezterm spawn` failed).
+    fn reconcile_panes(&self, panes: &[wezterm::Pane]) {
+        let alive: std::collections::HashSet<u64> = panes.iter().map(|p| p.pane_id).collect();
+        for t in &self.tasks {
+            match t.pane_id {
+                Some(p) if !alive.contains(&p) => {
+                    let _ = self.store.set_pane(t.id, None);
+                    let _ = self.store.update_status(t.id, TaskStatus::Idle);
+                }
+                None if matches!(t.status, TaskStatus::Working | TaskStatus::NeedsInput) => {
+                    // Working/NeedsInput imply a running agent, but there's no pane —
+                    // a failed spawn. Park it as Idle.
+                    let _ = self.store.update_status(t.id, TaskStatus::Idle);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Derive which agent pane (if any) is currently docked beside faf: a known task
+    /// pane that shares faf's WezTerm tab (that is how `open_beside` docks it). This
+    /// lets faf recover the docked session after a restart — when `open_pane` starts
+    /// `None` — instead of treating Enter as a fresh open and spawning a duplicate
+    /// split. An agent detached to its own tab, or a non-agent pane, is not "open".
+    fn detect_open_pane(&self, panes: &[wezterm::Pane]) -> Option<u64> {
+        let faf = self.faf_pane?;
+        let faf_tab = panes.iter().find(|p| p.pane_id == faf)?.tab_id;
+        let agent_panes: std::collections::HashSet<u64> =
+            self.tasks.iter().filter_map(|t| t.pane_id).collect();
+        panes
+            .iter()
+            .find(|p| p.tab_id == faf_tab && p.pane_id != faf && agent_panes.contains(&p.pane_id))
+            .map(|p| p.pane_id)
+    }
+
+    /// Drop tasks whose jj workspace has vanished (integrated + cleaned, or forgotten
+    /// outside faf): the workspace is gone, so the task is done — remove it. Keeps the
+    /// active list honest. Only runs with an authoritative workspace list.
+    fn reconcile_workspaces(&self, workspaces: &[jj::Workspace]) {
+        let live: std::collections::HashSet<&str> =
+            workspaces.iter().map(|w| w.name.as_str()).collect();
+        for t in &self.tasks {
+            if let Some(name) = &t.ws_name
+                && !live.contains(name.as_str())
+            {
+                if let Some(p) = &t.ws_path {
+                    let _ = std::fs::remove_dir_all(p); // best-effort dir cleanup
+                }
+                let _ = self.store.delete_task(t.id);
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn build_rows(
+        &self,
+        workspaces: &[jj::Workspace],
+    ) -> Result<(
+        Vec<GraphRow>,
+        Vec<Option<TaskId>>,
+        std::collections::HashMap<String, (String, String)>,
+    )> {
+        let mut heads: Vec<String> = workspaces.iter().map(|w| w.change_id.clone()).collect();
+        heads.push("@".to_string());
+        let revset = format!("ancestors({}, 25)", heads.join(" | "));
+        let mut revs = jj::log(&self.repo, &revset)?;
+        // Master's `@` always leads the log; agent branches sit alongside below.
+        model::pin_current_wc_first(&mut revs);
+        // change_id -> (unique prefix, padding rest) for the id column.
+        let id_display = revs
+            .iter()
+            .map(|r| {
+                (
+                    r.change_id.clone(),
+                    (r.id_prefix.clone(), r.id_rest.clone()),
+                )
+            })
+            .collect();
+        let m = model::build(&revs, workspaces, &self.tasks);
+        let rows = graph::render(&m.nodes);
+        // task_of is parallel to rows: a commit row carries its task id, others None.
+        let task_of: Vec<Option<TaskId>> = rows
+            .iter()
+            .map(|r| {
+                r.node_index
+                    .and_then(|i| m.task_of.get(i).copied().flatten())
+            })
+            .collect();
+        Ok((rows, task_of, id_display))
+    }
+
+    // ---- rendering ----
+
+    fn render(&self, f: &mut Frame) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+        self.render_header(f, chunks[0]);
+        self.render_body(f, chunks[1]);
+        self.render_footer(f, chunks[2]);
+    }
+
+    fn render_header(&self, f: &mut Frame, area: Rect) {
+        let working = self
+            .tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Working)
+            .count();
+        let session = match self.open_task_id() {
+            Some(id) => format!(" · ▶ #{}", id.0),
+            None => String::new(),
+        };
+        let text = format!(
+            " faf · {} · {working} working{session} ",
+            self.repo
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED)),
+            area,
+        );
+    }
+
+    fn render_body(&self, f: &mut Frame, area: Rect) {
+        // The revision graph is the whole body: when a session is docked WezTerm owns
+        // the right half (the real claude pane) beside faf's narrowed area, and when
+        // browsing the graph simply uses the full width.
+        self.render_graph(f, area);
+    }
+
+    fn render_graph(&self, f: &mut Frame, area: Rect) {
+        let selected = self.task_order.get(self.selected).copied();
+        let open = self.open_task_id();
+        let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len());
+        // Width of the "[abcdefgh] " id column, so continuation lines align under content.
+        let id_col = ID_W + 3;
+        for (i, row) in self.rows.iter().enumerate() {
+            let row_task = self.task_of_node.get(i).copied().flatten();
+            let is_sel = selected.is_some() && row_task == selected;
+            let base = if is_sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let mut spans: Vec<Span> = Vec::new();
+            match &row.change_id {
+                // Node row: gutter + [id] + content, with the unique prefix highlighted.
+                Some(cid) => {
+                    spans.push(Span::styled(format!("{}  ", row.gutter), base));
+                    let (prefix, rest) = self
+                        .id_display
+                        .get(cid)
+                        .cloned()
+                        .unwrap_or_else(|| (cid.chars().take(ID_W).collect(), String::new()));
+                    spans.push(Span::styled("[", base.fg(Color::DarkGray)));
+                    spans.push(Span::styled(
+                        prefix,
+                        base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(rest, base.fg(Color::DarkGray)));
+                    spans.push(Span::styled("] ", base.fg(Color::DarkGray)));
+                    spans.push(Span::styled(row.content.clone(), base));
+                    // Marker for the currently-docked (focused) session.
+                    if row_task.is_some() && row_task == open {
+                        spans.push(Span::styled(
+                            "  ▶",
+                            base.fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                }
+                // Link row (no content): gutter only.
+                None if row.content.is_empty() => {
+                    spans.push(Span::styled(row.gutter.clone(), base));
+                }
+                // Continuation row: gutter + id-column padding + content (aligned).
+                None => {
+                    spans.push(Span::styled(
+                        format!("{}  {}", row.gutter, " ".repeat(id_col)),
+                        base,
+                    ));
+                    spans.push(Span::styled(row.content.clone(), base));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        // Detached tasks (workspace inlined into master, or a stale row) have no
+        // distinct node — list them below so they stay visible and selectable.
+        if !self.detached.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "── detached (integrated / no node) ──",
+                Style::default().fg(Color::DarkGray),
+            )));
+            for id in &self.detached {
+                if let Some(t) = self.tasks.iter().find(|t| &t.id == id) {
+                    let (icon, _) = model::status_label(t.status);
+                    let text = format!("· #{} {} {icon}", t.id.0, t.label());
+                    let style = if selected == Some(*id) {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    let mut spans = vec![Span::styled(text, style)];
+                    if open == Some(*id) {
+                        spans.push(Span::styled(
+                            "  ▶",
+                            style.fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+        }
+        let block = Block::default().borders(Borders::RIGHT).title("revisions");
+        f.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_footer(&self, f: &mut Frame, area: Rect) {
+        let selected_pane = self.selected_task().and_then(|t| t.pane_id);
+        let enter = if self.open_pane.is_some() && self.open_pane == selected_pane {
+            "[↵]detach"
+        } else {
+            "[↵]open"
+        };
+        let keys = format!(" [n]ew {enter} [x]remove [q]uit   {}", self.status);
+        f.render_widget(
+            Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    // Build a minimal App with an in-memory store (no jj/wezterm needed).
+    fn test_app() -> App {
+        let (title_tx, title_rx) = channel();
+        let (_ev_tx, events_rx) = channel();
+        App {
+            repo: PathBuf::from("/tmp/repo"),
+            faf_exe: PathBuf::from("/bin/faf"),
+            socket: PathBuf::from("/tmp/faf.sock"),
+            db: PathBuf::from("/tmp/faf.db"),
+            store: Store::open_memory().unwrap(),
+            events_rx,
+            title_tx,
+            title_rx,
+            faf_pane: Some(1),
+            tasks: Vec::new(),
+            rows: Vec::new(),
+            task_of_node: Vec::new(),
+            task_order: Vec::new(),
+            detached: Vec::new(),
+            selected: 0,
+            open_pane: None,
+            id_display: std::collections::HashMap::new(),
+            title_requested: std::collections::HashSet::new(),
+            status: "ready".into(),
+            should_quit: false,
+            pending_refresh: false,
+            last_refresh: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn header_and_footer_render_without_panicking() {
+        let mut app = test_app();
+        app.tasks = vec![
+            app.store
+                .create_task("do a thing", 0, Autonomy::AcceptEdits)
+                .unwrap(),
+        ];
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        // If we got here, layout + widgets rendered without panic.
+    }
+
+    #[test]
+    fn reconcile_heals_orphaned_panes_to_idle() {
+        let app = test_app();
+        // Task A: Working with a pane that is still alive.
+        let a = app
+            .store
+            .create_task("a", 0, Autonomy::AcceptEdits)
+            .unwrap();
+        app.store.set_pane(a.id, Some(10)).unwrap();
+        app.store.update_status(a.id, TaskStatus::Working).unwrap();
+        // Task B: Working with a pane that has vanished.
+        let b = app
+            .store
+            .create_task("b", 0, Autonomy::AcceptEdits)
+            .unwrap();
+        app.store.set_pane(b.id, Some(99)).unwrap();
+        app.store.update_status(b.id, TaskStatus::Working).unwrap();
+        // Task C: Working but never got a pane (a failed spawn).
+        let c = app
+            .store
+            .create_task("c", 0, Autonomy::AcceptEdits)
+            .unwrap();
+        app.store.update_status(c.id, TaskStatus::Working).unwrap();
+
+        let mut app = app;
+        app.tasks = app.store.list_tasks().unwrap();
+
+        // Only pane 10 is alive.
+        let panes = vec![wezterm::Pane {
+            window_id: 1,
+            tab_id: 1,
+            pane_id: 10,
+            workspace: String::new(),
+            title: String::new(),
+            cwd: String::new(),
+        }];
+        app.reconcile_panes(&panes);
+
+        // A stays Working (pane alive); B healed (dead pane); C healed (no pane).
+        assert_eq!(
+            app.store.get_task(a.id).unwrap().status,
+            TaskStatus::Working
+        );
+        let b2 = app.store.get_task(b.id).unwrap();
+        assert_eq!(b2.status, TaskStatus::Idle);
+        assert_eq!(b2.pane_id, None);
+        assert_eq!(app.store.get_task(c.id).unwrap().status, TaskStatus::Idle);
+    }
+
+    #[test]
+    fn graph_renders_id_column_with_prefix() {
+        let mut app = test_app();
+        app.rows = vec![graph::GraphRow {
+            gutter: "@".into(),
+            content: "master (you)".into(),
+            node_index: Some(0),
+            change_id: Some("abcd1234efgh".into()),
+        }];
+        app.task_of_node = vec![None];
+        app.id_display = std::collections::HashMap::from([(
+            "abcd1234efgh".to_string(),
+            ("ab".to_string(), "cd1234".to_string()),
+        )]);
+
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("[abcd1234]"),
+            "id column with padded id: {text:?}"
+        );
+        assert!(text.contains("master (you)"));
+    }
+
+    #[test]
+    fn focused_session_is_marked_in_graph_and_header() {
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store.set_pane(t.id, Some(77)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.open_pane = Some(77); // this agent is docked beside faf
+        app.rows = vec![graph::GraphRow {
+            gutter: "@".into(),
+            content: format!("#{} x", t.id.0),
+            node_index: Some(0),
+            change_id: Some("abcd1234".into()),
+        }];
+        app.task_of_node = vec![Some(t.id)];
+
+        let backend = TestBackend::new(90, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains('▶'), "focused marker on the row: {text:?}");
+        assert!(text.contains(&format!("#{}", t.id.0)));
+    }
+
+    #[test]
+    fn detects_docked_agent_pane_after_restart() {
+        fn pane(tab: u64, id: u64, title: &str) -> wezterm::Pane {
+            wezterm::Pane {
+                window_id: 1,
+                tab_id: tab,
+                pane_id: id,
+                workspace: String::new(),
+                title: title.into(),
+                cwd: String::new(),
+            }
+        }
+
+        let mut app = test_app(); // faf_pane = Some(1), open_pane = None (fresh start)
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap(); // persisted across the restart
+        app.tasks = app.store.list_tasks().unwrap();
+
+        // Agent docked in faf's tab (7) -> recovered as the open session.
+        let docked = vec![
+            pane(7, 1, "faf"),
+            pane(7, 42, "#1 x"),
+            pane(9, 99, "unrelated other-tab pane"),
+        ];
+        assert_eq!(app.detect_open_pane(&docked), Some(42));
+
+        // Agent detached to its own tab (8) -> nothing docked.
+        let detached = vec![pane(7, 1, "faf"), pane(8, 42, "#1 x")];
+        assert_eq!(app.detect_open_pane(&detached), None);
+
+        // A non-agent pane sharing faf's tab is ignored (not a known task pane).
+        let stray = vec![pane(7, 1, "faf"), pane(7, 500, "a shell")];
+        assert_eq!(app.detect_open_pane(&stray), None);
+    }
+
+    #[test]
+    fn reconcile_workspaces_removes_only_gone_ones() {
+        use std::path::Path;
+        let app = test_app();
+        // Task A: workspace still present in jj.
+        let a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(a.id, "faf-task-1", Path::new("/nope/1"), "c1", "f1")
+            .unwrap();
+        // Task B: workspace gone (forgotten externally / integrated + cleaned).
+        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(b.id, "faf-task-2", Path::new("/nope/2"), "c2", "f2")
+            .unwrap();
+        let mut app = app;
+        app.tasks = app.store.list_tasks().unwrap();
+
+        let live = vec![
+            jj::Workspace {
+                name: "default".into(),
+                change_id: "x".into(),
+            },
+            jj::Workspace {
+                name: "faf-task-1".into(),
+                change_id: "y".into(),
+            },
+        ];
+        app.reconcile_workspaces(&live);
+
+        // Present workspace stays; vanished workspace's task is dropped entirely.
+        assert!(app.store.try_get_task(a.id).unwrap().is_some());
+        assert!(app.store.try_get_task(b.id).unwrap().is_none());
+    }
+}
