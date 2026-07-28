@@ -26,7 +26,7 @@ pub struct Cli {
 pub enum Command {
     /// Run the dashboard TUI (default).
     Tui {
-        /// Path to the jj repo (master). Defaults to the current directory.
+        /// Path to the jj repo (HEAD). Defaults to the current directory.
         #[arg(long)]
         repo: Option<PathBuf>,
     },

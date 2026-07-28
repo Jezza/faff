@@ -191,7 +191,7 @@ mod tests {
         assert_eq!(revs[0].id_rest, "mqzmnk");
         assert_eq!(revs[0].description, "");
 
-        // master @ is the current working copy
+        // HEAD @ is the current working copy
         assert!(revs[1].is_current_wc);
 
         // the base commit carries its description and is flagged conflicted
@@ -202,7 +202,7 @@ mod tests {
         // root has no parents
         assert_eq!(revs[4].parents, Vec::<String>::new());
 
-        // master @ and task @ share the same parent (the fork-point)
+        // HEAD @ and task @ share the same parent (the fork-point)
         assert_eq!(revs[0].parents, revs[1].parents);
     }
 
@@ -268,22 +268,22 @@ mod tests {
         assert!(names.contains(&"faf-task-1"));
 
         // resolve @ == the default workspace's change_id
-        let master_at = resolve_change_id(&repo, "@").unwrap();
+        let head_at = resolve_change_id(&repo, "@").unwrap();
         let default_ws = workspaces.iter().find(|w| w.name == "default").unwrap();
-        assert_eq!(master_at, default_ws.change_id);
+        assert_eq!(head_at, default_ws.change_id);
 
-        // log(all()) contains both working copies; master @ and task @ share a parent
+        // log(all()) contains both working copies; HEAD @ and task @ share a parent
         let revs = log(&repo, "all()").unwrap();
-        let master = revs.iter().find(|r| r.is_current_wc).expect("master @");
+        let head = revs.iter().find(|r| r.is_current_wc).expect("HEAD @");
         let task_ws = workspaces.iter().find(|w| w.name == "faf-task-1").unwrap();
         let task = revs
             .iter()
             .find(|r| r.change_id == task_ws.change_id)
             .expect("task @ present in log");
         assert_eq!(
-            master.parents, task.parents,
-            "master and task must branch from the same frozen fork-point"
+            head.parents, task.parents,
+            "HEAD and task must branch from the same frozen fork-point"
         );
-        assert_eq!(master.parents.len(), 1);
+        assert_eq!(head.parents.len(), 1);
     }
 }

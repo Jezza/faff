@@ -52,7 +52,7 @@ fn install_panic_hook() {
     }));
 }
 
-/// Resolve the master repo root: explicit path, else discover from the cwd via jj.
+/// Resolve the HEAD repo root: explicit path, else discover from the cwd via jj.
 fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(r) = repo {
         return Ok(r);
@@ -102,7 +102,7 @@ struct App {
     rows: Vec<GraphRow>,
     task_of_node: Vec<Option<TaskId>>,
     task_order: Vec<TaskId>,
-    /// Live tasks with no distinct graph node (workspace inlined into master, or a
+    /// Live tasks with no distinct graph node (workspace inlined into HEAD, or a
     /// stale row). Still selectable/removable; shown in a "detached" footer list.
     detached: Vec<TaskId>,
     selected: usize,
@@ -460,7 +460,7 @@ impl App {
 
         // Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
         // appear as graph nodes first (in graph order), then any detached tasks
-        // (workspace inlined into master, or otherwise not a distinct node). This keeps
+        // (workspace inlined into HEAD, or otherwise not a distinct node). This keeps
         // every task selectable/removable even after its change is integrated.
         let graph_tasks: Vec<TaskId> = self.task_of_node.iter().flatten().copied().collect();
         let in_graph: std::collections::HashSet<TaskId> = graph_tasks.iter().copied().collect();
@@ -548,7 +548,7 @@ impl App {
         heads.push("@".to_string());
         let revset = format!("ancestors({}, 25)", heads.join(" | "));
         let mut revs = jj::log(&self.repo, &revset)?;
-        // Master's `@` always leads the log; agent branches sit alongside below.
+        // HEAD's `@` always leads the log; agent branches sit alongside below.
         model::pin_current_wc_first(&mut revs);
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
@@ -562,14 +562,9 @@ impl App {
             .collect();
         let m = model::build(&revs, workspaces, &self.tasks);
         let rows = graph::render(&m.nodes);
-        // task_of is parallel to rows: a commit row carries its task id, others None.
-        let task_of: Vec<Option<TaskId>> = rows
-            .iter()
-            .map(|r| {
-                r.node_index
-                    .and_then(|i| m.task_of.get(i).copied().flatten())
-            })
-            .collect();
+        // task_of is parallel to rows: which task (if any) each row represents. For the
+        // combined HEAD+agent node this hangs on the agent line, not the HEAD header.
+        let task_of = model::row_tasks(&rows, &m.nodes, &m.task_of);
         Ok((rows, task_of, id_display))
     }
 
@@ -637,7 +632,21 @@ impl App {
             match &row.change_id {
                 // Node row: gutter + [id] + content, with the unique prefix highlighted.
                 Some(cid) => {
-                    spans.push(Span::styled(format!("{}  ", row.gutter), base));
+                    // Color the working-copy glyph `@` green (bold), like jj log; every
+                    // other gutter character keeps the base style. Only the `@` node's
+                    // commit row ever carries `@`, and there is at most one.
+                    let gutter = format!("{}  ", row.gutter);
+                    match gutter.find('@') {
+                        Some(at) => {
+                            spans.push(Span::styled(gutter[..at].to_string(), base));
+                            spans.push(Span::styled(
+                                "@",
+                                base.fg(Color::Green).add_modifier(Modifier::BOLD),
+                            ));
+                            spans.push(Span::styled(gutter[at + 1..].to_string(), base));
+                        }
+                        None => spans.push(Span::styled(gutter, base)),
+                    }
                     let (prefix, rest) = self
                         .id_display
                         .get(cid)
@@ -670,11 +679,19 @@ impl App {
                         base,
                     ));
                     spans.push(Span::styled(row.content.clone(), base));
+                    // The combined HEAD+agent node hangs its task (and so its docked
+                    // marker) on the agent's continuation line, not the HEAD header row.
+                    if row_task.is_some() && row_task == open {
+                        spans.push(Span::styled(
+                            "  ▶",
+                            base.fg(Color::Green).add_modifier(Modifier::BOLD),
+                        ));
+                    }
                 }
             }
             lines.push(Line::from(spans));
         }
-        // Detached tasks (workspace inlined into master, or a stale row) have no
+        // Detached tasks (workspace inlined into HEAD, or a stale row) have no
         // distinct node — list them below so they stay visible and selectable.
         if !self.detached.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -823,7 +840,7 @@ mod tests {
         let mut app = test_app();
         app.rows = vec![graph::GraphRow {
             gutter: "@".into(),
-            content: "master (you)".into(),
+            content: "(no description set)".into(),
             node_index: Some(0),
             change_id: Some("abcd1234efgh".into()),
         }];
@@ -847,7 +864,15 @@ mod tests {
             text.contains("[abcd1234]"),
             "id column with padded id: {text:?}"
         );
-        assert!(text.contains("master (you)"));
+        assert!(text.contains("(no description set)"));
+        // The working-copy glyph `@` is rendered green, like jj log.
+        let buf = term.backend().buffer();
+        let at = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "@")
+            .expect("@ glyph rendered");
+        assert_eq!(at.fg, Color::Green, "working-copy `@` is green");
     }
 
     #[test]
@@ -877,6 +902,71 @@ mod tests {
             .collect();
         assert!(text.contains('▶'), "focused marker on the row: {text:?}");
         assert!(text.contains(&format!("#{}", t.id.0)));
+    }
+
+    #[test]
+    fn combined_node_marks_and_highlights_the_agent_line_not_head() {
+        // HEAD parked on the agent's revision: the `@` commit row is the HEAD header
+        // (its description) and the agent hangs beneath. row_tasks hangs the task on the
+        // agent line, so the docked `▶` marker lands there — never on the HEAD header.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store.set_pane(t.id, Some(55)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.open_pane = Some(55); // the agent is docked beside faf
+        app.rows = vec![
+            graph::GraphRow {
+                gutter: "@".into(),
+                content: "(no description set)".into(),
+                node_index: Some(0),
+                change_id: Some("x".into()),
+            },
+            graph::GraphRow {
+                gutter: "│".into(),
+                content: format!("↳ #{} x", t.id.0),
+                node_index: None,
+                change_id: None,
+            },
+            graph::GraphRow {
+                gutter: "│".into(),
+                content: "  ⚙ working · %55".into(),
+                node_index: None,
+                change_id: None,
+            },
+        ];
+        // What model::row_tasks produces for a combined node: task on the agent line.
+        app.task_of_node = vec![None, Some(t.id), None];
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        let (w, h) = (60usize, 12usize);
+        let backend = TestBackend::new(w as u16, h as u16);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let row_text = |y: usize| -> String {
+            (0..w).map(|x| buf.content[y * w + x].symbol()).collect()
+        };
+        let head_row = (0..h)
+            .find(|&y| row_text(y).contains("(no description set)"))
+            .expect("HEAD header row rendered");
+        let agent_row = (0..h)
+            .find(|&y| row_text(y).contains("↳ #"))
+            .expect("agent line rendered");
+        assert!(
+            row_text(agent_row).contains('▶'),
+            "docked marker rides the agent line"
+        );
+        assert!(
+            !row_text(head_row).contains('▶'),
+            "no marker on the HEAD header row"
+        );
+        // The agent line is the selected/highlighted one (reverse video), not HEAD.
+        let reversed = |y: usize| {
+            (0..w).any(|x| buf.content[y * w + x].modifier.contains(Modifier::REVERSED))
+        };
+        assert!(reversed(agent_row), "agent line is highlighted when selected");
+        assert!(!reversed(head_row), "HEAD header row is not highlighted");
     }
 
     #[test]
