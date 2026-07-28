@@ -29,15 +29,32 @@ pub struct WorkspaceInfo {
 ///
 /// Either way the fork point is non-empty and already has children, so it's frozen
 /// (staleness-safe). The caller supplies `name`/`path`.
-pub fn create(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
+/// The shared fork-point recipe (spec §5): the change_id of the newest non-empty
+/// ancestor of `@` to base new work on. Used by `create` (task creation) and by
+/// `refresh` (the `r`/`R` re-base).
+///
+/// - `freeze == true` (`n`, `r`): fork point = `heads(::@ ~ empty())`. When `@` *is*
+///   that commit (you have uncommitted content), `jj new` freezes it and advances HEAD,
+///   so the returned commit is stable / staleness-safe and your WIP goes to the agent.
+/// - `freeze == false` (`R`): fork point = `heads(::@- ~ empty())` — your parent line,
+///   the newest non-empty ancestor strictly below `@`. Never writes; WIP is excluded.
+pub fn resolve_fork_point(repo: &Path, freeze: bool) -> Result<String> {
+    if !freeze {
+        return jj::resolve_change_id(repo, "heads(::@- ~ empty())")
+            .context("resolving parent fork point");
+    }
     let at = jj::resolve_change_id(repo, "@").context("resolving @")?;
     let fork_point =
         jj::resolve_change_id(repo, "heads(::@ ~ empty())").unwrap_or_else(|_| at.clone());
-
     // Only advance HEAD when @ itself carries the content we're forking from.
     if fork_point == at {
         jj::new(repo).context("jj new (advancing HEAD)")?;
     }
+    Ok(fork_point)
+}
+
+pub fn create(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
+    let fork_point = resolve_fork_point(repo, true)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -64,6 +81,43 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
     let name = format!("faf-task-{task_id}");
     let path = config::task_workspace_dir(repo, task_id, slug)?;
     create(repo, &name, &path)
+}
+
+/// Outcome of computing a refresh (`r`/`R`) for an agent workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// The agent already sits on (a descendant of) the newest base — nothing to do.
+    AlreadyFresh,
+    /// Inject `prompt` into the agent; it rebases itself onto `base`. faff never runs
+    /// the rebase — the agent, which holds the live working copy, does, and resolves any
+    /// conflicts.
+    Rebase { base: String, prompt: String },
+}
+
+/// Compute how to refresh task workspace `ws_name` onto a newer base (the `r`/`R`
+/// feature). faff computes the base with the same recipe as `create` (`freeze` selects
+/// `r` vs `R` — see `resolve_fork_point`) and returns the prompt to inject; it does not
+/// touch the agent's revision itself.
+///
+/// Returns `AlreadyFresh` when the agent's head already descends from the base (`r`/`R`
+/// would be a no-op), mirroring how `swap` bails when there's nothing to trade.
+pub fn refresh(repo: &Path, ws_name: &str, freeze: bool) -> Result<Refresh> {
+    let base = resolve_fork_point(repo, freeze)?;
+    let agent_head = jj::workspace_list(repo)?
+        .into_iter()
+        .find(|w| w.name == ws_name)
+        .map(|w| w.change_id)
+        .with_context(|| format!("workspace {ws_name} not found"))?;
+    // Fresh already if `base` is an ancestor of (or equal to) the agent's head, i.e.
+    // `base` appears in `::agent_head` (ancestors of the head, inclusive).
+    if jj::any_revision(repo, &format!("{base} & ::{agent_head}"))? {
+        return Ok(Refresh::AlreadyFresh);
+    }
+    let prompt = format!(
+        "Your task's base has moved. Run: jj rebase -b @ -d {base} — \
+         then resolve any conflicts and continue your task."
+    );
+    Ok(Refresh::Rebase { base, prompt })
 }
 
 /// Retire a task workspace: forget it, delete its directory, and abandon its commits
@@ -844,6 +898,78 @@ mod tests {
         snapshot(&ws_path).unwrap();
 
         assert!(!empty(&head), "snapshot must fold the agent's edit into its @");
+    }
+
+    #[test]
+    fn resolve_fork_point_freeze_vs_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path()); // leaves @ empty on top of "base"
+        let base = jj::resolve_change_id(&repo, "@-").unwrap(); // the "base" content commit
+
+        // @ is empty: freeze returns the base content commit and does NOT advance HEAD.
+        let head_before = jj::resolve_change_id(&repo, "@").unwrap();
+        assert_eq!(resolve_fork_point(&repo, true).unwrap(), base);
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            head_before,
+            "no jj new when @ is empty"
+        );
+        // parent (R) resolves to the same base content commit here.
+        assert_eq!(resolve_fork_point(&repo, false).unwrap(), base);
+
+        // Give @ uncommitted WIP.
+        fs::write(repo.join("wip.txt"), "wip").unwrap();
+        let at_with_wip = jj::resolve_change_id(&repo, "@").unwrap();
+
+        // R (parent) skips @ itself, returns its parent (base), and never writes.
+        assert_eq!(resolve_fork_point(&repo, false).unwrap(), base);
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            at_with_wip,
+            "R does not advance HEAD"
+        );
+
+        // freeze (r) jj-news to freeze the WIP: returns the now-frozen @, HEAD advances.
+        assert_eq!(resolve_fork_point(&repo, true).unwrap(), at_with_wip);
+        assert_ne!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            at_with_wip,
+            "HEAD advanced past the frozen WIP"
+        );
+    }
+
+    #[test]
+    fn refresh_detects_fresh_then_computes_rebase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+
+        // Fork an agent off the current base.
+        let ws_path = tmp.path().join("ws").join("0001");
+        let info = create(&repo, "faf-task-1", &ws_path).unwrap();
+
+        // Right after creation the agent already descends from the newest base → no-op.
+        assert_eq!(
+            refresh(&repo, &info.name, false).unwrap(),
+            Refresh::AlreadyFresh
+        );
+
+        // Advance the user's line with a new content commit.
+        fs::write(repo.join("user2.txt"), "u2").unwrap();
+        jj(&repo, &cfg, &["commit", "-m", "user2"]);
+        let user2 = jj::resolve_change_id(&repo, "@-").unwrap();
+
+        // The agent (forked from the old base) is now stale → rebase onto user2, and the
+        // prompt carries the exact command faff hands the agent.
+        match refresh(&repo, &info.name, false).unwrap() {
+            Refresh::Rebase { base, prompt } => {
+                assert_eq!(base, user2);
+                assert!(
+                    prompt.contains(&format!("jj rebase -b @ -d {user2}")),
+                    "prompt missing exact command: {prompt}"
+                );
+            }
+            other => panic!("expected Rebase, got {other:?}"),
+        }
     }
 
     #[test]

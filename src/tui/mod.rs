@@ -121,6 +121,10 @@ struct App {
     /// Set to a task id after `s` on a *working* agent: the next key confirms the swap
     /// (another `s`) or cancels it (anything else). Guards yanking a live agent's files.
     pending_swap: Option<TaskId>,
+    /// Set to `(task, freeze)` after `r`/`R` on a *working* agent: the same key confirms
+    /// (a redirect prompt is disruptive mid-turn), anything else cancels. `freeze`
+    /// records which of `r` (true) / `R` (false) armed it.
+    pending_rebase: Option<(TaskId, bool)>,
 }
 
 impl App {
@@ -159,6 +163,7 @@ impl App {
             last_refresh: Instant::now(),
             pending_refresh: false,
             pending_swap: None,
+            pending_rebase: None,
         };
         app.refresh();
         Ok(app)
@@ -216,6 +221,19 @@ impl App {
             }
             return;
         }
+        // A pending rebase-confirmation swallows the next key: the *same* key (`r` or
+        // `R`) confirms, anything else cancels (a redirect prompt into a live agent is
+        // only sent on a deliberate re-press).
+        if let Some((id, freeze)) = self.pending_rebase.take() {
+            let confirmed = (freeze && action == Action::Rebase)
+                || (!freeze && action == Action::RebaseParent);
+            if confirmed {
+                self.perform_rebase(id, freeze);
+            } else {
+                self.status = "rebase cancelled".to_string();
+            }
+            return;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::Up => self.move_selection(-1),
@@ -226,6 +244,8 @@ impl App {
             Action::RemoveDiscard => self.remove_selected(true),
             Action::Swap => self.swap_selected(),
             Action::Snapshot => self.snapshot_selected(),
+            Action::Rebase => self.rebase_selected(true),
+            Action::RebaseParent => self.rebase_selected(false),
             Action::None => {}
         }
     }
@@ -481,6 +501,67 @@ impl App {
         match workspace::snapshot(&path) {
             Ok(()) => self.status = format!("snapshotted #{}", t.id.0),
             Err(e) => self.status = format!("snapshot failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    /// `r` / `R`: refresh the selected agent onto a newer base. faff computes the base
+    /// (the same fork-point recipe `create` uses) and injects a prompt telling the agent
+    /// to rebase *itself* — faff never runs `jj rebase`. `freeze == true` (`r`) freezes
+    /// your WIP first like `create`; `false` (`R`) uses your parent line, read-only. On a
+    /// working agent the first press only arms a confirmation (a redirect mid-turn is
+    /// disruptive); a second, matching press goes through (via `handle_key`).
+    fn rebase_selected(&mut self, freeze: bool) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        if t.ws_name.is_none() {
+            self.status = "no workspace to rebase for this task".to_string();
+            return;
+        }
+        if t.pane_id.is_none() {
+            self.status = "no live pane to send the rebase prompt to".to_string();
+            return;
+        }
+        // The UserPromptSubmit hook captures the *first* prompt as the task title. Before
+        // the user has sent one, an injected rebase prompt would become that title — so
+        // hold off until the task has a real prompt of its own.
+        if t.prompt.is_empty() {
+            self.status = "send the task its first prompt before rebasing".to_string();
+            return;
+        }
+        if t.status == TaskStatus::Working {
+            self.pending_rebase = Some((t.id, freeze));
+            let key = if freeze { "r" } else { "R" };
+            self.status = format!(
+                "#{} is working — press {key} to confirm rebase, any other key cancels",
+                t.id.0
+            );
+            return;
+        }
+        self.perform_rebase(t.id, freeze);
+    }
+
+    /// Compute the new base and inject the rebase prompt into the agent's pane (already
+    /// validated / confirmed). No-op when the agent is already on the latest base.
+    fn perform_rebase(&mut self, id: TaskId, freeze: bool) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let (Some(name), Some(pane)) = (t.ws_name.clone(), t.pane_id) else {
+            self.status = "no workspace/pane to rebase for this task".to_string();
+            return;
+        };
+        match workspace::refresh(&self.repo, &name, freeze) {
+            Ok(workspace::Refresh::AlreadyFresh) => {
+                self.status = format!("#{} is already on the latest base", id.0);
+            }
+            Ok(workspace::Refresh::Rebase { prompt, .. }) => match wezterm::send_text(pane, &prompt)
+            {
+                Ok(()) => self.status = format!("sent rebase to #{}", id.0),
+                Err(e) => self.status = format!("rebase send failed: {e}"),
+            },
+            Err(e) => self.status = format!("rebase failed: {e}"),
         }
         self.refresh();
     }
@@ -870,7 +951,7 @@ impl App {
             "[↵]open"
         };
         let keys = format!(
-            " [n]ew {enter} [s]wap [S]napshot [x]remove [X]remove+drop [q]uit   {}",
+            " [n]ew {enter} [s]wap [S]napshot [r]ebase [x]remove [X]remove+drop [q]uit   {}",
             self.status
         );
         f.render_widget(
@@ -912,6 +993,7 @@ mod tests {
             should_quit: false,
             pending_refresh: false,
             pending_swap: None,
+            pending_rebase: None,
             last_refresh: Instant::now(),
         }
     }
@@ -947,6 +1029,53 @@ mod tests {
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.pending_swap, None, "a non-s key cancels");
         assert_eq!(app.status, "swap cancelled");
+    }
+
+    #[test]
+    fn rebase_on_working_agent_arms_then_cancels() {
+        // `r` on a working agent must not send anything; it only arms a confirmation.
+        // A non-matching key then cancels and clears the pending state.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.rebase_selected(true);
+        assert_eq!(
+            app.pending_rebase,
+            Some((t.id, true)),
+            "first r arms the confirmation"
+        );
+        assert!(app.status.contains("press r to confirm"));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pending_rebase, None, "a non-r key cancels");
+        assert_eq!(app.status, "rebase cancelled");
+    }
+
+    #[test]
+    fn rebase_before_first_prompt_is_blocked() {
+        // Before the task has a prompt of its own, an injected rebase prompt would be
+        // captured as the task's title — so `r`/`R` refuses until a real prompt exists.
+        let mut app = test_app();
+        let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.rebase_selected(true);
+        assert_eq!(app.pending_rebase, None, "must not arm without a prompt");
+        assert!(app.status.contains("first prompt"), "status: {}", app.status);
     }
 
     #[test]

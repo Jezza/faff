@@ -19,6 +19,11 @@ pub enum Action {
     Swap,
     /// `S`: snapshot the selected agent's workspace (fold its edits into its `@`).
     Snapshot,
+    /// `r`: refresh the selected agent onto the latest fork point, freezing your WIP
+    /// first (like `create`). faff injects a rebase prompt; the agent does the rebase.
+    Rebase,
+    /// `R`: like `Rebase`, but base the agent on your parent line (read-only, WIP excluded).
+    RebaseParent,
     None,
 }
 
@@ -34,6 +39,8 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('X') => Action::RemoveDiscard,
         KeyCode::Char('s') => Action::Swap,
         KeyCode::Char('S') => Action::Snapshot,
+        KeyCode::Char('r') => Action::Rebase,
+        KeyCode::Char('R') => Action::RebaseParent,
         _ => Action::None,
     }
 }
@@ -65,6 +72,8 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('X'))), Action::RemoveDiscard);
         assert_eq!(map_key(k(KeyCode::Char('s'))), Action::Swap);
         assert_eq!(map_key(k(KeyCode::Char('S'))), Action::Snapshot);
+        assert_eq!(map_key(k(KeyCode::Char('r'))), Action::Rebase);
+        assert_eq!(map_key(k(KeyCode::Char('R'))), Action::RebaseParent);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }
