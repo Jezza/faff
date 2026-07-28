@@ -10,8 +10,11 @@ pub enum Action {
     NewTask,
     /// Enter: open / detach / retarget the selected task's session (toggle).
     ToggleSession,
-    /// Remove the task: kill its pane, tear down its workspace, drop it from faf.
+    /// `x`: remove the task — kill its pane, tear down its workspace, drop it from faf.
+    /// Real work on the revision is preserved (only an all-empty branch is abandoned).
     Remove,
+    /// `X` (Shift+x): remove the task *and* abandon its revision, discarding the work.
+    RemoveDiscard,
     /// `s`: swap HEAD's `@` with the selected agent's revision (trade checkouts).
     Swap,
     /// `S`: snapshot the selected agent's workspace (fold its edits into its `@`).
@@ -28,6 +31,7 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('n') => Action::NewTask,
         KeyCode::Enter => Action::ToggleSession,
         KeyCode::Char('x') => Action::Remove,
+        KeyCode::Char('X') => Action::RemoveDiscard,
         KeyCode::Char('s') => Action::Swap,
         KeyCode::Char('S') => Action::Snapshot,
         _ => Action::None,
@@ -58,6 +62,7 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('n'))), Action::NewTask);
         assert_eq!(map_key(k(KeyCode::Enter)), Action::ToggleSession);
         assert_eq!(map_key(k(KeyCode::Char('x'))), Action::Remove);
+        assert_eq!(map_key(k(KeyCode::Char('X'))), Action::RemoveDiscard);
         assert_eq!(map_key(k(KeyCode::Char('s'))), Action::Swap);
         assert_eq!(map_key(k(KeyCode::Char('S'))), Action::Snapshot);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
