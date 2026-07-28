@@ -18,7 +18,7 @@ faff does not review, rebase, or merge. Integration is yours, in your own jj.
 
 ```sh
 cargo build
-cargo test              # 75 tests; the workspace integration tests shell out to jj
+cargo test              # 89 tests; the workspace integration tests shell out to jj
 cargo clippy --all-targets
 ```
 
@@ -38,6 +38,8 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab |
 | `s` | swap: trade your `@` with the selected agent's revision |
 | `S` | snapshot the selected agent's workspace |
+| `r` | refresh: tell the agent to rebase onto the latest fork point (freezes your WIP first) |
+| `R` | refresh onto your parent line instead (read-only; your WIP excluded) |
 | `x` | remove the selected task (keeps its revision as history) |
 | `X` | remove the selected task *and* abandon its revision (discards the work) |
 | `q` | quit |
@@ -58,7 +60,7 @@ revisions                                      │ ┃   from postcard to JSON
 ○  [ntlpqxos] import                           │ ┃
 ── detached (integrated / no node) ──          │ ┃ >
 · #5 Add OAuth login ✓                         │ ┃
- [n]ew [↵]detach [s]wap [S]napshot [x]remove [X]remove+drop [q]uit   ready ┃
+ [n]ew [↵]detach [s]wap [S]napshot [r]ebase [x]remove [X]remove+drop [q]uit   ready ┃
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -107,6 +109,22 @@ asks you to confirm (the swap changes files under a live agent); a second `s` go
 `S` runs `jj util snapshot` on the selected agent's workspace, folding its uncommitted edits
 into its revision so they show up in the graph. Useful for watching an agent that doesn't
 snapshot on its own. `s` does this for you before a swap, too.
+
+### Refreshing an agent (`r` / `R`)
+
+Where `s` keeps an agent fresh by *adopting its work onto your line*, `r` keeps it fresh in
+place: it re-bases a running agent forward without moving anything into your repo. faff
+computes the new base — the same fork-point recipe `n` uses, `heads(::@ ~ empty())` — and
+**injects a prompt into the agent's pane** telling it to run `jj rebase -b @ -d <base>` and
+carry on. faff never runs the rebase itself; the agent does, and resolves any conflicts. If
+the agent is mid-turn, Claude Code queues the prompt; faff keeps no queue of its own.
+
+`r` freezes your uncommitted WIP first (a `jj new` on *your* `@`, exactly like `n`), so the
+agent picks up your latest work. `R` bases it on your parent line instead — read-only, WIP
+excluded. Either is a no-op (reported, nothing sent) when the agent already sits on the
+newest base. On a working agent the first press arms a confirmation (a redirect mid-turn is
+disruptive); the same key again sends it. This needs the send side of the pane, so faff adds
+`wezterm cli send-text` alongside the `get-text` it already uses.
 
 ### Removing a task
 

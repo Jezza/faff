@@ -5,8 +5,9 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// One pane as reported by `wezterm cli list --format json` (unknown fields ignored).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -91,6 +92,19 @@ pub fn get_text_args(pane_id: u64) -> Vec<String> {
     vec![s("cli"), s("get-text"), s("--pane-id"), s(pane_id)]
 }
 
+/// `wezterm cli send-text --no-paste --pane-id <id>` (text is piped on stdin).
+/// `--no-paste` delivers the bytes as typed input rather than a bracketed paste, so a
+/// trailing carriage return actually submits the line in an interactive TUI.
+pub fn send_text_args(pane_id: u64) -> Vec<String> {
+    vec![
+        s("cli"),
+        s("send-text"),
+        s("--no-paste"),
+        s("--pane-id"),
+        s(pane_id),
+    ]
+}
+
 /// `wezterm cli kill-pane --pane-id <id>`.
 pub fn kill_pane_args(pane_id: u64) -> Vec<String> {
     vec![s("cli"), s("kill-pane"), s("--pane-id"), s(pane_id)]
@@ -153,6 +167,36 @@ pub fn get_text(pane_id: u64) -> Result<String> {
     run(&get_text_args(pane_id))
 }
 
+/// Send `text` to a pane as typed input, then a carriage return to submit it. If the
+/// agent is mid-turn Claude Code queues the line; if it's idle the prompt runs at once —
+/// faff needs no queue of its own.
+pub fn send_text(pane_id: u64, text: &str) -> Result<()> {
+    let mut child = Command::new("wezterm")
+        .args(send_text_args(pane_id))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning wezterm cli send-text")?;
+    {
+        let mut stdin = child.stdin.take().context("send-text stdin unavailable")?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("writing prompt to send-text")?;
+        stdin
+            .write_all(b"\r")
+            .context("writing submit CR to send-text")?;
+    }
+    let out = child.wait_with_output().context("waiting on send-text")?;
+    if !out.status.success() {
+        bail!(
+            "wezterm send-text failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 pub fn kill_pane(pane_id: u64) -> Result<()> {
     run(&kill_pane_args(pane_id)).map(|_| ())
 }
@@ -195,6 +239,10 @@ mod tests {
         assert_eq!(
             get_text_args(12),
             vec!["cli", "get-text", "--pane-id", "12"]
+        );
+        assert_eq!(
+            send_text_args(12),
+            vec!["cli", "send-text", "--no-paste", "--pane-id", "12"]
         );
         assert_eq!(
             kill_pane_args(12),
