@@ -79,8 +79,10 @@ padded to 8 columns with the unique prefix highlighted.
 5. Spawns `claude` in a WezTerm pane at the workspace, docks it beside faff, focuses it.
 
 The task starts with no prompt. You type it into the pane. The `UserPromptSubmit` hook
-captures the first prompt only, and a background `claude -p --model haiku` turns it into a
-short title for the row and the tab.
+captures the first prompt only. A background `claude -p --model haiku` then seeds the task
+change's jj description from that prompt — once, and only while the change has no
+description of its own, so it never overwrites one you or the agent later set. The agent's
+tab is titled `#<id>`.
 
 Steps 2 to 4 are best-effort; a failure there doesn't abort the task. A failed workspace
 add or pane spawn rolls the whole thing back.
@@ -121,13 +123,15 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 
 - `@` your working copy — drawn green (like jj log), labelled with its description
   (or `(no description set)`)
-- `●` a faff agent's revision, with a status line under it (`⚙ working`, `🔔 needs you`,
-  `✓ review-ready`) and its pane id
+- `●` a faff agent's revision, labelled with the change's jj description (falling back to
+  the first line of the prompt until it's described), with a status line under it
+  (`⚙ working`, `🔔 needs you`, `✓ review-ready`) and its pane id
 - `○` ordinary history, or another workspace's working copy
 - `×` a conflict
 
 Empty description-less single-parent commits collapse out. Merges and conflicts never
-collapse.
+collapse. Row labels are clipped to the current pane width — and only when they overflow —
+so they re-fit as docking or detaching a session resizes faff.
 
 A task whose change no longer has a node of its own, which is the usual result of
 integrating it, moves to a "detached" list under the graph. It stays selectable and
@@ -147,7 +151,7 @@ Hooks injected per workspace:
 
 | Hook | Effect |
 |---|---|
-| `UserPromptSubmit` | status → working; first prompt captured as the task |
+| `UserPromptSubmit` | status → working; first prompt captured, and used to seed the change's jj description |
 | `Stop` | status → idle |
 | `Notification` | status → needs input |
 | `PostToolUse` | appends an activity row; clears a stale needs-input |
@@ -173,6 +177,6 @@ scheme.
 | `wezterm` | `wezterm cli` argv, exec, list parsing |
 | `events` | event enum and Unix-socket transport |
 | `scheduler` | applies events to the store |
-| `title` | background title generation |
+| `title` | one-shot prompt→summary, used to seed the change description |
 | `cli` | argument parsing and the `report-event` subcommand |
 | `tui` | ratatui app: state, event loop, rendering, actions |

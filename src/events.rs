@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// Agent began a turn (UserPromptSubmit); `text` is the submitted prompt, used to
-    /// capture + title a task created empty via `n`.
+    /// capture the task and seed its jj description for a task created empty via `n`.
     Prompt { task: TaskId, text: String },
     /// Agent began working (no prompt text available).
     Working { task: TaskId },

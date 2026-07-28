@@ -13,7 +13,6 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
   id            INTEGER PRIMARY KEY,
   prompt        TEXT NOT NULL,
-  title         TEXT,
   status        TEXT NOT NULL,
   priority      INTEGER NOT NULL DEFAULT 0,
   autonomy      TEXT NOT NULL DEFAULT 'inherit',
@@ -207,14 +206,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_title(&self, id: TaskId, title: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tasks SET title = ?2 WHERE id = ?1",
-            params![id.0, title],
-        )?;
-        Ok(())
-    }
-
     pub fn set_session(&self, id: TaskId, session_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET session_id = ?2 WHERE id = ?1",
@@ -279,32 +270,31 @@ impl Store {
     }
 }
 
-const COLS: &str = "id, prompt, title, status, priority, autonomy, created_at, started_at, \
+const COLS: &str = "id, prompt, status, priority, autonomy, created_at, started_at, \
                     finished_at, archived_at, fork_point, ws_name, ws_path, ws_change_id, \
                     pane_id, session_id";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
-    let status_s: String = r.get(3)?;
-    let autonomy_s: String = r.get(5)?;
-    let ws_path: Option<String> = r.get(12)?;
-    let pane: Option<i64> = r.get(14)?;
+    let status_s: String = r.get(2)?;
+    let autonomy_s: String = r.get(4)?;
+    let ws_path: Option<String> = r.get(11)?;
+    let pane: Option<i64> = r.get(13)?;
     Ok(Task {
         id: TaskId(r.get(0)?),
         prompt: r.get(1)?,
-        title: r.get(2)?,
         status: TaskStatus::from_str(&status_s).unwrap_or(TaskStatus::Idle),
-        priority: r.get(4)?,
+        priority: r.get(3)?,
         autonomy: Autonomy::from_str(&autonomy_s).unwrap_or(Autonomy::AcceptEdits),
-        created_at: r.get(6)?,
-        started_at: r.get(7)?,
-        finished_at: r.get(8)?,
-        archived_at: r.get(9)?,
-        fork_point: r.get(10)?,
-        ws_name: r.get(11)?,
+        created_at: r.get(5)?,
+        started_at: r.get(6)?,
+        finished_at: r.get(7)?,
+        archived_at: r.get(8)?,
+        fork_point: r.get(9)?,
+        ws_name: r.get(10)?,
         ws_path: ws_path.map(PathBuf::from),
-        ws_change_id: r.get(13)?,
+        ws_change_id: r.get(12)?,
         pane_id: pane.map(|v| v as u64),
-        session_id: r.get(15)?,
+        session_id: r.get(14)?,
     })
 }
 
@@ -326,7 +316,6 @@ mod tests {
         assert_eq!(t.priority, 5);
         assert_eq!(t.autonomy, Autonomy::Bypass);
         assert_eq!(t.status, TaskStatus::NeedsInput);
-        assert!(t.title.is_none());
         assert!(t.created_at > 0);
 
         let got = s.get_task(t.id).unwrap();
@@ -372,13 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_pane_title_session_setters() {
+    fn workspace_pane_session_setters() {
         let s = store();
         let t = s.create_task("x", 0, Autonomy::AcceptEdits).unwrap();
         s.set_workspace(t.id, "faf-task-1", Path::new("/ws/0001-x"), "abcd", "fork1")
             .unwrap();
         s.set_pane(t.id, Some(42)).unwrap();
-        s.set_title(t.id, "do X").unwrap();
         s.set_session(t.id, "sess-9").unwrap();
         let g = s.get_task(t.id).unwrap();
         assert_eq!(g.ws_name.as_deref(), Some("faf-task-1"));
@@ -386,7 +374,6 @@ mod tests {
         assert_eq!(g.ws_change_id.as_deref(), Some("abcd"));
         assert_eq!(g.fork_point.as_deref(), Some("fork1"));
         assert_eq!(g.pane_id, Some(42));
-        assert_eq!(g.title.as_deref(), Some("do X"));
         assert_eq!(g.session_id.as_deref(), Some("sess-9"));
     }
 

@@ -145,10 +145,18 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             )
         } else if let Some(t) = task {
             // A task node; a conflicted revision gets the × glyph, else a filled ●.
+            // Prefer the change's own jj description when set (it's live and authoritative
+            // — the agent's `jj describe`, or the one-time seed), falling back to the
+            // prompt-derived label before the change has been described.
             let g = if rev.conflict { '×' } else { '●' };
+            let label = if rev.description.is_empty() {
+                t.label()
+            } else {
+                rev.description.clone()
+            };
             (
                 g,
-                vec![format!("#{} {}", t.id, t.label()), task_annotation(t)],
+                vec![format!("#{} {}", t.id, label), task_annotation(t)],
                 false,
                 Some(t.id),
             )
@@ -227,7 +235,6 @@ mod tests {
         Task {
             id: TaskId(id),
             prompt: "add oauth login".into(),
-            title: Some("Add OAuth".into()),
             status,
             priority: 0,
             autonomy: Autonomy::AcceptEdits,
@@ -247,9 +254,10 @@ mod tests {
     #[test]
     fn builds_head_task_forkpoint_and_base() {
         let revs = vec![
-            rev("mp", &["fk"], true, true, ""),  // HEAD @
-            rev("t7", &["fk"], false, true, ""), // task @ (faf-task-7)
-            rev("fk", &["p"], false, true, ""),  // empty fork-point -> collapse
+            rev("mp", &["fk"], true, true, ""), // HEAD @
+            // task @ (faf-task-7) — carries a jj description, which the row prefers.
+            rev("t7", &["fk"], false, true, "Add OAuth flow"),
+            rev("fk", &["p"], false, true, ""), // empty fork-point -> collapse
             rev("p", &[], false, false, "base"), // real commit
         ];
         let workspaces = vec![
@@ -272,9 +280,10 @@ mod tests {
         assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert_eq!(m.task_of[0], None);
 
-        // task node: two lines, glyph ● (a faf agent), mapped to task 7
+        // task node: two lines, glyph ● (a faf agent), mapped to task 7. The label is
+        // the change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '●');
-        assert_eq!(m.nodes[1].lines[0], "#7 Add OAuth");
+        assert_eq!(m.nodes[1].lines[0], "#7 Add OAuth flow");
         assert!(m.nodes[1].lines[1].contains("⚙"));
         assert!(m.nodes[1].lines[1].contains("%12"));
         assert_eq!(m.task_of[1], Some(TaskId(7)));
@@ -381,6 +390,20 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes[0].glyph, '●');
         assert!(m.nodes[0].lines[1].contains("working"));
+    }
+
+    #[test]
+    fn task_node_falls_back_to_prompt_without_a_description() {
+        // No jj description yet (e.g. before the seed lands): the row shows the
+        // prompt-derived label, untruncated (the render step clips to the pane width).
+        let revs = vec![rev("t1", &["p"], false, true, "")];
+        let workspaces = vec![Workspace {
+            name: "faf-task-1".into(),
+            change_id: "t1".into(),
+        }];
+        let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
+        let m = build(&revs, &workspaces, &tasks);
+        assert_eq!(m.nodes[0].lines[0], "#1 add oauth login");
     }
 
     #[test]

@@ -11,7 +11,7 @@ pub fn apply_event(store: &Store, ev: &Event) -> Result<()> {
     match ev {
         Event::Prompt { task, text } => {
             // First user prompt of a task created empty (via `n`) becomes its prompt,
-            // which the TUI titles from. Only the first one is captured.
+            // which the TUI seeds the jj description from. Only the first one is captured.
             if let Ok(t) = store.get_task(*task)
                 && t.prompt.trim().is_empty()
                 && !text.trim().is_empty()

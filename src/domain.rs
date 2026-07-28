@@ -94,7 +94,6 @@ impl Autonomy {
 pub struct Task {
     pub id: TaskId,
     pub prompt: String,
-    pub title: Option<String>,
     pub status: TaskStatus,
     pub priority: i64,
     pub autonomy: Autonomy,
@@ -111,19 +110,16 @@ pub struct Task {
 }
 
 impl Task {
-    /// Display label: derived title if present, else a truncated first line of the
-    /// prompt, else a placeholder (a task created via `n` before its first prompt).
+    /// Display label: the first line of the prompt, else a placeholder (a task created
+    /// via `n` before its first prompt). Returned untruncated — the log view clips it to
+    /// the current pane width at render time. The jj change's own description, when set,
+    /// is preferred over this in the graph (see `tui::model::build`).
     pub fn label(&self) -> String {
-        if let Some(t) = &self.title
-            && !t.is_empty()
-        {
-            return t.clone();
-        }
-        let from_prompt = truncate_first_line(&self.prompt, LABEL_WIDTH);
+        let from_prompt = self.prompt.lines().next().unwrap_or("").trim();
         if from_prompt.is_empty() {
             "(new task — awaiting prompt)".to_string()
         } else {
-            from_prompt
+            from_prompt.to_string()
         }
     }
 }
