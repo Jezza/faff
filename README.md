@@ -38,7 +38,8 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab |
 | `s` | swap: trade your `@` with the selected agent's revision |
 | `S` | snapshot the selected agent's workspace |
-| `x` | remove the selected task |
+| `x` | remove the selected task (keeps its revision as history) |
+| `X` | remove the selected task *and* abandon its revision (discards the work) |
 | `q` | quit |
 
 One session is docked at a time. Docking another detaches the current one.
@@ -57,7 +58,7 @@ revisions                                      │ ┃   from postcard to JSON
 ○  [ntlpqxos] import                           │ ┃
 ── detached (integrated / no node) ──          │ ┃ >
 · #5 Add OAuth login ✓                         │ ┃
- [n]ew [↵]detach [s]wap [S]napshot [x]remove [q]uit   ready ┃
+ [n]ew [↵]detach [s]wap [S]napshot [x]remove [X]remove+drop [q]uit   ready ┃
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -115,6 +116,12 @@ integrated into your `@` — are abandoned **only if they're all empty** (a bare
 empty tip). If any carry real content, faff leaves them in place as ordinary history for you
 to integrate or `jj abandon` yourself: faff never discards real work on removal. (This is also
 why removing a swapped task keeps your old line, which the agent's workspace now holds.)
+
+`X` (Shift + x) removes the same way but *also* abandons the revision, real content and all —
+for when you've decided the work isn't worth keeping and don't want to `jj abandon` it by hand.
+The `~ ::@` guard still applies, so anything already integrated into your `@` is never touched;
+`X` only ever discards the task's own unintegrated line. (jj keeps its op log, so an `X` you
+regret is recoverable with `jj op undo`.)
 
 ### The revision view
 

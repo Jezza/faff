@@ -222,7 +222,8 @@ impl App {
             Action::Down => self.move_selection(1),
             Action::NewTask => self.new_task(),
             Action::ToggleSession => self.toggle_session(),
-            Action::Remove => self.remove_selected(),
+            Action::Remove => self.remove_selected(false),
+            Action::RemoveDiscard => self.remove_selected(true),
             Action::Swap => self.swap_selected(),
             Action::Snapshot => self.snapshot_selected(),
             Action::None => {}
@@ -392,7 +393,11 @@ impl App {
 
     /// Remove the selected task: kill its pane, tear down its jj workspace, and drop the
     /// row from the store. There is no archive/history — a removed task is gone.
-    fn remove_selected(&mut self) {
+    ///
+    /// `x` (`discard_revision = false`) preserves the task's real work as ordinary jj
+    /// history; `X`/Shift+x (`discard_revision = true`) abandons the revision too,
+    /// throwing the work away (see `workspace::teardown_discarding_revision`).
+    fn remove_selected(&mut self, discard_revision: bool) {
         let Some(t) = self.selected_task() else {
             return;
         };
@@ -405,10 +410,18 @@ impl App {
         if let (Some(name), Some(path), Some(fork)) =
             (t.ws_name.clone(), t.ws_path.clone(), t.fork_point.clone())
         {
-            let _ = workspace::teardown(&self.repo, &name, &path, &fork);
+            let _ = if discard_revision {
+                workspace::teardown_discarding_revision(&self.repo, &name, &path, &fork)
+            } else {
+                workspace::teardown(&self.repo, &name, &path, &fork)
+            };
         }
         let _ = self.store.delete_task(t.id);
-        self.status = format!("removed #{}", t.id.0);
+        self.status = if discard_revision {
+            format!("removed #{} and discarded its revision", t.id.0)
+        } else {
+            format!("removed #{}", t.id.0)
+        };
         self.refresh();
     }
 
@@ -823,7 +836,7 @@ impl App {
             "[↵]open"
         };
         let keys = format!(
-            " [n]ew {enter} [s]wap [S]napshot [x]remove [q]uit   {}",
+            " [n]ew {enter} [s]wap [S]napshot [x]remove [X]remove+drop [q]uit   {}",
             self.status
         );
         f.render_widget(

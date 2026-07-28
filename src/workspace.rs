@@ -81,6 +81,33 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
 /// holds your old (non-empty) line, so removing that task keeps your work. The abandon
 /// runs *before* forgetting, while the workspace still exists.
 pub fn teardown(repo: &Path, ws_name: &str, ws_path: &Path, fork_point: &str) -> Result<()> {
+    retire(repo, ws_name, ws_path, fork_point, false)
+}
+
+/// Like [`teardown`], but abandon the task's own commits **outright** — including real
+/// work — rather than preserving them. This is the `X` (Shift+x) removal: the user has
+/// asked to throw the revision away, not just drop the task. `~ ::@` still shields
+/// anything already integrated into your `@`, so an integrated commit is never rewritten.
+pub fn teardown_discarding_revision(
+    repo: &Path,
+    ws_name: &str,
+    ws_path: &Path,
+    fork_point: &str,
+) -> Result<()> {
+    retire(repo, ws_name, ws_path, fork_point, true)
+}
+
+/// Shared teardown: forget the workspace, delete its directory, and abandon the task's
+/// own commits `(fork_point..head) ~ ::@`. `discard_revision` chooses *when*: normally
+/// only an all-empty branch (graph noise) is abandoned and real work is left as history;
+/// with `discard_revision` the whole branch goes.
+fn retire(
+    repo: &Path,
+    ws_name: &str,
+    ws_path: &Path,
+    fork_point: &str,
+    discard_revision: bool,
+) -> Result<()> {
     if let Some(head) = jj::workspace_list(repo)?
         .into_iter()
         .find(|w| w.name == ws_name)
@@ -89,10 +116,13 @@ pub fn teardown(repo: &Path, ws_name: &str, ws_path: &Path, fork_point: &str) ->
     {
         let own = format!("({fork_point}..{head}) ~ ::@");
         // `({own}) ~ empty()` is the task's own commits with the empty ones removed —
-        // i.e. its real work. If any exists, preserve the branch (skip the abandon).
-        // On a query error, default to preserving: never risk discarding real work.
-        let has_content = jj::any_revision(repo, &format!("({own}) ~ empty()")).unwrap_or(true);
-        if !has_content {
+        // i.e. its real work. Normally, if any exists we preserve the branch (skip the
+        // abandon); on a query error we default to preserving — never risk discarding
+        // real work by accident. `discard_revision` is the deliberate opt-out: abandon
+        // regardless (short-circuits so the emptiness query is skipped entirely).
+        let abandon = discard_revision
+            || !jj::any_revision(repo, &format!("({own}) ~ empty()")).unwrap_or(true);
+        if abandon {
             // Best-effort: an empty result (fully integrated) / gone revisions are fine.
             let _ = jj::abandon(repo, &own);
         }
@@ -544,6 +574,44 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|w| w.name == "faf-task-2")
+        );
+    }
+
+    #[test]
+    fn integration_teardown_discarding_revision_abandons_real_work() {
+        // The `X` (Shift+x) removal: unlike plain teardown, it abandons the task's own
+        // commits even when they carry real content — the user asked to throw the
+        // revision away.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+
+        let ws_path = tmp.path().join("ws").join("0003");
+        let info = create(&repo, "faf-task-3", &ws_path).unwrap();
+
+        // Two real commits on the task branch, same as the keep-work case above.
+        fs::write(ws_path.join("a.txt"), "a").unwrap();
+        jj_in(&ws_path, &cfg, &["commit", "-m", "DROPA"]);
+        fs::write(ws_path.join("b.txt"), "b").unwrap();
+        jj_in(&ws_path, &cfg, &["commit", "-m", "DROPB"]);
+
+        teardown_discarding_revision(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
+
+        // Both task commits are ABANDONED (discarded), the workspace forgotten, dir gone.
+        let after = jj::log(&repo, "all()").unwrap();
+        assert!(
+            !after.iter().any(|r| r.description == "DROPA"),
+            "DROPA must be abandoned, not kept"
+        );
+        assert!(
+            !after.iter().any(|r| r.description == "DROPB"),
+            "DROPB must be abandoned, not kept"
+        );
+        assert!(!ws_path.exists());
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|w| w.name == "faf-task-3")
         );
     }
 
