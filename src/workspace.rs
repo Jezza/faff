@@ -145,16 +145,23 @@ fn retire(
 /// abandoned the moment its *last* workspace leaves it.
 /// 1. Snapshot both workspaces, so nothing uncommitted is lost and each commit holds
 ///    its latest content before the trade (the agent may never have run jj itself).
-/// 2. Bail if the agent's revision is empty — there's nothing to adopt, and moving onto
-///    it would let jj abandon it mid-trade.
-/// 3. Move the *agent* onto your old line first, while the default workspace still holds
-///    it. That keeps your `@` doubly-referenced, so it survives even when it's empty —
-///    the common case, where you dispatched an agent and never touched your own tree.
-/// 4. Move the default workspace onto the agent's revision. Your old `@` survives (the
-///    agent now holds it); the agent's revision is now held by both.
+/// 2. Pick the edit order. The *first* `jj edit` double-references its destination (so
+///    that commit survives even when empty) but orphans its source for an instant — and
+///    an empty, description-less orphan is abandoned before the second edit can land. So
+///    we make the *empty* side the destination of the first edit, whichever side it is:
+///    - Agent revision empty (the bounce-back case — you swapped onto an agent, then swap
+///      again to return to the empty line you left it on): move the default workspace onto
+///      the agent's revision first, then the agent onto your old, non-empty line.
+///    - Otherwise: move the *agent* onto your old line first, keeping an empty `@` alive;
+///      the non-empty agent revision safely survives being orphaned.
+///    - Both revisions empty: unsalvageable (each edit would abandon an empty orphan) and
+///      nothing to review either way, so swap bails.
+/// 3. Run the two edits in the chosen order. The agent ends on your old line (its next
+///    work is based on your current line, not an ever-staler fork); your `@` ends on the
+///    agent's revision.
 ///
-/// If step 4 fails the swap is left half-applied — recoverable, since "both workspaces
-/// on the agent's rev" is exactly the combined HEAD+agent node faf already renders
+/// If the second edit fails the swap is left half-applied — recoverable, since "both
+/// workspaces on one revision" is exactly the combined HEAD+agent node faf already renders
 /// (re-run swap or fix by hand). Bails untouched if `@` is already the agent's revision.
 pub fn swap(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
     let user_head = jj::resolve_change_id(repo, "@").context("resolving @")?;
@@ -166,17 +173,25 @@ pub fn swap(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
     if user_head == agent_head {
         bail!("@ is already on {ws_name}'s revision — nothing to swap");
     }
-    // 1. Capture both workspaces' uncommitted edits (change_ids are unchanged by this).
+    // 1. Capture both workspaces' uncommitted edits (change_ids are unchanged by this, but
+    //    a snapshot can turn an "empty" revision non-empty — so measure emptiness after).
     jj::snapshot_in(ws_path).context("snapshotting the agent workspace")?;
     jj::snapshot_in(repo).context("snapshotting your workspace")?;
-    // 2. Nothing to adopt from an empty agent revision.
-    if !jj::any_revision(repo, &format!("{agent_head} ~ empty()"))? {
-        bail!("{ws_name}'s revision is empty — nothing to adopt");
+    // 2. Choose the edit order so the empty side is the first edit's destination.
+    let agent_empty = !jj::any_revision(repo, &format!("{agent_head} ~ empty()"))?;
+    let user_empty = !jj::any_revision(repo, &format!("{user_head} ~ empty()"))?;
+    if agent_empty && user_empty {
+        bail!("both your revision and {ws_name}'s are empty — nothing to trade");
     }
-    // 3. Agent onto your old line first (keeps an empty `@` alive — see above).
-    jj::edit_in(ws_path, &user_head).context("moving the agent onto your old line")?;
-    // 4. Default workspace onto the agent's revision.
-    jj::edit(repo, &agent_head).context("moving @ onto the agent's revision")?;
+    // 3. Run the two edits. Either order lands @ on the agent's revision and the agent on
+    //    your old line; only which one moves first differs (see the doc comment).
+    if agent_empty {
+        jj::edit(repo, &agent_head).context("moving @ onto the agent's revision")?;
+        jj::edit_in(ws_path, &user_head).context("moving the agent onto your old line")?;
+    } else {
+        jj::edit_in(ws_path, &user_head).context("moving the agent onto your old line")?;
+        jj::edit(repo, &agent_head).context("moving @ onto the agent's revision")?;
+    }
     Ok(user_head)
 }
 
@@ -711,6 +726,98 @@ mod tests {
         assert!(
             err.to_string().contains("nothing to swap"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn integration_swap_bounces_back_over_empty_line() {
+        // The bounce-review workflow: swap onto an agent's work, make a touch-up, then
+        // swap again to return your `@` to the empty, description-less line you left the
+        // agent on — handing the touched-up work back. That return trip's target is empty,
+        // which the old guard refused ("nothing to adopt"); adaptive edit ordering makes
+        // the empty target survive the trade.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+
+        // Your line starts empty (a fresh `@` on `base`). Fork a task off it; the agent
+        // then produces real work but never runs jj itself (swap must snapshot for it).
+        let ws_path = tmp.path().join("ws").join("0007");
+        let info = create(&repo, "faf-task-7", &ws_path).unwrap();
+        fs::write(ws_path.join("agent.txt"), "theirs").unwrap();
+
+        let your_line = jj::resolve_change_id(&repo, "@").unwrap();
+        let agent_work = info.change_id.clone();
+
+        // Swap 1: pull the agent's work into your repo to review (agent revision non-empty).
+        swap(&repo, &info.name, &ws_path).unwrap();
+        assert_eq!(jj::resolve_change_id(&repo, "@").unwrap(), agent_work);
+        assert!(repo.join("agent.txt").exists(), "agent's work is in your repo");
+
+        // Make a touch-up on it.
+        fs::write(repo.join("touch.txt"), "mine").unwrap();
+
+        // Swap 2: hand it back. The target is `your_line` — empty and description-less,
+        // exactly the auto-abandon-prone case the old guard bailed on.
+        swap(&repo, &info.name, &ws_path).unwrap();
+
+        // Your `@` is back on your own (empty) line: only `base`, none of the work.
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            your_line,
+            "@ returned to your line"
+        );
+        assert!(
+            !repo.join("agent.txt").exists(),
+            "the work went back to the agent"
+        );
+        assert!(!repo.join("touch.txt").exists());
+
+        // The agent workspace now holds the work *with* your touch-up folded in.
+        let agent_now = jj::workspace_list(&repo)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.name == "faf-task-7")
+            .unwrap()
+            .change_id;
+        assert_eq!(agent_now, agent_work, "agent is back on the work revision");
+        assert!(ws_path.join("agent.txt").exists());
+        assert!(
+            ws_path.join("touch.txt").exists(),
+            "your touch-up followed to the agent"
+        );
+
+        // Both revisions survived the round trip — nothing was abandoned mid-trade.
+        assert!(
+            jj::any_revision(&repo, &your_line).unwrap(),
+            "your line survives"
+        );
+        assert!(
+            jj::any_revision(&repo, &agent_work).unwrap(),
+            "the work revision survives"
+        );
+    }
+
+    #[test]
+    fn integration_swap_bails_when_both_revisions_empty() {
+        // An agent that produced nothing, swapped from an empty line: no ordering can save
+        // both empty commits and there is nothing to review, so swap bails untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let ws_path = tmp.path().join("ws").join("0008");
+        let info = create(&repo, "faf-task-8", &ws_path).unwrap();
+        // No edits in either workspace: your `@` and the agent tip are both empty.
+
+        let user_before = jj::resolve_change_id(&repo, "@").unwrap();
+        let err = swap(&repo, &info.name, &ws_path).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to trade"),
+            "unexpected error: {err}"
+        );
+        // Untouched: @ did not move.
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            user_before,
+            "a bailed swap leaves @ where it was"
         );
     }
 
