@@ -36,6 +36,8 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `n` | new task |
 | `↑`/`↓` or `k`/`j` | move selection |
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab |
+| `s` | swap: trade your `@` with the selected agent's revision |
+| `S` | snapshot the selected agent's workspace |
 | `x` | remove the selected task |
 | `q` | quit |
 
@@ -55,7 +57,7 @@ revisions                                      │ ┃   from postcard to JSON
 ○  [ntlpqxos] import                           │ ┃
 ── detached (integrated / no node) ──          │ ┃ >
 · #5 Add OAuth login ✓                         │ ┃
- [n]ew [↵]detach [x]remove [q]uit   ready        ┃
+ [n]ew [↵]detach [s]wap [S]napshot [x]remove [q]uit   ready ┃
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -83,11 +85,34 @@ short title for the row and the tab.
 Steps 2 to 4 are best-effort; a failure there doesn't abort the task. A failed workspace
 add or pane spawn rolls the whole thing back.
 
+### Swapping (`s`)
+
+`s` trades your working copy with the selected agent's revision: your `@` ends up where the
+agent's revision was, and the agent's workspace ends up on your old line. Your repo now
+holds the agent's work (review or build on it in your own pane), and the agent, next time it
+runs, is based on your current line instead of an ever-staler fork — which is the point:
+it keeps agent workspaces from going stale as you move ahead.
+
+Mechanically it snapshots both workspaces (so an agent that never ran a jj command doesn't
+lose its edits), then two `jj edit`s reorder around jj's auto-abandon of empty commits so an
+empty `@` survives the trade. It bails if `@` already sits on the agent's revision, or if the
+agent's revision is empty (nothing to adopt). If the agent is actively working, the first `s`
+asks you to confirm (the swap changes files under a live agent); a second `s` goes through.
+
+### Snapshotting (`S`)
+
+`S` runs `jj util snapshot` on the selected agent's workspace, folding its uncommitted edits
+into its revision so they show up in the graph. Useful for watching an agent that doesn't
+snapshot on its own. `s` does this for you before a swap, too.
+
 ### Removing a task
 
-`x` kills the pane, abandons `(fork_point..head) ~ ::@` (the task's commits, minus anything
-that's now an ancestor of your `@`), forgets the workspace, deletes its directory, and drops
-the row. No archive.
+`x` kills the pane, forgets the workspace, deletes its directory, and drops the row (no
+archive). The task's commits — `(fork_point..head) ~ ::@`, its own work minus anything already
+integrated into your `@` — are abandoned **only if they're all empty** (a bare fork or an
+empty tip). If any carry real content, faff leaves them in place as ordinary history for you
+to integrate or `jj abandon` yourself: faff never discards real work on removal. (This is also
+why removing a swapped task keeps your old line, which the agent's workspace now holds.)
 
 ### The revision view
 
@@ -143,8 +168,8 @@ scheme.
 | `config` | data-dir paths, repo-path encoding, slugs |
 | `store` | SQLite (tasks, activity, config) |
 | `graph` | DAG to text lanes, multi-line nodes, collapsing |
-| `jj` | `jj log`/`workspace list` via templates |
-| `workspace` | fork, memory seed, hook injection, trust, teardown |
+| `jj` | `jj log`/`workspace list` via templates; `edit`/`snapshot` per workspace |
+| `workspace` | fork, memory seed, hook injection, trust, teardown, swap, snapshot |
 | `wezterm` | `wezterm cli` argv, exec, list parsing |
 | `events` | event enum and Unix-socket transport |
 | `scheduler` | applies events to the store |
