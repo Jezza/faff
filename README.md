@@ -46,7 +46,7 @@ With task #7's session docked, faff on the left and the real `claude` pane on th
 ```
  faf · faff · 1 working · ▶ #7                   ┃ ⏺ Convert the HTTP and MQTT bridges
 revisions                                      │ ┃   from postcard to JSON
-@  [wvrsmsyk] master (you)                     │ ┃
+@  [wvrsmsyk] (no description set)             │ ┃
 │ ●  [kmkxwzqr] #7 Convert bridges to JSON  ▶  │ ┃ ● Read src/bridge/http.rs
 ├─╯             ⚙ working · %12                │ ┃ ● Edit src/bridge/http.rs
 │ ●  [rzqlvksp] #8 Fix flaky store tests       │ ┃ ● Bash cargo test -p bridge
@@ -69,7 +69,7 @@ padded to 8 columns with the unique prefix highlighted.
 1. `jj workspace add` at the newest non-empty ancestor of `@`. If `@` is that revision,
    `jj new` runs first, advancing your working copy onto a fresh empty commit. Uncommitted
    work is included in the fork.
-2. Copies `~/.claude/projects/<master-key>/memory/` and `MEMORY.md` to the new workspace's
+2. Copies `~/.claude/projects/<HEAD-key>/memory/` and `MEMORY.md` to the new workspace's
    project key.
 3. Writes `<workspace>/.claude/settings.local.json` with hooks that call
    `faff report-event`.
@@ -92,9 +92,10 @@ the row. No archive.
 ### The revision view
 
 The body is one graph, built from `jj log` over `ancestors(<all workspace heads> | @, 25)`.
-Master's line is pinned to the top lane, agent branches below it. Glyphs:
+HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 
-- `@` your working copy
+- `@` your working copy — drawn green (like jj log), labelled with its description
+  (or `(no description set)`)
 - `●` a faff agent's revision, with a status line under it (`⚙ working`, `🔔 needs you`,
   `✓ review-ready`) and its pane id
 - `○` ordinary history, or another workspace's working copy

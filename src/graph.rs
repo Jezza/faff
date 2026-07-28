@@ -5,7 +5,7 @@
 //! Input nodes are in display order (top→bottom = child→parent, as jj log emits).
 //! Output rows are: commit rows (carry a `node_index`), continuation rows (extra
 //! content lines of a node), and link rows (the `├─╯` connectors). The renderer
-//! handles the shape faf produces — a mostly-linear master trunk with short task
+//! handles the shape faf produces — a mostly-linear HEAD trunk with short task
 //! branches merging back in — and degrades gracefully on deeper graphs.
 
 use std::collections::HashMap;
@@ -110,11 +110,11 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
     // Each lane holds the change_id it is currently flowing toward (a pending parent).
     let mut lanes: Vec<Option<String>> = Vec::new();
 
-    // Reserve lane 0 for the working copy's line (the `@` node = master), so ONLY its
-    // line ever occupies the leftmost lane. Pre-seeding lane 0 with master's id means a
-    // descendant sitting above master (a task rebased onto it) hits the stub case — its
-    // parent, master, is lane 0's pending target — and renders as a branch merging back
-    // in, instead of grabbing lane 0 itself. If master is the first node this is a no-op
+    // Reserve lane 0 for the working copy's line (the `@` node = HEAD), so ONLY its
+    // line ever occupies the leftmost lane. Pre-seeding lane 0 with HEAD's id means a
+    // descendant sitting above HEAD (a task rebased onto it) hits the stub case — its
+    // parent, HEAD, is lane 0's pending target — and renders as a branch merging back
+    // in, instead of grabbing lane 0 itself. If HEAD is the first node this is a no-op
     // (it just takes lane 0 immediately, no phantom trunk drawn above it).
     if let Some(m) = nodes.iter().find(|n| n.glyph == '@') {
         lanes.push(Some(m.change_id.clone()));
@@ -260,10 +260,10 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         }
     }
 
-    // Birth of master's reserved trunk lane. Pre-seeding lane 0 (above) makes it show a
-    // bare `│` on every row above master, which reads as "the trunk continues upward
+    // Birth of HEAD's reserved trunk lane. Pre-seeding lane 0 (above) makes it show a
+    // bare `│` on every row above HEAD, which reads as "the trunk continues upward
     // off-screen". It doesn't: the trunk is born where it first does something — the
-    // topmost fork merging in, else master's own commit. So blank that phantom `│` on
+    // topmost fork merging in, else HEAD's own commit. So blank that phantom `│` on
     // the rows above the birth, and if the birth is a merge, turn its `├` T-junction
     // into a `╭` corner (nothing continues above it). Lower forks keep their `├`, since
     // for them the trunk genuinely continues up to the birth.
@@ -378,9 +378,9 @@ mod tests {
 
     #[test]
     fn one_branch_merges_back_into_trunk() {
-        // master(ovmp)->yvvy ; task(kysl)->yvvy ; yvvy->zmpy ; zmpy(root)
+        // HEAD(ovmp)->yvvy ; task(kysl)->yvvy ; yvvy->zmpy ; zmpy(root)
         let nodes = vec![
-            node("ovmp", &["yvvy"], '@', &["master"]),
+            node("ovmp", &["yvvy"], '@', &["HEAD"]),
             node("kysl", &["yvvy"], '○', &["task"]),
             node("yvvy", &["zmpy"], '●', &["fork base"]),
             node("zmpy", &[], '◆', &["root"]),
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn multiline_node_keeps_gutter_connected() {
         let nodes = vec![
-            node("ovmp", &["yvvy"], '@', &["master"]),
+            node("ovmp", &["yvvy"], '@', &["HEAD"]),
             node("kysl", &["yvvy"], '●', &["#7 add-auth", "⚙ working 2m"]),
             node("yvvy", &[], '◆', &["root"]),
         ];
@@ -414,11 +414,11 @@ mod tests {
 
     #[test]
     fn siblings_from_one_fork_point_stay_two_columns() {
-        // master @ plus three agents all fork from the same point `fp`. Each must render
+        // HEAD @ plus three agents all fork from the same point `fp`. Each must render
         // as a short branch that merges straight back — never nesting one column deeper
         // per sibling — so the graph stays two columns wide however many agents there are.
         let nodes = vec![
-            node("m", &["fp"], '@', &["master (you)"]),
+            node("m", &["fp"], '@', &["(no description set)"]),
             node("a16", &["fp"], '●', &["#16 migrate", "⚙ working · %90"]),
             node("a15", &["fp"], '●', &["#15 startup", "⚙ working · %89"]),
             node("a3", &["fp"], '●', &["#3 macros", "⚙ working · %88"]),
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(
             gutters(&rows),
             vec![
-                "@", // master trunk
+                "@", // HEAD trunk
                 "│ ●",
                 "├─╯", // agent 16 + merge
                 "│ ●",
@@ -451,9 +451,9 @@ mod tests {
     #[test]
     fn collapsed_fork_point_is_removed_and_branch_reattaches() {
         // Empty fork-point `m` (collapse) between children and real parent `p`.
-        // master(mp)->m ; task(t)->m ; m(empty,collapse)->p ; p(root)
+        // HEAD(mp)->m ; task(t)->m ; m(empty,collapse)->p ; p(root)
         let nodes = vec![
-            node("mp", &["m"], '@', &["master"]),
+            node("mp", &["m"], '@', &["HEAD"]),
             node("t", &["m"], '○', &["task"]),
             GraphNode {
                 collapse: true,
@@ -475,9 +475,9 @@ mod tests {
     fn freed_lane_is_reused_by_later_branch() {
         // Two tasks off the trunk at different points should both use lane 1.
         let nodes = vec![
-            node("m2", &["m1"], '@', &["master@"]),
+            node("m2", &["m1"], '@', &["HEAD@"]),
             node("t2", &["m1"], '○', &["task2"]),
-            node("m1", &["m0"], '●', &["master work"]),
+            node("m1", &["m0"], '●', &["HEAD work"]),
             node("t1", &["m0"], '○', &["task1"]),
             node("m0", &[], '◆', &["base"]),
         ];
@@ -489,14 +489,14 @@ mod tests {
     }
 
     #[test]
-    fn descendant_above_master_is_a_branch_off_lane_zero() {
-        // `kmk` was rebased onto master, so master is its parent. With master's line
-        // pinned first (kmk above master), lane 0 is reserved for master (`@`): kmk must
-        // render as a branch on lane 1 merging into master, NOT take lane 0 itself. A
+    fn descendant_above_head_is_a_branch_off_lane_zero() {
+        // `kmk` was rebased onto HEAD, so HEAD is its parent. With HEAD's line
+        // pinned first (kmk above HEAD), lane 0 is reserved for HEAD (`@`): kmk must
+        // render as a branch on lane 1 merging into HEAD, NOT take lane 0 itself. A
         // separate agent off `base` still stubs below.
         let nodes = vec![
-            node("kmk", &["master"], '○', &["#3 kmk", "⚙ working"]),
-            node("master", &["base"], '@', &["master (you)"]),
+            node("kmk", &["head"], '○', &["#3 kmk", "⚙ working"]),
+            node("head", &["base"], '@', &["(no description set)"]),
             node("agent", &["base"], '○', &["#5 agent"]),
             node("base", &[], '◆', &["base"]),
         ];
@@ -506,7 +506,7 @@ mod tests {
             vec![
                 "  ○", // kmk on the branch lane; trunk column blank (unborn above)
                 "╭─╯", // trunk born here, curving up to the fork — no T-junction
-                "@",   // master alone on lane 0
+                "@",   // HEAD alone on lane 0
                 "│ ○", // agent stubs off base (trunk continues above it → straight │)
                 "├─╯", //
                 "◆",   // base
@@ -515,18 +515,18 @@ mod tests {
         assert_eq!(rows[0].content, "#3 kmk");
         assert_eq!(rows[0].node_index, Some(0));
         assert_eq!(rows[1].content, "⚙ working"); // status rides the merge row
-        assert_eq!(rows[2].content, "master (you)");
+        assert_eq!(rows[2].content, "(no description set)");
     }
 
     #[test]
     fn top_fork_corners_and_lower_fork_keeps_the_junction() {
-        // Two tasks rebased onto master. The trunk is born at the topmost merge (`╭─╯`,
+        // Two tasks rebased onto HEAD. The trunk is born at the topmost merge (`╭─╯`,
         // nothing above it); the lower fork keeps its `├─╯` because the trunk genuinely
         // continues up to that birth.
         let nodes = vec![
-            node("kmk", &["master"], '○', &["#3 kmk"]),
-            node("kmk2", &["master"], '○', &["#4 kmk2"]),
-            node("master", &["base"], '@', &["master (you)"]),
+            node("kmk", &["head"], '○', &["#3 kmk"]),
+            node("kmk2", &["head"], '○', &["#4 kmk2"]),
+            node("head", &["base"], '@', &["(no description set)"]),
             node("base", &[], '◆', &["base"]),
         ];
         let rows = render(&nodes);

@@ -22,9 +22,9 @@ pub struct WorkspaceInfo {
 /// Fork point = `heads(::@ ~ empty())` — the nearest ancestor of `@` (including `@`
 /// itself) that is non-empty. Then:
 /// - if `@` *is* that commit (you have uncommitted content), `jj new` freezes it and
-///   advances master, and the task forks from the frozen commit;
+///   advances HEAD, and the task forks from the frozen commit;
 /// - if `@` is empty (nothing edited since the last fork), we fork straight from the
-///   existing content commit and **do not** advance master — so repeatedly creating
+///   existing content commit and **do not** advance HEAD — so repeatedly creating
 ///   tasks without editing doesn't stack up empty fork-points that clutter the log.
 ///
 /// Either way the fork point is non-empty and already has children, so it's frozen
@@ -34,9 +34,9 @@ pub fn create(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
     let fork_point =
         jj::resolve_change_id(repo, "heads(::@ ~ empty())").unwrap_or_else(|_| at.clone());
 
-    // Only advance master when @ itself carries the content we're forking from.
+    // Only advance HEAD when @ itself carries the content we're forking from.
     if fork_point == at {
-        jj::new(repo).context("jj new (advancing master)")?;
+        jj::new(repo).context("jj new (advancing HEAD)")?;
     }
 
     if let Some(parent) = path.parent() {
@@ -70,9 +70,9 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
 /// workspace, and remove its directory.
 ///
 /// The abandon set is `(fork_point..head) ~ ::@`: the task's own commits, MINUS
-/// anything that is now an ancestor of master's `@`. This is the crucial safety
-/// property — if you integrated the task (e.g. rebased master onto its commit),
-/// that commit is in `::@` and is preserved; abandoning it would rewrite master and
+/// anything that is now an ancestor of HEAD's `@`. This is the crucial safety
+/// property — if you integrated the task (e.g. rebased HEAD onto its commit),
+/// that commit is in `::@` and is preserved; abandoning it would rewrite HEAD and
 /// undo your integration. If nothing was integrated (a discard), the whole branch is
 /// abandoned so no orphaned heads are left. Done *before* forgetting, while the
 /// workspace still exists.
@@ -158,11 +158,11 @@ pub fn claude_projects_dir() -> PathBuf {
     base.join("projects")
 }
 
-/// Copy master's memory snapshot into the new workspace's project key (spec §8).
-/// Best-effort: returns Ok(false) if master has no memory yet. `master_cwd` is the
-/// directory Claude runs in for master (assumed to be the repo root).
-pub fn seed_memory(claude_projects: &Path, master_cwd: &Path, ws_path: &Path) -> Result<bool> {
-    let src_key = config::encode_repo_path(master_cwd);
+/// Copy HEAD's memory snapshot into the new workspace's project key (spec §8).
+/// Best-effort: returns Ok(false) if HEAD has no memory yet. `head_cwd` is the
+/// directory Claude runs in for HEAD (assumed to be the repo root).
+pub fn seed_memory(claude_projects: &Path, head_cwd: &Path, ws_path: &Path) -> Result<bool> {
+    let src_key = config::encode_repo_path(head_cwd);
     let dst_key = config::encode_repo_path(ws_path);
     let src_mem = claude_projects.join(&src_key).join("memory");
     if !src_mem.is_dir() {
@@ -297,15 +297,15 @@ mod tests {
     fn seed_memory_copies_snapshot_and_index() {
         let tmp = tempfile::tempdir().unwrap();
         let projects = tmp.path().join("projects");
-        let master = Path::new("/home/jezza/work/repo");
+        let head = Path::new("/home/jezza/work/repo");
         let ws = Path::new("/data/faf/-home-jezza-work-repo/ws/0001-x");
 
-        let src_key = config::encode_repo_path(master);
+        let src_key = config::encode_repo_path(head);
         fs::create_dir_all(projects.join(&src_key).join("memory")).unwrap();
         fs::write(projects.join(&src_key).join("memory").join("a.md"), "mem a").unwrap();
         fs::write(projects.join(&src_key).join("MEMORY.md"), "index").unwrap();
 
-        let copied = seed_memory(&projects, master, ws).unwrap();
+        let copied = seed_memory(&projects, head, ws).unwrap();
         assert!(copied);
 
         let dst_key = config::encode_repo_path(ws);
@@ -427,10 +427,10 @@ mod tests {
     #[test]
     fn integration_empty_at_reuses_fork_point() {
         // Two tasks created back-to-back with no edits between must fork from the
-        // same content commit — no extra empty fork-points, master doesn't advance.
+        // same content commit — no extra empty fork-points, HEAD doesn't advance.
         let tmp = tempfile::tempdir().unwrap();
         let (repo, _cfg) = scratch_repo(tmp.path()); // leaves @ empty on top of "base"
-        let master_before = jj::resolve_change_id(&repo, "@").unwrap();
+        let head_before = jj::resolve_change_id(&repo, "@").unwrap();
 
         let a = create(&repo, "faf-task-1", &tmp.path().join("ws/1")).unwrap();
         let b = create(&repo, "faf-task-2", &tmp.path().join("ws/2")).unwrap();
@@ -442,8 +442,8 @@ mod tests {
         assert_ne!(a.change_id, b.change_id, "but they are distinct workspaces");
         assert_eq!(
             jj::resolve_change_id(&repo, "@").unwrap(),
-            master_before,
-            "master @ did not advance (no new empty fork-point)"
+            head_before,
+            "HEAD @ did not advance (no new empty fork-point)"
         );
     }
 
@@ -467,7 +467,7 @@ mod tests {
 
         teardown(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
 
-        // Both task commits are gone (no orphaned heads), master's base survives.
+        // Both task commits are gone (no orphaned heads), HEAD's base survives.
         let after = jj::log(&repo, "all()").unwrap();
         assert!(
             !after.iter().any(|r| r.description == "WORKA"),
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn integration_teardown_preserves_integrated_commit() {
-        // The user's scenario: integrate the agent's commit into master, then remove
+        // The user's scenario: integrate the agent's commit into HEAD, then remove
         // the task. teardown must NOT abandon the integrated commit.
         let tmp = tempfile::tempdir().unwrap();
         let (repo, cfg) = scratch_repo(tmp.path());
@@ -493,7 +493,7 @@ mod tests {
         fs::write(ws_path.join("w.txt"), "w").unwrap();
         jj_in(&ws_path, &cfg, &["commit", "-m", "INTEGRATED_WORK"]);
 
-        // Integrate: master's @ is placed on top of the task's work commit (the
+        // Integrate: HEAD's @ is placed on top of the task's work commit (the
         // committed work is the parent of the task workspace's now-empty head).
         let head = jj::workspace_list(&repo)
             .unwrap()
@@ -551,7 +551,7 @@ mod tests {
         assert!(info.path.exists(), "workspace dir should exist");
         assert!(
             info.path.join("wip.txt").exists(),
-            "task must inherit master's WIP"
+            "task must inherit HEAD's WIP"
         );
         assert_ne!(info.change_id, info.fork_point);
 
