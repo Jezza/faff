@@ -61,6 +61,28 @@ fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run `jj --no-pager <args>` with the working directory set to `dir` and **no** `-R`
+/// flag. jj infers the repo + workspace from `dir`, so this acts on whatever workspace
+/// `dir` belongs to. This is the only way to operate on a non-default workspace: `-R`
+/// (as `run_jj` passes it) always pins the `default` workspace and ignores the cwd.
+fn run_jj_in(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("jj")
+        .arg("--no-pager")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .context("spawning jj (is it installed and on PATH?)")?;
+    if !out.status.success() {
+        bail!(
+            "jj {:?} (in {}) failed: {}",
+            args,
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Parse the log template output into RevInfo records.
 fn parse_log(stdout: &str) -> Vec<RevInfo> {
     stdout
@@ -161,6 +183,39 @@ pub fn workspace_forget(repo: &Path, name: &str) -> Result<()> {
 pub fn abandon(repo: &Path, revset: &str) -> Result<()> {
     run_jj(repo, &["abandon", "-r", revset])?;
     Ok(())
+}
+
+/// `jj -R <repo> edit <rev>` — repoint the **default** workspace's `@` at an existing
+/// revision. `-R` pins the default workspace regardless of cwd, so this only ever moves
+/// HEAD's own working copy.
+pub fn edit(repo: &Path, rev: &str) -> Result<()> {
+    run_jj(repo, &["edit", rev])?;
+    Ok(())
+}
+
+/// `jj edit <rev>` run inside a workspace directory (no `-R`): move that workspace's
+/// `@` onto `rev`. The only way to repoint a non-default (agent) workspace.
+pub fn edit_in(ws_dir: &Path, rev: &str) -> Result<()> {
+    run_jj_in(ws_dir, &["edit", rev])?;
+    Ok(())
+}
+
+/// `jj util snapshot` inside a workspace dir (no `-R`): fold that workspace's
+/// working-copy changes into its `@`, with no other effect. Lets faf capture edits from
+/// an agent that never ran a jj command itself (so nothing snapshotted it).
+pub fn snapshot_in(ws_dir: &Path) -> Result<()> {
+    run_jj_in(ws_dir, &["util", "snapshot"])?;
+    Ok(())
+}
+
+/// Whether `revset` matches at least one revision. Lets callers branch on set
+/// (non-)emptiness without parsing counts.
+pub fn any_revision(repo: &Path, revset: &str) -> Result<bool> {
+    let out = run_jj(
+        repo,
+        &["log", "--no-graph", "-r", revset, "-T", CHANGE_ID_TEMPLATE],
+    )?;
+    Ok(out.lines().any(|l| !l.trim().is_empty()))
 }
 
 #[cfg(test)]
@@ -285,5 +340,29 @@ mod tests {
             "HEAD and task must branch from the same frozen fork-point"
         );
         assert_eq!(head.parents.len(), 1);
+    }
+
+    #[test]
+    fn integration_any_revision_matches_and_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+        let init = Command::new("jj")
+            .args(["git", "init"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        jj_setup(&repo, &cfg, &["commit", "-m", "base"]); // leaves @ empty on top of base
+
+        // A matching revset is truthy; an empty one is falsy.
+        assert!(any_revision(&repo, "all()").unwrap());
+        assert!(any_revision(&repo, "@").unwrap());
+        assert!(!any_revision(&repo, "none()").unwrap());
+        // The fresh @ is empty, so its non-empty subset matches nothing.
+        assert!(!any_revision(&repo, "@ ~ empty()").unwrap());
     }
 }

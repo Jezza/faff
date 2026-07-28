@@ -2,7 +2,7 @@
 //! and teardown. See spec §5, §9. All jj shelling goes through `crate::jj`.
 
 use crate::{config, jj};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -66,16 +66,20 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
     create(repo, &name, &path)
 }
 
-/// Retire a task workspace: abandon the task's *un-integrated* commits, forget the
-/// workspace, and remove its directory.
+/// Retire a task workspace: forget it, delete its directory, and abandon its commits
+/// **only if they are all empty**.
 ///
-/// The abandon set is `(fork_point..head) ~ ::@`: the task's own commits, MINUS
-/// anything that is now an ancestor of HEAD's `@`. This is the crucial safety
-/// property — if you integrated the task (e.g. rebased HEAD onto its commit),
-/// that commit is in `::@` and is preserved; abandoning it would rewrite HEAD and
-/// undo your integration. If nothing was integrated (a discard), the whole branch is
-/// abandoned so no orphaned heads are left. Done *before* forgetting, while the
-/// workspace still exists.
+/// The task's own commits are `(fork_point..head) ~ ::@` — its branch, minus anything
+/// already integrated into HEAD's `@` (which must never be rewritten). Of that set:
+/// - if any commit carries real content, faf leaves the whole branch alone as ordinary
+///   history — you integrate or `jj abandon` it yourself. faf never discards real work
+///   on removal;
+/// - if they are all empty (a bare fork, an empty tip — graph noise), they're abandoned
+///   so no empty heads linger.
+///
+/// This also makes `swap` safe to undo by removal: after a swap the agent workspace
+/// holds your old (non-empty) line, so removing that task keeps your work. The abandon
+/// runs *before* forgetting, while the workspace still exists.
 pub fn teardown(repo: &Path, ws_name: &str, ws_path: &Path, fork_point: &str) -> Result<()> {
     if let Some(head) = jj::workspace_list(repo)?
         .into_iter()
@@ -83,8 +87,15 @@ pub fn teardown(repo: &Path, ws_name: &str, ws_path: &Path, fork_point: &str) ->
         .map(|w| w.change_id)
         && head != fork_point
     {
-        // Best-effort: empty result (fully integrated) / gone revisions are fine.
-        let _ = jj::abandon(repo, &format!("({fork_point}..{head}) ~ ::@"));
+        let own = format!("({fork_point}..{head}) ~ ::@");
+        // `({own}) ~ empty()` is the task's own commits with the empty ones removed —
+        // i.e. its real work. If any exists, preserve the branch (skip the abandon).
+        // On a query error, default to preserving: never risk discarding real work.
+        let has_content = jj::any_revision(repo, &format!("({own}) ~ empty()")).unwrap_or(true);
+        if !has_content {
+            // Best-effort: an empty result (fully integrated) / gone revisions are fine.
+            let _ = jj::abandon(repo, &own);
+        }
     }
     jj::workspace_forget(repo, ws_name).context("jj workspace forget")?;
     if ws_path.exists() {
@@ -92,6 +103,57 @@ pub fn teardown(repo: &Path, ws_name: &str, ws_path: &Path, fork_point: &str) ->
             .with_context(|| format!("removing workspace dir {}", ws_path.display()))?;
     }
     Ok(())
+}
+
+/// Swap the default workspace's `@` with a task workspace's revision — a literal trade
+/// of checkouts. Your repo ends up on the agent's work; the agent's workspace ends up
+/// on your old line (so its next work is based on your current line, not an ever-staler
+/// fork). Returns the change_id the agent workspace now sits on (your old `@`).
+///
+/// jj has no atomic two-workspace swap, so this is a snapshot then two `jj edit`s, in
+/// an order chosen around one jj rule: an empty, description-less commit is auto-
+/// abandoned the moment its *last* workspace leaves it.
+/// 1. Snapshot both workspaces, so nothing uncommitted is lost and each commit holds
+///    its latest content before the trade (the agent may never have run jj itself).
+/// 2. Bail if the agent's revision is empty — there's nothing to adopt, and moving onto
+///    it would let jj abandon it mid-trade.
+/// 3. Move the *agent* onto your old line first, while the default workspace still holds
+///    it. That keeps your `@` doubly-referenced, so it survives even when it's empty —
+///    the common case, where you dispatched an agent and never touched your own tree.
+/// 4. Move the default workspace onto the agent's revision. Your old `@` survives (the
+///    agent now holds it); the agent's revision is now held by both.
+///
+/// If step 4 fails the swap is left half-applied — recoverable, since "both workspaces
+/// on the agent's rev" is exactly the combined HEAD+agent node faf already renders
+/// (re-run swap or fix by hand). Bails untouched if `@` is already the agent's revision.
+pub fn swap(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
+    let user_head = jj::resolve_change_id(repo, "@").context("resolving @")?;
+    let agent_head = jj::workspace_list(repo)?
+        .into_iter()
+        .find(|w| w.name == ws_name)
+        .map(|w| w.change_id)
+        .with_context(|| format!("workspace {ws_name} not found"))?;
+    if user_head == agent_head {
+        bail!("@ is already on {ws_name}'s revision — nothing to swap");
+    }
+    // 1. Capture both workspaces' uncommitted edits (change_ids are unchanged by this).
+    jj::snapshot_in(ws_path).context("snapshotting the agent workspace")?;
+    jj::snapshot_in(repo).context("snapshotting your workspace")?;
+    // 2. Nothing to adopt from an empty agent revision.
+    if !jj::any_revision(repo, &format!("{agent_head} ~ empty()"))? {
+        bail!("{ws_name}'s revision is empty — nothing to adopt");
+    }
+    // 3. Agent onto your old line first (keeps an empty `@` alive — see above).
+    jj::edit_in(ws_path, &user_head).context("moving the agent onto your old line")?;
+    // 4. Default workspace onto the agent's revision.
+    jj::edit(repo, &agent_head).context("moving @ onto the agent's revision")?;
+    Ok(user_head)
+}
+
+/// Snapshot a task workspace's working copy into its `@` (see `jj::snapshot_in`), so an
+/// agent that hasn't run a jj command has its edits reflected in the revision graph.
+pub fn snapshot(ws_path: &Path) -> Result<()> {
+    jj::snapshot_in(ws_path)
 }
 
 /// Pre-trust `ws_path` in `~/.claude.json` so the spawned agent skips the
@@ -448,7 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn integration_teardown_abandons_whole_task_branch() {
+    fn integration_teardown_keeps_nonempty_work() {
+        // faf never discards real work on removal: a task branch with content is left
+        // as ordinary history (workspace forgotten, dir gone, commits preserved).
         let tmp = tempfile::tempdir().unwrap();
         let (repo, cfg) = scratch_repo(tmp.path());
 
@@ -461,24 +525,150 @@ mod tests {
         fs::write(ws_path.join("b.txt"), "b").unwrap();
         jj_in(&ws_path, &cfg, &["commit", "-m", "WORKB"]);
 
-        let before = jj::log(&repo, "all()").unwrap();
-        assert!(before.iter().any(|r| r.description == "WORKA"));
-        assert!(before.iter().any(|r| r.description == "WORKB"));
+        teardown(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
+
+        // Both task commits SURVIVE (the branch is real work, not noise); the workspace
+        // is forgotten and its directory removed.
+        let after = jj::log(&repo, "all()").unwrap();
+        assert!(
+            after.iter().any(|r| r.description == "WORKA"),
+            "WORKA must be kept, not abandoned"
+        );
+        assert!(
+            after.iter().any(|r| r.description == "WORKB"),
+            "WORKB must be kept, not abandoned"
+        );
+        assert!(!ws_path.exists());
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|w| w.name == "faf-task-2")
+        );
+    }
+
+    #[test]
+    fn integration_teardown_abandons_empty_branch() {
+        // A task that produced no content (just the empty fork tip) is pure graph noise;
+        // teardown abandons it so no empty head lingers.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+
+        let ws_path = tmp.path().join("ws").join("0009");
+        let info = create(&repo, "faf-task-9", &ws_path).unwrap();
+        // The workspace's @ is an empty commit on the fork point.
+        assert_ne!(info.change_id, info.fork_point);
 
         teardown(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
 
-        // Both task commits are gone (no orphaned heads), HEAD's base survives.
+        // The empty tip is gone (abandoned), the workspace forgotten, the dir removed.
         let after = jj::log(&repo, "all()").unwrap();
         assert!(
-            !after.iter().any(|r| r.description == "WORKA"),
-            "WORKA must be abandoned, not orphaned"
+            !after.iter().any(|r| r.change_id == info.change_id),
+            "empty task tip must be abandoned"
         );
-        assert!(
-            !after.iter().any(|r| r.description == "WORKB"),
-            "WORKB must be abandoned, not orphaned"
-        );
-        assert!(after.iter().any(|r| r.description == "base"));
         assert!(!ws_path.exists());
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|w| w.name == "faf-task-9")
+        );
+    }
+
+    #[test]
+    fn integration_swap_trades_checkouts() {
+        // Trade the default workspace's @ with the agent's revision. The agent here has
+        // NOT snapshotted its edits — swap must capture them first (step 1), so the
+        // agent's work materialises in the default repo after the trade.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+
+        // Give the default workspace some WIP, then fork a task off it.
+        fs::write(repo.join("user.txt"), "mine").unwrap();
+        let ws_path = tmp.path().join("ws").join("0004");
+        let info = create(&repo, "faf-task-4", &ws_path).unwrap();
+
+        // The agent edits a file but never runs jj (no snapshot of its own).
+        fs::write(ws_path.join("agent.txt"), "theirs").unwrap();
+
+        let user_before = jj::resolve_change_id(&repo, "@").unwrap();
+        let agent_before = info.change_id.clone();
+
+        let returned = swap(&repo, &info.name, &ws_path).unwrap();
+
+        // The default workspace now sits on the agent's revision; the agent workspace on
+        // your old line. swap returns the agent workspace's new head (your old @).
+        assert_eq!(returned, user_before, "swap returns your old @");
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            agent_before,
+            "default @ moved onto the agent's revision"
+        );
+        let agent_head_now = jj::workspace_list(&repo)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.name == "faf-task-4")
+            .unwrap()
+            .change_id;
+        assert_eq!(agent_head_now, user_before, "agent moved onto your old line");
+
+        // Files followed the checkouts: the agent's captured work is now in the default
+        // repo (proving the pre-swap snapshot), and gone from the agent workspace.
+        assert!(
+            repo.join("agent.txt").exists(),
+            "agent's work materialised in the default repo"
+        );
+        assert!(repo.join("user.txt").exists(), "your work is still present");
+        assert!(
+            !ws_path.join("agent.txt").exists(),
+            "agent workspace no longer holds the agent's work"
+        );
+        assert!(ws_path.join("user.txt").exists());
+    }
+
+    #[test]
+    fn integration_swap_bails_when_already_parked() {
+        // If @ already sits on the agent's revision, there is nothing to trade.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        fs::write(repo.join("user.txt"), "mine").unwrap();
+        let ws_path = tmp.path().join("ws").join("0005");
+        let info = create(&repo, "faf-task-5", &ws_path).unwrap();
+
+        // Park the default workspace onto the agent's revision (as `jj edit` would).
+        jj::edit(&repo, &info.change_id).unwrap();
+
+        let err = swap(&repo, &info.name, &ws_path).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to swap"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn integration_snapshot_captures_agent_edits() {
+        // An agent that never runs jj leaves its @ empty; `snapshot` folds its edits in.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let ws_path = tmp.path().join("ws").join("0006");
+        let info = create(&repo, "faf-task-6", &ws_path).unwrap();
+        let head = info.change_id.clone();
+
+        let empty = |cid: &str| {
+            jj::log(&repo, cid)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.change_id == cid)
+                .unwrap()
+                .empty
+        };
+        assert!(empty(&head), "the agent tip starts empty");
+
+        fs::write(ws_path.join("new.txt"), "captured").unwrap();
+        snapshot(&ws_path).unwrap();
+
+        assert!(!empty(&head), "snapshot must fold the agent's edit into its @");
     }
 
     #[test]

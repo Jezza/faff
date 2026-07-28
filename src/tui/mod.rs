@@ -116,6 +116,9 @@ struct App {
     last_refresh: Instant,
     /// Set when an event/title arrived; coalesces bursts into a throttled refresh.
     pending_refresh: bool,
+    /// Set to a task id after `s` on a *working* agent: the next key confirms the swap
+    /// (another `s`) or cancels it (anything else). Guards yanking a live agent's files.
+    pending_swap: Option<TaskId>,
 }
 
 impl App {
@@ -153,6 +156,7 @@ impl App {
             should_quit: false,
             last_refresh: Instant::now(),
             pending_refresh: false,
+            pending_swap: None,
         };
         app.refresh();
         Ok(app)
@@ -205,13 +209,26 @@ impl App {
     }
 
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
-        match input::map_key(key) {
+        let action = input::map_key(key);
+        // A pending swap-confirmation swallows the next key: `s` confirms, anything
+        // else cancels (so a live agent's files are only yanked on a deliberate re-press).
+        if let Some(id) = self.pending_swap.take() {
+            if action == Action::Swap {
+                self.perform_swap(id);
+            } else {
+                self.status = "swap cancelled".to_string();
+            }
+            return;
+        }
+        match action {
             Action::Quit => self.should_quit = true,
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
             Action::NewTask => self.new_task(),
             Action::ToggleSession => self.toggle_session(),
             Action::Remove => self.remove_selected(),
+            Action::Swap => self.swap_selected(),
+            Action::Snapshot => self.snapshot_selected(),
             Action::None => {}
         }
     }
@@ -396,6 +413,66 @@ impl App {
         }
         let _ = self.store.delete_task(t.id);
         self.status = format!("removed #{}", t.id.0);
+        self.refresh();
+    }
+
+    /// `s`: swap the default workspace's `@` with the selected agent's revision (a
+    /// literal trade of checkouts — see `workspace::swap`). If the agent is actively
+    /// working, the first `s` only arms a confirmation (its files are about to change
+    /// underneath it); a second `s` (via `handle_key`) goes through.
+    fn swap_selected(&mut self) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        if t.ws_name.is_none() || t.ws_path.is_none() {
+            self.status = "no workspace to swap for this task".to_string();
+            return;
+        }
+        if t.status == TaskStatus::Working {
+            self.pending_swap = Some(t.id);
+            self.status = format!(
+                "#{} is working — press s to confirm swap, any other key cancels",
+                t.id.0
+            );
+            return;
+        }
+        self.perform_swap(t.id);
+    }
+
+    /// Run the swap for task `id` (already validated / confirmed) and refresh.
+    fn perform_swap(&mut self, id: TaskId) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let (Some(name), Some(path)) = (t.ws_name.clone(), t.ws_path.clone()) else {
+            self.status = "no workspace to swap for this task".to_string();
+            return;
+        };
+        match workspace::swap(&self.repo, &name, &path) {
+            Ok(new_rev) => {
+                // Keep the recorded revision honest (the graph rebuilds from jj anyway).
+                let _ = self.store.set_ws_change_id(id, &new_rev);
+                self.status = format!("swapped @ ⇄ #{}", id.0);
+            }
+            Err(e) => self.status = format!("swap failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    /// `S`: snapshot the selected agent's workspace so edits from an agent that hasn't
+    /// run a jj command land in its `@` and show up in the graph.
+    fn snapshot_selected(&mut self) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        let Some(path) = t.ws_path.clone() else {
+            self.status = "no workspace to snapshot for this task".to_string();
+            return;
+        };
+        match workspace::snapshot(&path) {
+            Ok(()) => self.status = format!("snapshotted #{}", t.id.0),
+            Err(e) => self.status = format!("snapshot failed: {e}"),
+        }
         self.refresh();
     }
 
@@ -729,7 +806,10 @@ impl App {
         } else {
             "[↵]open"
         };
-        let keys = format!(" [n]ew {enter} [x]remove [q]uit   {}", self.status);
+        let keys = format!(
+            " [n]ew {enter} [s]wap [S]napshot [x]remove [q]uit   {}",
+            self.status
+        );
         f.render_widget(
             Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
             area,
@@ -768,8 +848,42 @@ mod tests {
             status: "ready".into(),
             should_quit: false,
             pending_refresh: false,
+            pending_swap: None,
             last_refresh: Instant::now(),
         }
+    }
+
+    use ratatui::crossterm::event::KeyCode;
+    fn key(code: KeyCode) -> ratatui::crossterm::event::KeyEvent {
+        ratatui::crossterm::event::KeyEvent {
+            code,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: ratatui::crossterm::event::KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn swap_on_working_agent_arms_then_cancels() {
+        // `s` on a working agent must not shell out to jj; it only arms a confirmation.
+        // A non-`s` key then cancels and clears the pending state.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.swap_selected();
+        assert_eq!(app.pending_swap, Some(t.id), "first s arms the confirmation");
+        assert!(app.status.contains("press s to confirm"));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pending_swap, None, "a non-s key cancels");
+        assert_eq!(app.status, "swap cancelled");
     }
 
     #[test]

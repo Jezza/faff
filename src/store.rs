@@ -181,6 +181,16 @@ impl Store {
         Ok(())
     }
 
+    /// Update just the recorded agent revision (after a swap moves its workspace `@`).
+    /// The graph rebuilds from jj regardless; this keeps the stored row honest.
+    pub fn set_ws_change_id(&self, id: TaskId, change_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET ws_change_id = ?2 WHERE id = ?1",
+            params![id.0, change_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_pane(&self, id: TaskId, pane_id: Option<u64>) -> Result<()> {
         self.conn.execute(
             "UPDATE tasks SET pane_id = ?2 WHERE id = ?1",

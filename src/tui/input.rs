@@ -12,6 +12,10 @@ pub enum Action {
     ToggleSession,
     /// Remove the task: kill its pane, tear down its workspace, drop it from faf.
     Remove,
+    /// `s`: swap HEAD's `@` with the selected agent's revision (trade checkouts).
+    Swap,
+    /// `S`: snapshot the selected agent's workspace (fold its edits into its `@`).
+    Snapshot,
     None,
 }
 
@@ -24,6 +28,8 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('n') => Action::NewTask,
         KeyCode::Enter => Action::ToggleSession,
         KeyCode::Char('x') => Action::Remove,
+        KeyCode::Char('s') => Action::Swap,
+        KeyCode::Char('S') => Action::Snapshot,
         _ => Action::None,
     }
 }
@@ -52,6 +58,8 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('n'))), Action::NewTask);
         assert_eq!(map_key(k(KeyCode::Enter)), Action::ToggleSession);
         assert_eq!(map_key(k(KeyCode::Char('x'))), Action::Remove);
+        assert_eq!(map_key(k(KeyCode::Char('s'))), Action::Swap);
+        assert_eq!(map_key(k(KeyCode::Char('S'))), Action::Snapshot);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }
