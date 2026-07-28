@@ -218,6 +218,31 @@ pub fn any_revision(repo: &Path, revset: &str) -> Result<bool> {
     Ok(out.lines().any(|l| !l.trim().is_empty()))
 }
 
+/// First line of the description of the revision `revset` resolves to (empty string
+/// when it has none, or when nothing matches).
+pub fn description(repo: &Path, revset: &str) -> Result<String> {
+    let out = run_jj(
+        repo,
+        &[
+            "log",
+            "--no-graph",
+            "-r",
+            revset,
+            "-T",
+            r#"description.first_line() ++ "\n""#,
+        ],
+    )?;
+    Ok(out.lines().next().unwrap_or("").to_string())
+}
+
+/// `jj describe -r <revset> -m <message>` — set a change's description. Used to seed a
+/// task change's description from its first prompt; the caller guards against clobbering
+/// an existing one (see `title::spawn_seed_job`).
+pub fn describe(repo: &Path, revset: &str, message: &str) -> Result<()> {
+    run_jj(repo, &["describe", "-r", revset, "-m", message])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +389,35 @@ mod tests {
         assert!(!any_revision(&repo, "none()").unwrap());
         // The fresh @ is empty, so its non-empty subset matches nothing.
         assert!(!any_revision(&repo, "@ ~ empty()").unwrap());
+    }
+
+    #[test]
+    fn integration_describe_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+
+        let init = Command::new("jj")
+            .args(["git", "init"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success(), "jj git init failed");
+        // Persist the committer identity in the repo config so the production `run_jj`
+        // (which doesn't set JJ_CONFIG) can write a commit inside the sandbox.
+        jj_setup(&repo, &cfg, &["config", "set", "--repo", "user.name", "Test"]);
+        jj_setup(
+            &repo,
+            &cfg,
+            &["config", "set", "--repo", "user.email", "test@x.io"],
+        );
+
+        // A fresh working copy has no description.
+        assert_eq!(description(&repo, "@").unwrap(), "");
+        // describe sets it; description reads back its first line.
+        describe(&repo, "@", "seeded from the prompt").unwrap();
+        assert_eq!(description(&repo, "@").unwrap(), "seeded from the prompt");
     }
 }

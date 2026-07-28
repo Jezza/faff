@@ -7,7 +7,7 @@ mod input;
 mod model;
 mod session;
 
-use crate::domain::{Autonomy, Task, TaskId, TaskStatus};
+use crate::domain::{Autonomy, Task, TaskId, TaskStatus, truncate_first_line};
 use crate::graph::{self, GraphRow};
 use crate::store::Store;
 use crate::{config, events, jj, title, wezterm, workspace};
@@ -93,8 +93,10 @@ struct App {
     db: PathBuf,
     store: Store,
     events_rx: Receiver<events::Event>,
-    title_tx: Sender<(TaskId, String)>,
-    title_rx: Receiver<(TaskId, String)>,
+    /// Background description-seed jobs send back the id of a task they just described,
+    /// as a nudge to refresh so the new description shows.
+    seed_tx: Sender<TaskId>,
+    seed_rx: Receiver<TaskId>,
     faf_pane: Option<u64>,
 
     // View state (owned; recomputed on refresh).
@@ -109,12 +111,12 @@ struct App {
     open_pane: Option<u64>,
     /// change_id -> (unique prefix, padding rest) for the id column, from jj.
     id_display: std::collections::HashMap<String, (String, String)>,
-    /// Tasks a title job has already been dispatched for (avoid re-dispatching).
-    title_requested: std::collections::HashSet<TaskId>,
+    /// Tasks a description-seed job has already been dispatched for (once per session).
+    seed_requested: std::collections::HashSet<TaskId>,
     status: String,
     should_quit: bool,
     last_refresh: Instant,
-    /// Set when an event/title arrived; coalesces bursts into a throttled refresh.
+    /// Set when an event/seed arrived; coalesces bursts into a throttled refresh.
     pending_refresh: bool,
     /// Set to a task id after `s` on a *working* agent: the next key confirms the swap
     /// (another `s`) or cancels it (anything else). Guards yanking a live agent's files.
@@ -127,7 +129,7 @@ impl App {
         let store = Store::open(&db)?;
         let socket = events::socket_path(&repo);
         let events_rx = events::spawn_listener(&socket)?;
-        let (title_tx, title_rx) = channel();
+        let (seed_tx, seed_rx) = channel();
         let faf_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faf"));
         let faf_pane = std::env::var("WEZTERM_PANE")
             .ok()
@@ -140,8 +142,8 @@ impl App {
             db,
             store,
             events_rx,
-            title_tx,
-            title_rx,
+            seed_tx,
+            seed_rx,
             faf_pane,
             tasks: Vec::new(),
             rows: Vec::new(),
@@ -151,7 +153,7 @@ impl App {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            title_requested: std::collections::HashSet::new(),
+            seed_requested: std::collections::HashSet::new(),
             status: "ready".to_string(),
             should_quit: false,
             last_refresh: Instant::now(),
@@ -187,23 +189,17 @@ impl App {
         Ok(())
     }
 
-    /// Drain the socket nudge channel and completed title jobs. Hook events are
-    /// persisted to the store by `report-event` itself, so socket messages are only
-    /// refresh nudges here (not re-applied). Returns whether anything arrived.
+    /// Drain the socket nudge channel and completed description-seed jobs. Hook events
+    /// are persisted to the store by `report-event` itself, so socket messages are only
+    /// refresh nudges here (not re-applied); a seed job already wrote the jj description
+    /// itself, so its message is likewise just a nudge. Returns whether anything arrived.
     fn drain_channels(&mut self) -> bool {
         let mut any = false;
         while self.events_rx.try_recv().is_ok() {
             any = true; // report-event already wrote the store; just nudge a refresh
         }
-        while let Ok((id, title)) = self.title_rx.try_recv() {
-            any = true;
-            let _ = self.store.set_title(id, &title);
-            // Reflect the title on the agent's WezTerm tab too.
-            if let Ok(t) = self.store.get_task(id)
-                && let Some(pane) = t.pane_id
-            {
-                let _ = wezterm::set_tab_title(pane, &format!("#{} {title}", id.0));
-            }
+        while self.seed_rx.try_recv().is_ok() {
+            any = true; // a description was seeded; refresh so the new label shows
         }
         any
     }
@@ -342,7 +338,7 @@ impl App {
             prog.push(&t.prompt);
         }
         let pane = wezterm::spawn(&ws_path, &prog)?;
-        let _ = wezterm::set_tab_title(pane, &format!("#{} {}", t.id.0, t.label()));
+        let _ = wezterm::set_tab_title(pane, &format!("#{}", t.id.0));
         // `wezterm cli spawn` activates the new tab, stealing focus from faf. Return
         // focus to faf so spawning an agent never yanks the user out of the TUI (a new
         // task re-focuses its own pane afterward — see open_session).
@@ -476,17 +472,24 @@ impl App {
         self.refresh();
     }
 
-    /// Kick off the async title job for any task that has a prompt (captured from its
-    /// first UserPromptSubmit) but no title yet — once per task.
-    fn maybe_generate_titles(&mut self) {
+    /// Kick off the async description-seed job for any task that has a prompt (captured
+    /// from its first UserPromptSubmit) and a workspace — once per task per session. The
+    /// job itself skips tasks whose change already has a description, so this can fire for
+    /// every task without clobbering anything.
+    fn maybe_seed_descriptions(&mut self) {
         for t in &self.tasks {
-            if t.title.is_none()
-                && !t.prompt.trim().is_empty()
-                && !self.title_requested.contains(&t.id)
-            {
-                self.title_requested.insert(t.id);
-                title::spawn_title_job(t.id, t.prompt.clone(), self.title_tx.clone());
+            if t.prompt.trim().is_empty() || self.seed_requested.contains(&t.id) {
+                continue;
             }
+            let Some(ws) = t.ws_name.clone() else { continue };
+            self.seed_requested.insert(t.id);
+            title::spawn_seed_job(
+                t.id,
+                self.repo.clone(),
+                format!("{ws}@"),
+                t.prompt.clone(),
+                self.seed_tx.clone(),
+            );
         }
     }
 
@@ -520,8 +523,8 @@ impl App {
             self.open_pane = self.detect_open_pane(p);
         }
 
-        // Generate titles for tasks that captured a prompt but have no title yet.
-        self.maybe_generate_titles();
+        // Seed jj descriptions for tasks that captured a prompt (no-op if already set).
+        self.maybe_seed_descriptions();
 
         // Build the revision graph from the (already-fetched) workspace list.
         if let Some(ws) = &ws_list {
@@ -694,6 +697,10 @@ impl App {
     fn render_graph(&self, f: &mut Frame, area: Rect) {
         let selected = self.task_order.get(self.selected).copied();
         let open = self.open_task_id();
+        // Text width inside the block (its RIGHT border takes one column). Labels are
+        // clipped to fit this — and only when they overflow — so the log fills the pane
+        // and re-fits whenever docking/detaching a session resizes faff.
+        let text_w = area.width.saturating_sub(1) as usize;
         let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len());
         // Width of the "[abcdefgh] " id column, so continuation lines align under content.
         let id_col = ID_W + 3;
@@ -705,6 +712,10 @@ impl App {
             } else {
                 Style::default()
             };
+            // Reserve columns for the trailing docked-session marker on rows that show it,
+            // so truncating the content never pushes the `▶` off the pane.
+            let show_marker = row_task.is_some() && row_task == open;
+            let marker_w = if show_marker { 3 } else { 0 };
             let mut spans: Vec<Span> = Vec::new();
             match &row.change_id {
                 // Node row: gutter + [id] + content, with the unique prefix highlighted.
@@ -713,6 +724,7 @@ impl App {
                     // other gutter character keeps the base style. Only the `@` node's
                     // commit row ever carries `@`, and there is at most one.
                     let gutter = format!("{}  ", row.gutter);
+                    let gutter_w = gutter.chars().count();
                     match gutter.find('@') {
                         Some(at) => {
                             spans.push(Span::styled(gutter[..at].to_string(), base));
@@ -729,6 +741,7 @@ impl App {
                         .get(cid)
                         .cloned()
                         .unwrap_or_else(|| (cid.chars().take(ID_W).collect(), String::new()));
+                    let id_w = 1 + prefix.chars().count() + rest.chars().count() + 2;
                     spans.push(Span::styled("[", base.fg(Color::DarkGray)));
                     spans.push(Span::styled(
                         prefix,
@@ -736,9 +749,10 @@ impl App {
                     ));
                     spans.push(Span::styled(rest, base.fg(Color::DarkGray)));
                     spans.push(Span::styled("] ", base.fg(Color::DarkGray)));
-                    spans.push(Span::styled(row.content.clone(), base));
+                    let avail = text_w.saturating_sub(gutter_w + id_w + marker_w);
+                    spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
                     // Marker for the currently-docked (focused) session.
-                    if row_task.is_some() && row_task == open {
+                    if show_marker {
                         spans.push(Span::styled(
                             "  ▶",
                             base.fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -751,14 +765,13 @@ impl App {
                 }
                 // Continuation row: gutter + id-column padding + content (aligned).
                 None => {
-                    spans.push(Span::styled(
-                        format!("{}  {}", row.gutter, " ".repeat(id_col)),
-                        base,
-                    ));
-                    spans.push(Span::styled(row.content.clone(), base));
+                    let pad = format!("{}  {}", row.gutter, " ".repeat(id_col));
+                    let avail = text_w.saturating_sub(pad.chars().count() + marker_w);
+                    spans.push(Span::styled(pad, base));
+                    spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
                     // The combined HEAD+agent node hangs its task (and so its docked
                     // marker) on the agent's continuation line, not the HEAD header row.
-                    if row_task.is_some() && row_task == open {
+                    if show_marker {
                         spans.push(Span::styled(
                             "  ▶",
                             base.fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -778,14 +791,17 @@ impl App {
             for id in &self.detached {
                 if let Some(t) = self.tasks.iter().find(|t| &t.id == id) {
                     let (icon, _) = model::status_label(t.status);
+                    let show_marker = open == Some(*id);
+                    let marker_w = if show_marker { 3 } else { 0 };
                     let text = format!("· #{} {} {icon}", t.id.0, t.label());
+                    let text = truncate_first_line(&text, text_w.saturating_sub(marker_w));
                     let style = if selected == Some(*id) {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default()
                     };
                     let mut spans = vec![Span::styled(text, style)];
-                    if open == Some(*id) {
+                    if show_marker {
                         spans.push(Span::styled(
                             "  ▶",
                             style.fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -824,7 +840,7 @@ mod tests {
 
     // Build a minimal App with an in-memory store (no jj/wezterm needed).
     fn test_app() -> App {
-        let (title_tx, title_rx) = channel();
+        let (seed_tx, seed_rx) = channel();
         let (_ev_tx, events_rx) = channel();
         App {
             repo: PathBuf::from("/tmp/repo"),
@@ -833,8 +849,8 @@ mod tests {
             db: PathBuf::from("/tmp/faf.db"),
             store: Store::open_memory().unwrap(),
             events_rx,
-            title_tx,
-            title_rx,
+            seed_tx,
+            seed_rx,
             faf_pane: Some(1),
             tasks: Vec::new(),
             rows: Vec::new(),
@@ -844,7 +860,7 @@ mod tests {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            title_requested: std::collections::HashSet::new(),
+            seed_requested: std::collections::HashSet::new(),
             status: "ready".into(),
             should_quit: false,
             pending_refresh: false,

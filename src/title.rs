@@ -1,8 +1,16 @@
-//! Async task-title generation via a one-shot `claude -p --model haiku`. See spec §11.
-//! Non-blocking: the task shows a fallback label until the real title arrives.
+//! One-time seeding of a task change's jj description via a one-shot
+//! `claude -p --model haiku`. See spec §11.
+//!
+//! When a task captures its first prompt, we derive a short title from it and set it as
+//! the change's jj `description` — but only if the change has none yet, so we never
+//! clobber a description the agent or the user set. The log view reads the live
+//! description, so once seeded (or once the agent describes its own work) the row
+//! updates on its own. Non-blocking: runs on a background thread and nudges a refresh.
 
 use crate::domain::{LABEL_WIDTH, TaskId, truncate_first_line};
+use crate::jj;
 use anyhow::Result;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::Sender;
 
@@ -63,11 +71,30 @@ pub fn claude_runner(instruction: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Spawn a background thread that derives the title and sends `(id, title)` back.
-pub fn spawn_title_job(id: TaskId, prompt: String, tx: Sender<(TaskId, String)>) {
+/// Spawn a background thread that seeds the description of the change `revset` resolves
+/// to (typically `"<workspace>@"`). Best-effort and non-clobbering: skips if the change
+/// already has a description, or if reading/writing jj fails. On a successful write,
+/// sends `id` back so the TUI refreshes and shows the new description.
+pub fn spawn_seed_job(
+    id: TaskId,
+    repo: PathBuf,
+    revset: String,
+    prompt: String,
+    tx: Sender<TaskId>,
+) {
     std::thread::spawn(move || {
-        let title = derive_title(&prompt, claude_runner);
-        let _ = tx.send((id, title));
+        // Never overwrite a description the agent or user already set.
+        match jj::description(&repo, &revset) {
+            Ok(d) if d.trim().is_empty() => {}
+            _ => return,
+        }
+        let desc = derive_title(&prompt, claude_runner);
+        if desc.is_empty() {
+            return;
+        }
+        if jj::describe(&repo, &revset, &desc).is_ok() {
+            let _ = tx.send(id);
+        }
     });
 }
 
