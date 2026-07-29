@@ -10,7 +10,6 @@ pub mod graph;
 pub mod jj;
 pub mod scheduler;
 pub mod store;
-pub mod title;
 pub mod tui;
 pub mod wezterm;
 pub mod workspace;
