@@ -174,6 +174,14 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
     let mut nodes = Vec::with_capacity(revs.len());
     let mut task_of = Vec::with_capacity(revs.len());
 
+    // Widest task-id (in digits) across the tasks, so every `#id` field pads to a common
+    // width and the status emoji that follows lines up down the stacked agent rows.
+    let id_width = tasks
+        .iter()
+        .map(|t| t.id.0.to_string().len())
+        .max()
+        .unwrap_or(1);
+
     for rev in revs {
         let ws = workspaces.iter().find(|w| w.change_id == rev.change_id);
         // A rev can be the working copy of several workspaces at once: after
@@ -186,7 +194,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             .filter(|w| w.change_id == rev.change_id)
             .find_map(|w| tasks.iter().find(|t| t.ws_name.as_deref() == Some(&w.name)));
 
-        let (glyph, lines, collapse, tid) = if let (Some(t), true) = (task, rev.is_current_wc) {
+        let (glyph, mut lines, collapse, tid) = if let (Some(t), true) = (task, rev.is_current_wc) {
             // HEAD is parked on this agent's revision (you `jj edit`ed it). Keep HEAD's
             // own line — the revision's description — on the node and hang the agent
             // beneath it as one indented line, in the same `#id emoji :: title` form the
@@ -199,7 +207,10 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             let (icon, _) = status_label(t.status);
             (
                 '@',
-                vec![head, format!("↳ #{} {} :: {}", t.id, icon, t.label())],
+                vec![
+                    head,
+                    format!("↳ #{:<w$} {} :: {}", t.id.0, icon, t.label(), w = id_width),
+                ],
                 false,
                 Some(t.id),
             )
@@ -219,7 +230,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             let (icon, _) = status_label(t.status);
             (
                 g,
-                vec![format!("#{} {} :: {}", t.id, icon, label)],
+                vec![format!("#{:<w$} {} :: {}", t.id.0, icon, label, w = id_width)],
                 false,
                 Some(t.id),
             )
@@ -254,14 +265,24 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             ('○', vec![String::new()], true, None)
         } else {
             // An ordinary (non-agent) commit — your own history — gets a hollow ○; a
-            // faf agent's revision is a filled ● (see the task branch above).
+            // faf agent's revision is a filled ● (see the task branch above). No
+            // description falls back to jj's "(no description set)" (as the `@` nodes do),
+            // never the change id — that's already drawn in the "[abcdefgh]" id column.
             let d = if rev.description.is_empty() {
-                rev.change_id.chars().take(8).collect::<String>()
+                "(no description set)".to_string()
             } else {
                 rev.description.clone()
             };
             ('○', vec![d], false, None)
         };
+
+        // Lead the label with a fill glyph — right after the id column — marking whether
+        // the change has content: █ non-empty, ░ empty. Every visible node carries one;
+        // collapsed graph-noise nodes are spliced out before render, so they get none.
+        if !collapse && let Some(first) = lines.first_mut() {
+            let fill = if rev.empty { '░' } else { '█' };
+            *first = format!("{fill} {first}");
+        }
 
         nodes.push(GraphNode {
             change_id: rev.change_id.clone(),
@@ -338,24 +359,26 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes.len(), 4);
 
-        // HEAD @ — no description, so the label falls back to jj's placeholder
+        // HEAD @ — empty and no description, so the fill is ░ and the label is jj's
+        // placeholder.
         assert_eq!(m.nodes[0].glyph, '@');
-        assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
+        assert_eq!(m.nodes[0].lines, vec!["░ (no description set)"]);
         assert_eq!(m.task_of[0], None);
 
         // task node: one line `#id emoji :: title`, glyph ● (a faf agent), mapped to task
         // 7. The title is the change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '●');
-        assert_eq!(m.nodes[1].lines, vec!["#7 ⚙ :: Add OAuth flow"]);
+        assert_eq!(m.nodes[1].lines, vec!["░ #7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
 
         // fork-point collapses
         assert!(m.nodes[2].collapse);
         assert_eq!(m.task_of[2], None);
 
-        // base commit: ordinary non-agent history → hollow ○, shows its description
+        // base commit: ordinary non-agent history → hollow ○, non-empty (█), shows its
+        // description
         assert_eq!(m.nodes[3].glyph, '○');
-        assert_eq!(m.nodes[3].lines, vec!["base"]);
+        assert_eq!(m.nodes[3].lines, vec!["█ base"]);
         assert!(!m.nodes[3].collapse);
     }
 
@@ -384,7 +407,7 @@ mod tests {
         assert_eq!(m.nodes[0].glyph, '@');
         // HEAD keeps its own line — the shared revision's description; the agent hangs
         // beneath as one indented `↳ #id emoji :: title` sub-line.
-        assert_eq!(m.nodes[0].lines[0], "agent: did work");
+        assert_eq!(m.nodes[0].lines[0], "█ agent: did work");
         assert!(m.nodes[0].lines[1].starts_with("↳ #1 ⚙ :: "));
         assert_eq!(m.nodes[0].lines.len(), 2);
         // Mapped to the task → the refresh's detached list won't claim it.
@@ -519,13 +542,15 @@ mod tests {
             vec!["@", "├─●", "○", "├─●", "○", "├─●", "○", "○"],
             "trunk stays one clean column; each agent folds to a single ├─● row above its base"
         );
-        // Agent rows carry `#id emoji :: title`; the status is the bare emoji per state.
-        assert!(rows[1].content.starts_with("#15 ⚙ :: "));
-        assert!(rows[3].content.starts_with("#7 🔔 :: "));
-        assert!(rows[5].content.starts_with("#9 ✓ :: "));
-        // Trunk rows are the user's own revisions, shown by description.
-        assert_eq!(rows[2].content, "spawn: declare! child-class refs");
-        assert_eq!(rows[4].content, "Generate bridge clients from JSON Schema");
+        // Agent rows lead with the ░ empty-fill (these forks are empty), then
+        // `#id emoji :: title`. Ids pad to the widest (#15) so the emojis align: #7/#9
+        // gain a trailing space.
+        assert!(rows[1].content.starts_with("░ #15 ⚙ :: "));
+        assert!(rows[3].content.starts_with("░ #7  🔔 :: "));
+        assert!(rows[5].content.starts_with("░ #9  ✓ :: "));
+        // Trunk rows are the user's own revisions, non-empty (█), shown by description.
+        assert_eq!(rows[2].content, "█ spawn: declare! child-class refs");
+        assert_eq!(rows[4].content, "█ Generate bridge clients from JSON Schema");
     }
 
     #[test]
@@ -555,7 +580,81 @@ mod tests {
         }];
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
-        assert_eq!(m.nodes[0].lines[0], "#1 ⚙ :: add oauth login");
+        assert_eq!(m.nodes[0].lines[0], "░ #1 ⚙ :: add oauth login");
+    }
+
+    #[test]
+    fn task_number_is_padded_so_status_emojis_align() {
+        // Mixed-width task ids on stacked agent rows: the narrower number is right-padded
+        // to the widest id's width, so every status emoji begins at the same column.
+        // Without it, "#7 ⚙" and "#12 🔔" put their emojis one column apart.
+        let revs = vec![
+            rev("t7", &["p"], false, true, ""),
+            rev("t12", &["p"], false, true, ""),
+            rev("p", &[], false, false, "base"),
+        ];
+        let workspaces = vec![
+            Workspace {
+                name: "faf-task-7".into(),
+                change_id: "t7".into(),
+            },
+            Workspace {
+                name: "faf-task-12".into(),
+                change_id: "t12".into(),
+            },
+        ];
+        let tasks = vec![
+            task(7, "faf-task-7", TaskStatus::Working),
+            task(12, "faf-task-12", TaskStatus::NeedsInput),
+        ];
+        let m = build(&revs, &workspaces, &tasks);
+        let l7 = &m.nodes[0].lines[0];
+        let l12 = &m.nodes[1].lines[0];
+        assert_eq!(l7, "░ #7  ⚙ :: add oauth login");
+        assert_eq!(l12, "░ #12 🔔 :: add oauth login");
+        // The emoji begins at the same char column on both rows.
+        assert_eq!(
+            l7.chars().position(|c| c == '⚙'),
+            l12.chars().position(|c| c == '🔔'),
+            "status emojis must align across differing task-number widths"
+        );
+    }
+
+    #[test]
+    fn ordinary_commit_without_a_description_shows_placeholder_not_change_id() {
+        // A plain (non-agent, non-wc, non-conflict) commit with no description must show
+        // "(no description set)" — never its change id, which is already drawn in the
+        // "[abcdefgh]" id column, so repeating it as the label is noise. Non-empty so it
+        // doesn't collapse; two-char id keeps the old-fallback substring easy to spot.
+        let revs = vec![rev("abcd1234", &["p"], false, false, "")];
+        let m = build(&revs, &[], &[]);
+        assert_eq!(m.nodes[0].glyph, '○');
+        assert_eq!(m.nodes[0].lines, vec!["█ (no description set)"]);
+        assert!(
+            !m.nodes[0].lines[0].contains("abcd"),
+            "the label must not echo the change id"
+        );
+    }
+
+    #[test]
+    fn visible_nodes_carry_an_empty_fill_indicator() {
+        // Every visible node leads its label with a fill glyph, right after the id column:
+        // █ when the change has content, ░ when it is empty. Collapsed graph-noise nodes
+        // never render, so they get none.
+        let revs = vec![
+            rev("full", &["e"], false, false, "did work"), // non-empty ordinary → █
+            rev("e", &["m"], false, true, "empty wip"),    // empty, described (no collapse) → ░
+            rev("m", &["a", "b"], false, true, ""),        // empty merge (2 parents, no collapse) → ░
+            rev("a", &[], false, false, "a"),
+            rev("b", &[], false, false, "b"),
+        ];
+        let m = build(&revs, &[], &[]);
+        assert_eq!(m.nodes[0].lines[0], "█ did work", "non-empty → full block");
+        assert_eq!(m.nodes[1].lines[0], "░ empty wip", "empty → light shade");
+        assert_eq!(
+            m.nodes[2].lines[0], "░ (no description set)",
+            "empty merge → light shade, keeps its placeholder label"
+        );
     }
 
     #[test]
