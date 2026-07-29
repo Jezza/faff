@@ -115,7 +115,7 @@ pub fn refresh(repo: &Path, ws_name: &str, freeze: bool) -> Result<Refresh> {
     }
     let prompt = format!(
         "Your task's base has moved. Run: jj rebase -b @ -d {base} — \
-         then resolve any conflicts and continue your task."
+         then resolve any conflicts."
     );
     Ok(Refresh::Rebase { base, prompt })
 }
