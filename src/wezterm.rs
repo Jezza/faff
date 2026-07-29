@@ -93,8 +93,8 @@ pub fn get_text_args(pane_id: u64) -> Vec<String> {
 }
 
 /// `wezterm cli send-text --no-paste --pane-id <id>` (text is piped on stdin).
-/// `--no-paste` delivers the bytes as typed input rather than a bracketed paste, so a
-/// trailing carriage return actually submits the line in an interactive TUI.
+/// `--no-paste` delivers the bytes as typed input rather than a bracketed paste. The
+/// submit Enter is sent as a second call (see `send_text`), not inline with the text.
 pub fn send_text_args(pane_id: u64) -> Vec<String> {
     vec![
         s("cli"),
@@ -167,10 +167,28 @@ pub fn get_text(pane_id: u64) -> Result<String> {
     run(&get_text_args(pane_id))
 }
 
-/// Send `text` to a pane as typed input, then a carriage return to submit it. If the
-/// agent is mid-turn Claude Code queues the line; if it's idle the prompt runs at once —
-/// faff needs no queue of its own.
+/// Delay between sending a prompt's text and the submit CR (see `send_text`).
+const SUBMIT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Send `text` to a pane as typed input, then submit it with a **separate** Enter keypress.
+///
+/// The submit CR must go in its own `send-text` call, after a short pause. Claude Code's
+/// input treats a burst of bytes (the text with a trailing CR delivered together) as a
+/// paste and turns that CR into a literal newline in the box rather than submitting —
+/// which is why an inline `\r` never actually runs the prompt. Delivering the CR on its
+/// own, once the paste-detection window has closed, registers it as Enter.
+///
+/// If the agent is mid-turn Claude Code queues the line; if it's idle the prompt runs at
+/// once — faff needs no queue of its own.
 pub fn send_text(pane_id: u64, text: &str) -> Result<()> {
+    send_bytes(pane_id, text.as_bytes())?;
+    std::thread::sleep(SUBMIT_DELAY);
+    send_bytes(pane_id, b"\r")?;
+    Ok(())
+}
+
+/// Pipe `bytes` to a single `wezterm cli send-text` invocation.
+fn send_bytes(pane_id: u64, bytes: &[u8]) -> Result<()> {
     let mut child = Command::new("wezterm")
         .args(send_text_args(pane_id))
         .stdin(Stdio::piped())
@@ -181,11 +199,8 @@ pub fn send_text(pane_id: u64, text: &str) -> Result<()> {
     {
         let mut stdin = child.stdin.take().context("send-text stdin unavailable")?;
         stdin
-            .write_all(text.as_bytes())
-            .context("writing prompt to send-text")?;
-        stdin
-            .write_all(b"\r")
-            .context("writing submit CR to send-text")?;
+            .write_all(bytes)
+            .context("writing to send-text")?;
     }
     let out = child.wait_with_output().context("waiting on send-text")?;
     if !out.status.success() {
