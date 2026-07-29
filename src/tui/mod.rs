@@ -870,6 +870,19 @@ impl App {
         let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len());
         // Width of the "[abcdefgh] " id column, so continuation lines align under content.
         let id_col = ID_W + 3;
+        // Pad every gutter to one uniform width so the [id] column, block indicator, and
+        // description line up into straight columns regardless of branch depth — a folded
+        // agent stub `├─●` is wider than a trunk glyph `○`, and without this the whole
+        // right-hand block shifts sideways by the difference. The 2-space separator that
+        // was previously appended per-row is folded into this width. (Gutter cells are all
+        // single-column box-drawing chars, so char count is the display width.)
+        let gutter_w = self
+            .rows
+            .iter()
+            .map(|r| r.gutter.chars().count())
+            .max()
+            .unwrap_or(0)
+            + 2;
         for (i, row) in self.rows.iter().enumerate() {
             let row_task = self.task_of_node.get(i).copied().flatten();
             let is_sel = selected.is_some() && row_task == selected;
@@ -889,8 +902,7 @@ impl App {
                     // Color the working-copy glyph `@` green (bold), like jj log; every
                     // other gutter character keeps the base style. Only the `@` node's
                     // commit row ever carries `@`, and there is at most one.
-                    let gutter = format!("{}  ", row.gutter);
-                    let gutter_w = gutter.chars().count();
+                    let gutter = format!("{:<gutter_w$}", row.gutter);
                     match gutter.find('@') {
                         Some(at) => {
                             spans.push(Span::styled(gutter[..at].to_string(), base));
@@ -931,7 +943,7 @@ impl App {
                 }
                 // Continuation row: gutter + id-column padding + content (aligned).
                 None => {
-                    let pad = format!("{}  {}", row.gutter, " ".repeat(id_col));
+                    let pad = format!("{:<gutter_w$}{}", row.gutter, " ".repeat(id_col));
                     let avail = text_w.saturating_sub(pad.chars().count() + marker_w);
                     spans.push(Span::styled(pad, base));
                     spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
@@ -1261,6 +1273,77 @@ mod tests {
             .find(|c| c.symbol() == "@")
             .expect("@ glyph rendered");
         assert_eq!(at.fg, Color::Green, "working-copy `@` is green");
+    }
+
+    #[test]
+    fn graph_aligns_id_and_indicator_columns_across_gutter_widths() {
+        // A trunk node (`○`, a 1-column gutter) and a folded agent stub (`├─●`, a
+        // 3-column gutter) must line their `[id]` column, block indicator, and
+        // description into one straight vertical column: the gutter is padded to a
+        // uniform width so branch depth never pushes the `[id] ░ …` block sideways.
+        let mut app = test_app();
+        app.rows = vec![
+            graph::GraphRow {
+                gutter: "○".into(),
+                content: "█ trunk work".into(),
+                node_index: Some(0),
+                change_id: Some("aaaaaaaa".into()),
+            },
+            graph::GraphRow {
+                gutter: "├─●".into(),
+                content: "░ #11 :: agent work".into(),
+                node_index: Some(1),
+                change_id: Some("bbbbbbbb".into()),
+            },
+        ];
+        app.task_of_node = vec![None, None];
+        app.id_display = std::collections::HashMap::from([
+            ("aaaaaaaa".to_string(), ("aaaaaaaa".to_string(), String::new())),
+            ("bbbbbbbb".to_string(), ("bbbbbbbb".to_string(), String::new())),
+        ]);
+
+        let width = 80usize;
+        let backend = TestBackend::new(width as u16, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        let buf = term.backend().buffer();
+        // (x, y) of every cell carrying `sym`.
+        let find = |sym: &str| -> Vec<(usize, usize)> {
+            buf.content
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.symbol() == sym)
+                .map(|(i, _)| (i % width, i / width))
+                .collect()
+        };
+
+        // The block indicators are unique to the graph rows (█ on the trunk row, ░ on
+        // the agent stub) — they must share one x column.
+        let full = find("█");
+        let empty = find("░");
+        assert_eq!(full.len(), 1, "one █ indicator: {full:?}");
+        assert_eq!(empty.len(), 1, "one ░ indicator: {empty:?}");
+        assert_eq!(
+            full[0].0, empty[0].0,
+            "block indicators aligned: █@{full:?} vs ░@{empty:?}"
+        );
+
+        // The `[` opening each id column (found on the indicator's own row, so footer/
+        // header brackets don't interfere) must likewise sit at one x.
+        let bracket_x = |y: usize| -> usize {
+            buf.content
+                .iter()
+                .enumerate()
+                .find(|(i, c)| i / width == y && c.symbol() == "[")
+                .map(|(i, _)| i % width)
+                .expect("id column `[` on the indicator's row")
+        };
+        assert_eq!(
+            bracket_x(full[0].1),
+            bracket_x(empty[0].1),
+            "id columns aligned"
+        );
     }
 
     #[test]
