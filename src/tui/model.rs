@@ -40,6 +40,76 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
     revs.sort_by_key(|r| !reaches.get(&r.change_id).copied().unwrap_or(false));
 }
 
+/// Order revisions for the flat lane layout: the trunk — HEAD's first-parent chain — stays
+/// in child→parent order, and every other revision is lifted to sit directly above the
+/// trunk revision it forked from. Each agent then renders as a one-row `├─●` stub anchored
+/// to its fork point, and no lane is ever held open across an unrelated node.
+///
+/// Falls back to [`pin_current_wc_first`] when there is no working copy in the set, or when
+/// some revision forks off a non-trunk node — shapes this flat anchoring isn't meant for,
+/// where the conservative "HEAD's line first, rest untouched" pin stays correct.
+pub fn order_by_fork_point(revs: &mut [RevInfo]) {
+    let Some(head_id) = revs
+        .iter()
+        .find(|r| r.is_current_wc)
+        .map(|r| r.change_id.clone())
+    else {
+        return;
+    };
+
+    // Trunk (lane 0): HEAD, then its first parent, then that node's first parent, … while
+    // each is present in the set.
+    let by_id: std::collections::HashMap<&str, &RevInfo> =
+        revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
+    let mut trunk: Vec<String> = Vec::new();
+    let mut on_trunk: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cur = Some(head_id);
+    while let Some(id) = cur {
+        if !on_trunk.insert(id.clone()) {
+            break; // cycle guard — never on a DAG
+        }
+        let Some(r) = by_id.get(id.as_str()) else { break };
+        cur = r.parents.first().cloned();
+        trunk.push(id);
+    }
+
+    // Every non-trunk revision must fork off a trunk node (its first parent). If any forks
+    // off something else, this isn't the flat shape — leave it to the conservative pin.
+    let clean = revs.iter().all(|r| {
+        on_trunk.contains(&r.change_id) || r.parents.first().is_some_and(|p| on_trunk.contains(p))
+    });
+    drop(by_id);
+    if !clean {
+        pin_current_wc_first(revs);
+        return;
+    }
+
+    // Bucket the non-trunk revisions under their fork-base trunk node, preserving order.
+    let mut children: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut trunk_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, r) in revs.iter().enumerate() {
+        if on_trunk.contains(&r.change_id) {
+            trunk_pos.insert(r.change_id.clone(), i);
+        } else {
+            let base = r.parents.first().cloned().unwrap(); // clean ⇒ Some, and in trunk
+            children.entry(base).or_default().push(i);
+        }
+    }
+
+    // Emit each trunk node top→bottom, with its forked children lifted just above it.
+    let mut order: Vec<usize> = Vec::with_capacity(revs.len());
+    for t in &trunk {
+        if let Some(kids) = children.get(t) {
+            order.extend(kids.iter().copied());
+        }
+        order.push(trunk_pos[t]);
+    }
+
+    let reordered: Vec<RevInfo> = order.iter().map(|&i| revs[i].clone()).collect();
+    revs.clone_from_slice(&reordered);
+}
+
 /// Nodes to render, plus which task (if any) each node represents.
 pub struct GraphModel {
     pub nodes: Vec<GraphNode>,
@@ -87,14 +157,6 @@ pub fn status_label(status: TaskStatus) -> (&'static str, &'static str) {
     }
 }
 
-fn task_annotation(t: &Task) -> String {
-    let (icon, human) = status_label(t.status);
-    match t.pane_id {
-        Some(p) => format!("{icon} {human} · %{p}"),
-        None => format!("{icon} {human}"),
-    }
-}
-
 /// The working-copy (`@`) label: the revision's own description, or "(no description
 /// set)" when it has none. Mirrors how jj log shows your commit; the green `@` glyph
 /// (drawn by the renderer) is the "you are here" marker.
@@ -127,19 +189,17 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         let (glyph, lines, collapse, tid) = if let (Some(t), true) = (task, rev.is_current_wc) {
             // HEAD is parked on this agent's revision (you `jj edit`ed it). Keep HEAD's
             // own line — the revision's description — on the node and hang the agent
-            // beneath it as an indented line, so the agent shows here — mapped to its
-            // task, not detached — without conflating the two into one label.
+            // beneath it as one indented line, in the same `#id emoji :: title` form the
+            // standalone agent rows use, so the agent shows here — mapped to its task, not
+            // detached — without conflating the two into one label.
             let mut head = head_label(rev);
             if rev.conflict {
                 head.push_str("  ⚠ conflict");
             }
+            let (icon, _) = status_label(t.status);
             (
                 '@',
-                vec![
-                    head,
-                    format!("↳ #{} {}", t.id, t.label()),
-                    format!("  {}", task_annotation(t)),
-                ],
+                vec![head, format!("↳ #{} {} :: {}", t.id, icon, t.label())],
                 false,
                 Some(t.id),
             )
@@ -147,16 +207,19 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             // A task node; a conflicted revision gets the × glyph, else a filled ●.
             // Prefer the change's own jj description when set (it's live and authoritative
             // — the agent's `jj describe`, or the one-time seed), falling back to the
-            // prompt-derived label before the change has been described.
+            // prompt-derived label before the change has been described. Status is the
+            // emoji alone, inline before the title; the whole agent is one line, so the
+            // renderer folds it to a single `├─●` row anchored above its fork point.
             let g = if rev.conflict { '×' } else { '●' };
             let label = if rev.description.is_empty() {
                 t.label()
             } else {
                 rev.description.clone()
             };
+            let (icon, _) = status_label(t.status);
             (
                 g,
-                vec![format!("#{} {}", t.id, label), task_annotation(t)],
+                vec![format!("#{} {} :: {}", t.id, icon, label)],
                 false,
                 Some(t.id),
             )
@@ -280,12 +343,10 @@ mod tests {
         assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert_eq!(m.task_of[0], None);
 
-        // task node: two lines, glyph ● (a faf agent), mapped to task 7. The label is
-        // the change's jj description, not the prompt.
+        // task node: one line `#id emoji :: title`, glyph ● (a faf agent), mapped to task
+        // 7. The title is the change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '●');
-        assert_eq!(m.nodes[1].lines[0], "#7 Add OAuth flow");
-        assert!(m.nodes[1].lines[1].contains("⚙"));
-        assert!(m.nodes[1].lines[1].contains("%12"));
+        assert_eq!(m.nodes[1].lines, vec!["#7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
 
         // fork-point collapses
@@ -322,10 +383,10 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes[0].glyph, '@');
         // HEAD keeps its own line — the shared revision's description; the agent hangs
-        // beneath as an indented sub-line.
+        // beneath as one indented `↳ #id emoji :: title` sub-line.
         assert_eq!(m.nodes[0].lines[0], "agent: did work");
-        assert!(m.nodes[0].lines[1].starts_with("↳ #1"));
-        assert!(m.nodes[0].lines[2].contains("working"));
+        assert!(m.nodes[0].lines[1].starts_with("↳ #1 ⚙ :: "));
+        assert_eq!(m.nodes[0].lines.len(), 2);
         // Mapped to the task → the refresh's detached list won't claim it.
         assert_eq!(m.task_of[0], Some(TaskId(1)));
     }
@@ -380,6 +441,94 @@ mod tests {
     }
 
     #[test]
+    fn agents_are_anchored_above_their_fork_points() {
+        // @ forks from pk; #15 from pk; #7 from ur; #9 from tp. Each agent must be lifted
+        // to sit directly above its fork base, with the trunk kept in child→parent order —
+        // so every agent folds to a one-row stub and no lane crosses an unrelated node.
+        let mut revs = vec![
+            rev("head", &["pk"], true, true, ""), // @  (forks from pk)
+            rev("a7", &["ur"], false, true, ""),  // #7  (forks from ur)
+            rev("a15", &["pk"], false, true, ""), // #15 (forks from pk)
+            rev("a9", &["tp"], false, true, ""),  // #9  (forks from tp)
+            rev("pk", &["ur"], false, false, "pk"),
+            rev("ur", &["tp"], false, false, "ur"),
+            rev("tp", &[], false, false, "tp"),
+        ];
+        order_by_fork_point(&mut revs);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(order, vec!["head", "a15", "pk", "a7", "ur", "a9", "tp"]);
+    }
+
+    #[test]
+    fn order_by_fork_point_falls_back_when_a_branch_is_not_off_the_trunk() {
+        // `a2` forked off another agent (`a1`), not a trunk node: the flat anchoring
+        // doesn't apply, so it falls back to the conservative pin (HEAD's line first,
+        // everything else left in place).
+        let mut revs = vec![
+            rev("head", &["base"], true, true, ""),
+            rev("a1", &["base"], false, true, ""),
+            rev("a2", &["a1"], false, true, ""), // off an agent, not the trunk
+            rev("base", &[], false, false, "base"),
+        ];
+        order_by_fork_point(&mut revs);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(order, vec!["head", "a1", "a2", "base"]);
+    }
+
+    #[test]
+    fn end_to_end_flat_fork_anchored_lanes() {
+        // Three agents forked from three different trunk revisions (#15 off pk, #7 off ur,
+        // #9 off tp). Ordered → built → rendered, each must fold to a single `├─●` row
+        // sitting directly above its fork base, the trunk a clean vertical column.
+        let mut revs = vec![
+            rev("ymuz", &["pk"], true, true, ""), // @
+            rev("qoyp", &["pk"], false, true, ""), // #15
+            rev("xwvs", &["ur"], false, true, ""), // #7
+            rev("tztq", &["tp"], false, true, ""), // #9
+            rev("pk", &["ur"], false, false, "spawn: declare! child-class refs"),
+            rev("ur", &["tp"], false, false, "Generate bridge clients from JSON Schema"),
+            rev("tp", &["ts"], false, false, "add chatty to examples"),
+            rev("ts", &[], false, false, "fix wasm lints"),
+        ];
+        let workspaces = vec![
+            Workspace {
+                name: "faf-task-15".into(),
+                change_id: "qoyp".into(),
+            },
+            Workspace {
+                name: "faf-task-7".into(),
+                change_id: "xwvs".into(),
+            },
+            Workspace {
+                name: "faf-task-9".into(),
+                change_id: "tztq".into(),
+            },
+        ];
+        let tasks = vec![
+            task(15, "faf-task-15", TaskStatus::Working),
+            task(7, "faf-task-7", TaskStatus::NeedsInput),
+            task(9, "faf-task-9", TaskStatus::Idle),
+        ];
+
+        order_by_fork_point(&mut revs);
+        let m = build(&revs, &workspaces, &tasks);
+        let rows = crate::graph::render(&m.nodes);
+        let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
+        assert_eq!(
+            gutters,
+            vec!["@", "├─●", "○", "├─●", "○", "├─●", "○", "○"],
+            "trunk stays one clean column; each agent folds to a single ├─● row above its base"
+        );
+        // Agent rows carry `#id emoji :: title`; the status is the bare emoji per state.
+        assert!(rows[1].content.starts_with("#15 ⚙ :: "));
+        assert!(rows[3].content.starts_with("#7 🔔 :: "));
+        assert!(rows[5].content.starts_with("#9 ✓ :: "));
+        // Trunk rows are the user's own revisions, shown by description.
+        assert_eq!(rows[2].content, "spawn: declare! child-class refs");
+        assert_eq!(rows[4].content, "Generate bridge clients from JSON Schema");
+    }
+
+    #[test]
     fn task_node_uses_filled_glyph_and_status_label() {
         let revs = vec![rev("t1", &["p"], false, true, "")];
         let workspaces = vec![Workspace {
@@ -389,7 +538,10 @@ mod tests {
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes[0].glyph, '●');
-        assert!(m.nodes[0].lines[1].contains("working"));
+        // One line, status as the bare emoji before the `::` title separator.
+        assert_eq!(m.nodes[0].lines.len(), 1);
+        assert!(m.nodes[0].lines[0].contains("⚙"));
+        assert!(m.nodes[0].lines[0].contains(" :: "));
     }
 
     #[test]
@@ -403,7 +555,7 @@ mod tests {
         }];
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
-        assert_eq!(m.nodes[0].lines[0], "#1 add oauth login");
+        assert_eq!(m.nodes[0].lines[0], "#1 ⚙ :: add oauth login");
     }
 
     #[test]
@@ -469,7 +621,7 @@ mod tests {
                 "x",
                 &["base"],
                 '@',
-                &["(no description set)", "↳ #1 Add OAuth", "  ⚙ working · %12"],
+                &["(no description set)", "↳ #1 ⚙ :: Add OAuth"],
             ),
             gnode("base", &[], '◆', &["base"]),
         ];
@@ -479,10 +631,9 @@ mod tests {
 
         assert_eq!(rows[0].content, "(no description set)");
         assert_eq!(rt[0], None, "the HEAD header row must not carry the task");
-        assert_eq!(rows[1].content, "↳ #1 Add OAuth");
+        assert_eq!(rows[1].content, "↳ #1 ⚙ :: Add OAuth");
         assert_eq!(rt[1], Some(TaskId(1)), "the agent line carries the task");
         assert_eq!(rt[2], None);
-        assert_eq!(rt[3], None);
     }
 
     #[test]
@@ -491,7 +642,7 @@ mod tests {
         // task on its own commit row — untouched by the combined-node special case.
         let nodes = vec![
             gnode("h", &["fp"], '@', &["(no description set)"]),
-            gnode("a", &["fp"], '●', &["#7 add-auth", "⚙ working"]),
+            gnode("a", &["fp"], '●', &["#7 ⚙ :: add-auth"]),
             gnode("fp", &[], '◆', &["base"]),
         ];
         let node_task = vec![None, Some(TaskId(7)), None];
