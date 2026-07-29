@@ -756,8 +756,9 @@ impl App {
         heads.push("@".to_string());
         let revset = format!("ancestors({}, 25)", heads.join(" | "));
         let mut revs = jj::log(&self.repo, &revset)?;
-        // HEAD's `@` always leads the log; agent branches sit alongside below.
-        model::pin_current_wc_first(&mut revs);
+        // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
+        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
+        model::order_by_fork_point(&mut revs);
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
             .iter()

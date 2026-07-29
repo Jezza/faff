@@ -127,13 +127,13 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
             .filter_map(|(j, l)| (l.as_deref() == Some(n.change_id.as_str())).then_some(j))
             .collect();
 
-        // Stub: a branch head (nothing flows into it) whose single parent is already
-        // targeted by an open lane. Rather than open a lane that stays alive until the
-        // shared fork point — which nests every sibling agent one column deeper — draw
-        // a short branch that immediately merges back into that trunk lane. So N agents
-        // forked from one point render at a constant two columns instead of N. The
-        // node's last content line rides the merge row (e.g. an agent's status line
-        // sits under its title, on the `├─╯`).
+        // Fold: a branch head (nothing flows into it) whose single parent is already
+        // targeted by an open lane renders as ONE row — `├─●` — instead of a branch row
+        // plus a separate `├─╯` merge row. The `├` sits on the trunk lane, a short `─`
+        // reaches right to the node's glyph, and the branch closes immediately. So N
+        // agents forked from one point render as N single rows stacked directly above
+        // their shared base, at a constant two columns. (Extra content lines — rare, now
+        // that an agent is one line — hang beneath as connected continuation rows.)
         if incoming.is_empty()
             && n.parents.len() == 1
             && let Some(trunk) = lanes
@@ -141,7 +141,7 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
                 .position(|l| l.as_deref() == Some(n.parents[0].as_str()))
         {
             // Temporary lane for the branch, always to the right of the trunk so the
-            // connector reads left-to-right (`├─╯`).
+            // connector reads left-to-right (`├─●`).
             let stub = match (trunk + 1..lanes.len()).find(|&j| lanes[j].is_none()) {
                 Some(s) => {
                     lanes[s] = Some(n.change_id.clone());
@@ -152,36 +152,23 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
                     lanes.len() - 1
                 }
             };
-            // Commit row, then any interior content lines with the branch lane held open.
+            // The folded row carries the node's id + first content line; the branch closes
+            // on this same row.
             rows.push(GraphRow {
-                gutter: commit_gutter(&lanes, stub, n.glyph),
+                gutter: fold_gutter(&lanes, trunk, stub, n.glyph),
                 content: n.lines[0].clone(),
                 node_index: Some(n.orig),
                 change_id: Some(n.change_id.clone()),
             });
-            let k = n.lines.len();
-            if k > 2 {
-                for line in &n.lines[1..k - 1] {
-                    rows.push(GraphRow {
-                        gutter: cont_gutter(&lanes, stub, true),
-                        content: line.clone(),
-                        node_index: None,
-                        change_id: None,
-                    });
-                }
-            }
-            // Merge row closes the branch; the final content line (if any) rides it.
-            rows.push(GraphRow {
-                gutter: merge_link_row(&lanes, trunk, &[stub]),
-                content: if k > 1 {
-                    n.lines[k - 1].clone()
-                } else {
-                    String::new()
-                },
-                node_index: None,
-                change_id: None,
-            });
             lanes[stub] = None;
+            for line in n.lines.iter().skip(1) {
+                rows.push(GraphRow {
+                    gutter: cont_gutter(&lanes, trunk, true),
+                    content: line.clone(),
+                    node_index: None,
+                    change_id: None,
+                });
+            }
             while matches!(lanes.last(), Some(None)) {
                 lanes.pop();
             }
@@ -337,6 +324,31 @@ fn merge_link_row(lanes: &[Option<String>], col: usize, merges: &[usize]) -> Str
     trim_end(cells)
 }
 
+/// Gutter for a folded branch: `├` on the trunk lane, the node's `glyph` on the (right-of-
+/// trunk) `stub` lane, joined by `─`. One row does the work of a branch row plus its merge,
+/// so an agent anchored to its fork point renders as a single `├─●`.
+fn fold_gutter(lanes: &[Option<String>], trunk: usize, stub: usize, glyph: char) -> String {
+    let mut cells = vec![' '; gutter_width(lanes.len())];
+    for (j, lane) in lanes.iter().enumerate() {
+        cells[2 * j] = if j == trunk {
+            '├'
+        } else if j == stub {
+            glyph
+        } else if lane.is_some() {
+            '│'
+        } else {
+            ' '
+        };
+    }
+    // Horizontal fill between the trunk tee and the glyph (stub is always right of trunk).
+    for cell in cells.iter_mut().take(2 * stub).skip(2 * trunk + 1) {
+        if *cell == ' ' {
+            *cell = '─';
+        }
+    }
+    trim_end(cells)
+}
+
 fn trim_end(cells: Vec<char>) -> String {
     let s: String = cells.into_iter().collect();
     s.trim_end().to_string()
@@ -388,12 +400,12 @@ mod tests {
         let rows = render(&nodes);
         assert_eq!(
             gutters(&rows),
-            vec!["@", "│ ○", "├─╯", "●", "◆"],
-            "expected trunk + branch + merge connector"
+            vec!["@", "├─○", "●", "◆"],
+            "branch folds to a single ├─○ row anchored above its base"
         );
-        // node_index present only on commit rows, not the link row
+        // every commit row carries its node index; the fold row is itself a commit row
         let idx: Vec<_> = rows.iter().map(|r| r.node_index).collect();
-        assert_eq!(idx, vec![Some(0), Some(1), None, Some(2), Some(3)]);
+        assert_eq!(idx, vec![Some(0), Some(1), Some(2), Some(3)]);
     }
 
     #[test]
@@ -404,8 +416,9 @@ mod tests {
             node("yvvy", &[], '◆', &["root"]),
         ];
         let rows = render(&nodes);
-        // The branch merges straight back; its status line rides the `├─╯` merge row.
-        assert_eq!(gutters(&rows), vec!["@", "│ ●", "├─╯", "◆"]);
+        // The branch folds to a single `├─●` row; an extra content line hangs beneath it
+        // as a connected continuation row on the trunk.
+        assert_eq!(gutters(&rows), vec!["@", "├─●", "│", "◆"]);
         assert_eq!(rows[1].content, "#7 add-auth");
         assert_eq!(rows[1].node_index, Some(1));
         assert_eq!(rows[2].content, "⚙ working 2m");
@@ -413,15 +426,15 @@ mod tests {
     }
 
     #[test]
-    fn siblings_from_one_fork_point_stay_two_columns() {
-        // HEAD @ plus three agents all fork from the same point `fp`. Each must render
-        // as a short branch that merges straight back — never nesting one column deeper
-        // per sibling — so the graph stays two columns wide however many agents there are.
+    fn siblings_from_one_fork_point_each_fold_to_one_row() {
+        // HEAD @ plus three agents all forked from the same point `fp`. Each folds to a
+        // single `├─●` row stacked above the fork point — the graph stays two columns wide
+        // however many agents there are, one row apiece.
         let nodes = vec![
             node("m", &["fp"], '@', &["(no description set)"]),
-            node("a16", &["fp"], '●', &["#16 migrate", "⚙ working · %90"]),
-            node("a15", &["fp"], '●', &["#15 startup", "⚙ working · %89"]),
-            node("a3", &["fp"], '●', &["#3 macros", "⚙ working · %88"]),
+            node("a16", &["fp"], '●', &["#16 ⚙ :: migrate"]),
+            node("a15", &["fp"], '●', &["#15 ⚙ :: startup"]),
+            node("a3", &["fp"], '●', &["#3 ⚙ :: macros"]),
             node("fp", &["base"], '●', &["fork base"]),
             node("base", &[], '◆', &["base"]),
         ];
@@ -429,20 +442,16 @@ mod tests {
         assert_eq!(
             gutters(&rows),
             vec![
-                "@", // HEAD trunk
-                "│ ●",
-                "├─╯", // agent 16 + merge
-                "│ ●",
-                "├─╯", // agent 15 + merge
-                "│ ●",
-                "├─╯", // agent 3 + merge
+                "@",   // HEAD trunk
+                "├─●", // agent 16
+                "├─●", // agent 15
+                "├─●", // agent 3
                 "●",   // fork point
                 "◆",   // base
             ]
         );
-        // Each agent's status line rides its merge row.
-        assert_eq!(rows[2].content, "⚙ working · %90");
-        assert_eq!(rows[2].node_index, None);
+        assert_eq!(rows[1].content, "#16 ⚙ :: migrate");
+        assert_eq!(rows[1].node_index, Some(1));
         // Commit rows still map to the original node indices, in order.
         let idx: Vec<_> = rows.iter().filter_map(|r| r.node_index).collect();
         assert_eq!(idx, vec![0, 1, 2, 3, 4, 5]);
@@ -462,8 +471,8 @@ mod tests {
             node("p", &[], '◆', &["real base"]),
         ];
         let rows = render(&nodes);
-        // `m` row is gone; task branch now merges at `p`.
-        assert_eq!(gutters(&rows), vec!["@", "│ ○", "├─╯", "◆"]);
+        // `m` row is gone; the task branch folds to a single row anchored at `p`.
+        assert_eq!(gutters(&rows), vec!["@", "├─○", "◆"]);
         // no row references the collapsed node (orig index 2)
         assert!(rows.iter().all(|r| r.node_index != Some(2)));
         // remaining commit rows map to originals 0,1,3
@@ -482,10 +491,7 @@ mod tests {
             node("m0", &[], '◆', &["base"]),
         ];
         let rows = render(&nodes);
-        assert_eq!(
-            gutters(&rows),
-            vec!["@", "│ ○", "├─╯", "●", "│ ○", "├─╯", "◆"]
-        );
+        assert_eq!(gutters(&rows), vec!["@", "├─○", "●", "├─○", "◆"]);
     }
 
     #[test]
@@ -495,7 +501,7 @@ mod tests {
         // render as a branch on lane 1 merging into HEAD, NOT take lane 0 itself. A
         // separate agent off `base` still stubs below.
         let nodes = vec![
-            node("kmk", &["head"], '○', &["#3 kmk", "⚙ working"]),
+            node("kmk", &["head"], '○', &["#3 kmk"]),
             node("head", &["base"], '@', &["(no description set)"]),
             node("agent", &["base"], '○', &["#5 agent"]),
             node("base", &[], '◆', &["base"]),
@@ -504,18 +510,15 @@ mod tests {
         assert_eq!(
             gutters(&rows),
             vec![
-                "  ○", // kmk on the branch lane; trunk column blank (unborn above)
-                "╭─╯", // trunk born here, curving up to the fork — no T-junction
+                "╭─○", // kmk folds above HEAD; trunk born here (corner, nothing above)
                 "@",   // HEAD alone on lane 0
-                "│ ○", // agent stubs off base (trunk continues above it → straight │)
-                "├─╯", //
+                "├─○", // agent folds off base (trunk continues above it → ├)
                 "◆",   // base
             ]
         );
         assert_eq!(rows[0].content, "#3 kmk");
         assert_eq!(rows[0].node_index, Some(0));
-        assert_eq!(rows[1].content, "⚙ working"); // status rides the merge row
-        assert_eq!(rows[2].content, "(no description set)");
+        assert_eq!(rows[1].content, "(no description set)");
     }
 
     #[test]
@@ -530,7 +533,7 @@ mod tests {
             node("base", &[], '◆', &["base"]),
         ];
         let rows = render(&nodes);
-        assert_eq!(gutters(&rows), vec!["  ○", "╭─╯", "│ ○", "├─╯", "@", "◆"]);
+        assert_eq!(gutters(&rows), vec!["╭─○", "├─○", "@", "◆"]);
     }
 
     #[test]
