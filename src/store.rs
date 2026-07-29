@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS config (
 );
 "#;
 
+/// `config` key holding the monotonic task-id high-water mark (see `next_task_id`).
+const TASK_ID_SEQ: &str = "task_id_seq";
+
 /// One activity-feed entry (spec §9: from PostToolUse / lifecycle hooks).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Activity {
@@ -87,10 +90,12 @@ impl Store {
     /// Insert a new task (awaiting its first prompt) and return it fully populated.
     pub fn create_task(&self, prompt: &str, priority: i64, autonomy: Autonomy) -> Result<Task> {
         let created = now_ms();
+        let id = self.next_task_id()?;
         self.conn.execute(
-            "INSERT INTO tasks (prompt, status, priority, autonomy, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO tasks (id, prompt, status, priority, autonomy, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
+                id,
                 prompt,
                 TaskStatus::NeedsInput.as_str(),
                 priority,
@@ -98,8 +103,27 @@ impl Store {
                 created
             ],
         )?;
-        let id = TaskId(self.conn.last_insert_rowid());
-        self.get_task(id)
+        self.get_task(TaskId(id))
+    }
+
+    /// Allocate a task id that is never reused — the high-water mark of every id ever
+    /// handed out, +1. `INTEGER PRIMARY KEY` alone reuses the ids of deleted rows, but a
+    /// task id is a permanent, externally-visible key (jj workspace name `faf-task-<id>`,
+    /// ws dir, `#<id>` tab title), so reuse collides with any leftover of the old task.
+    /// The mark is persisted in `config` so it survives deletions and restarts, and is
+    /// seeded from the current `MAX(id)` so a database created before this scheme upgrades
+    /// cleanly on its first new task.
+    fn next_task_id(&self) -> Result<i64> {
+        let seq = self
+            .config_get(TASK_ID_SEQ)?
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let max_row: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM tasks", [], |r| r.get(0))?;
+        let next = seq.max(max_row) + 1;
+        self.config_set(TASK_ID_SEQ, &next.to_string())?;
+        Ok(next)
     }
 
     pub fn get_task(&self, id: TaskId) -> Result<Task> {
@@ -403,6 +427,37 @@ mod tests {
         assert_eq!(s.config_get("theme").unwrap().as_deref(), Some("dark"));
         s.config_set("theme", "light").unwrap();
         assert_eq!(s.config_get("theme").unwrap().as_deref(), Some("light"));
+    }
+
+    #[test]
+    fn create_task_never_reuses_a_deleted_id() {
+        let s = store();
+        let a = s.create_task("a", 0, Autonomy::AcceptEdits).unwrap();
+        let b = s.create_task("b", 0, Autonomy::AcceptEdits).unwrap();
+        assert_eq!(a.id, TaskId(1));
+        assert_eq!(b.id, TaskId(2));
+        // Remove the highest task. Its id must NOT be handed out again — the whole
+        // system treats the task id as a permanent unique key (jj workspace name,
+        // ws dir, tab title), so reuse collides with any leftover of the old task.
+        s.delete_task(b.id).unwrap();
+        let c = s.create_task("c", 0, Autonomy::AcceptEdits).unwrap();
+        assert_eq!(c.id, TaskId(3), "deleted id 2 must not be reused");
+    }
+
+    #[test]
+    fn task_ids_stay_monotonic_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("faf.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.create_task("a", 0, Autonomy::AcceptEdits).unwrap();
+            let b = s.create_task("b", 0, Autonomy::AcceptEdits).unwrap();
+            s.delete_task(b.id).unwrap(); // highest id removed before the process exits
+        }
+        // A fresh process must remember the high-water mark, not reuse id 2.
+        let s2 = Store::open(&path).unwrap();
+        let c = s2.create_task("c", 0, Autonomy::AcceptEdits).unwrap();
+        assert_eq!(c.id, TaskId(3), "id must advance past the highest ever used");
     }
 
     #[test]

@@ -516,7 +516,7 @@ impl App {
         self.tasks = self.store.list_tasks().unwrap_or_default();
 
         // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
-        let ws_list = jj::workspace_list(&self.repo).ok();
+        let mut ws_list = jj::workspace_list(&self.repo).ok();
 
         // Heal orphans so stale rows don't linger forever or misreport their status.
         let panes = wezterm::list().ok();
@@ -525,6 +525,14 @@ impl App {
         }
         if let Some(ws) = &ws_list {
             self.reconcile_workspaces(ws);
+        }
+        // Forget faff workspaces no task tracks — ghosts from a remove/swap that didn't
+        // fully unregister — and drop them from the list so the graph doesn't redraw a
+        // workspace we just forgot. This is what stops a stale `faf-task-N` registration
+        // from blocking the next `n` with a workspace-name collision.
+        if let Some(ws) = &mut ws_list {
+            let forgotten = self.reconcile_orphan_workspaces(ws);
+            ws.retain(|w| !forgotten.contains(&w.name));
         }
         // Reload to reflect any status changes the reconcile passes made.
         self.tasks = self.store.list_tasks().unwrap_or_default();
@@ -626,6 +634,32 @@ impl App {
                 let _ = self.store.delete_task(t.id);
             }
         }
+    }
+
+    /// faff-owned jj workspaces (`faf-task-*`) that no live task tracks — ghosts left by
+    /// a remove or swap that didn't fully unregister. Pure: returns the names to forget,
+    /// with no side effects (the effectful wrapper does the forgetting).
+    fn orphaned_workspaces(&self, workspaces: &[jj::Workspace]) -> Vec<String> {
+        let tracked: std::collections::HashSet<&str> =
+            self.tasks.iter().filter_map(|t| t.ws_name.as_deref()).collect();
+        workspaces
+            .iter()
+            .map(|w| w.name.as_str())
+            .filter(|name| name.starts_with("faf-task-") && !tracked.contains(name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Forget the ghost workspaces `orphaned_workspaces` finds, so a future task's id and
+    /// its `faf-task-<id>` name can never collide with a stale registration on `n`.
+    /// Returns the names forgotten so the caller can drop them from this cycle's graph.
+    /// Best-effort: a forget that fails is retried next refresh.
+    fn reconcile_orphan_workspaces(&self, workspaces: &[jj::Workspace]) -> Vec<String> {
+        let orphans = self.orphaned_workspaces(workspaces);
+        for name in &orphans {
+            let _ = jj::workspace_forget(&self.repo, name);
+        }
+        orphans
     }
 
     #[allow(clippy::type_complexity)]
@@ -1179,5 +1213,29 @@ mod tests {
         // Present workspace stays; vanished workspace's task is dropped entirely.
         assert!(app.store.try_get_task(a.id).unwrap().is_some());
         assert!(app.store.try_get_task(b.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn orphaned_workspaces_flags_only_untracked_faff_workspaces() {
+        use std::path::Path;
+        let app = test_app();
+        // A live task whose workspace is still tracked.
+        let t = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-3", Path::new("/nope/3"), "c3", "f3")
+            .unwrap();
+        let mut app = app;
+        app.tasks = app.store.list_tasks().unwrap();
+
+        let live = vec![
+            // The default workspace is never faff-owned — must be left alone.
+            jj::Workspace { name: "default".into(), change_id: "x".into() },
+            // Tracked by task `t` — must be kept.
+            jj::Workspace { name: "faf-task-3".into(), change_id: "y".into() },
+            // A faff workspace with no DB row — a ghost to forget.
+            jj::Workspace { name: "faf-task-4".into(), change_id: "z".into() },
+        ];
+
+        assert_eq!(app.orphaned_workspaces(&live), vec!["faf-task-4".to_string()]);
     }
 }
