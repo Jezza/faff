@@ -10,7 +10,7 @@ mod session;
 use crate::domain::{Autonomy, Task, TaskId, TaskStatus, truncate_first_line};
 use crate::graph::{self, GraphRow};
 use crate::store::Store;
-use crate::{config, events, jj, title, wezterm, workspace};
+use crate::{config, events, jj, wezterm, workspace};
 use anyhow::{Context, Result};
 use input::Action;
 use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind};
@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
@@ -99,10 +99,6 @@ struct App {
     db: PathBuf,
     store: Store,
     events_rx: Receiver<events::Event>,
-    /// Background description-seed jobs send back the id of a task they just described,
-    /// as a nudge to refresh so the new description shows.
-    seed_tx: Sender<TaskId>,
-    seed_rx: Receiver<TaskId>,
     faf_pane: Option<u64>,
 
     // View state (owned; recomputed on refresh).
@@ -117,12 +113,10 @@ struct App {
     open_pane: Option<u64>,
     /// change_id -> (unique prefix, padding rest) for the id column, from jj.
     id_display: std::collections::HashMap<String, (String, String)>,
-    /// Tasks a description-seed job has already been dispatched for (once per session).
-    seed_requested: std::collections::HashSet<TaskId>,
     status: String,
     should_quit: bool,
     last_refresh: Instant,
-    /// Set when an event/seed arrived; coalesces bursts into a throttled refresh.
+    /// Set when an event arrived; coalesces bursts into a throttled refresh.
     pending_refresh: bool,
     /// Set to a task id after `s` on a *working* agent: the next key confirms the swap
     /// (another `s`) or cancels it (anything else). Guards yanking a live agent's files.
@@ -143,7 +137,6 @@ impl App {
         let store = Store::open(&db)?;
         let socket = events::socket_path(&repo);
         let events_rx = events::spawn_listener(&socket)?;
-        let (seed_tx, seed_rx) = channel();
         let faf_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faf"));
         let faf_pane = std::env::var("WEZTERM_PANE")
             .ok()
@@ -156,8 +149,6 @@ impl App {
             db,
             store,
             events_rx,
-            seed_tx,
-            seed_rx,
             faf_pane,
             tasks: Vec::new(),
             rows: Vec::new(),
@@ -167,7 +158,6 @@ impl App {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            seed_requested: std::collections::HashSet::new(),
             status: "ready".to_string(),
             should_quit: false,
             last_refresh: Instant::now(),
@@ -205,17 +195,13 @@ impl App {
         Ok(())
     }
 
-    /// Drain the socket nudge channel and completed description-seed jobs. Hook events
-    /// are persisted to the store by `report-event` itself, so socket messages are only
-    /// refresh nudges here (not re-applied); a seed job already wrote the jj description
-    /// itself, so its message is likewise just a nudge. Returns whether anything arrived.
+    /// Drain the socket nudge channel. Hook events are persisted to the store by
+    /// `report-event` itself, so socket messages are only refresh nudges here (not
+    /// re-applied). Returns whether anything arrived.
     fn drain_channels(&mut self) -> bool {
         let mut any = false;
         while self.events_rx.try_recv().is_ok() {
             any = true; // report-event already wrote the store; just nudge a refresh
-        }
-        while self.seed_rx.try_recv().is_ok() {
-            any = true; // a description was seeded; refresh so the new label shows
         }
         any
     }
@@ -592,7 +578,7 @@ impl App {
     /// `d`: ask the selected agent to describe its own revision. faff never runs `jj
     /// describe` itself — it injects a prompt telling the agent to set a short 4-7 word
     /// description of the end result, so the log row shows what the revision actually did
-    /// (not just the seeded title from the first prompt). On a working agent the first
+    /// (not just the prompt-derived label). On a working agent the first
     /// press only arms a confirmation (a mid-turn prompt is disruptive, and a description
     /// is premature before the work settles); a second `d` goes through (via `handle_key`).
     fn describe_selected(&mut self) {
@@ -641,27 +627,6 @@ impl App {
         self.refresh();
     }
 
-    /// Kick off the async description-seed job for any task that has a prompt (captured
-    /// from its first UserPromptSubmit) and a workspace — once per task per session. The
-    /// job itself skips tasks whose change already has a description, so this can fire for
-    /// every task without clobbering anything.
-    fn maybe_seed_descriptions(&mut self) {
-        for t in &self.tasks {
-            if t.prompt.trim().is_empty() || self.seed_requested.contains(&t.id) {
-                continue;
-            }
-            let Some(ws) = t.ws_name.clone() else { continue };
-            self.seed_requested.insert(t.id);
-            title::spawn_seed_job(
-                t.id,
-                self.repo.clone(),
-                format!("{ws}@"),
-                t.prompt.clone(),
-                self.seed_tx.clone(),
-            );
-        }
-    }
-
     // ---- refresh (recompute view from store + jj) ----
 
     fn refresh(&mut self) {
@@ -699,9 +664,6 @@ impl App {
         if let Some(p) = &panes {
             self.open_pane = self.detect_open_pane(p);
         }
-
-        // Seed jj descriptions for tasks that captured a prompt (no-op if already set).
-        self.maybe_seed_descriptions();
 
         // Build the revision graph from the (already-fetched) workspace list.
         if let Some(ws) = &ws_list {
@@ -1044,8 +1006,7 @@ mod tests {
 
     // Build a minimal App with an in-memory store (no jj/wezterm needed).
     fn test_app() -> App {
-        let (seed_tx, seed_rx) = channel();
-        let (_ev_tx, events_rx) = channel();
+        let (_ev_tx, events_rx) = std::sync::mpsc::channel();
         App {
             repo: PathBuf::from("/tmp/repo"),
             faf_exe: PathBuf::from("/bin/faf"),
@@ -1053,8 +1014,6 @@ mod tests {
             db: PathBuf::from("/tmp/faf.db"),
             store: Store::open_memory().unwrap(),
             events_rx,
-            seed_tx,
-            seed_rx,
             faf_pane: Some(1),
             tasks: Vec::new(),
             rows: Vec::new(),
@@ -1064,7 +1023,6 @@ mod tests {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            seed_requested: std::collections::HashSet::new(),
             status: "ready".into(),
             should_quit: false,
             pending_refresh: false,

@@ -82,10 +82,9 @@ padded to 8 columns with the unique prefix highlighted.
 5. Spawns `claude` in a WezTerm pane at the workspace, docks it beside faff, focuses it.
 
 The task starts with no prompt. You type it into the pane. The `UserPromptSubmit` hook
-captures the first prompt only. A background `claude -p --model haiku` then seeds the task
-change's jj description from that prompt — once, and only while the change has no
-description of its own, so it never overwrites one you or the agent later set. The agent's
-tab is titled `#<id>`.
+captures the first prompt only, and faff uses its first line as the task's display label in
+the log until the change gets a real description of its own (see `d`). The agent's tab is
+titled `#<id>`.
 
 Steps 2 to 4 are best-effort; a failure there doesn't abort the task. A failed workspace
 add or pane spawn rolls the whole thing back.
@@ -128,15 +127,15 @@ disruptive); the same key again sends it. This needs the send side of the pane, 
 
 ### Describing a revision (`d`)
 
-When a task captures its first prompt, faff seeds the change's jj description from that
-prompt — a fair *intent* label, but not what the work actually turned into. `d` closes that
-gap: like `r`, it **injects a prompt into the agent's pane**, here telling the agent to run
-`jj describe` with a short 4-7 word summary of the revision's *end result*. faff never runs
-`jj describe` itself; the agent does, and the log row picks up the new description on the next
+Until its change has a description, a task's log row shows the first line of its prompt — a
+fair *intent* label, but not what the work actually turned into. `d` closes that gap: like
+`r`, it **injects a prompt into the agent's pane**, here telling the agent to run `jj
+describe` with a short 4-7 word summary of the revision's *end result*. faff never runs `jj
+describe` itself; the agent does, and the log row picks up the new description on the next
 refresh. Run it once the agent has finished — on a working agent the first press arms a
 confirmation (a describe mid-turn is premature, and the prompt is disruptive), and a second
 `d` sends it. It needs a live pane and a task that already has a prompt of its own (otherwise
-the injected prompt would be captured as the title, exactly as with `r`).
+the injected prompt would be captured as the first prompt, exactly as with `r`).
 
 ### Removing a task
 
@@ -191,7 +190,7 @@ Hooks injected per workspace:
 
 | Hook | Effect |
 |---|---|
-| `UserPromptSubmit` | status → working; first prompt captured, and used to seed the change's jj description |
+| `UserPromptSubmit` | status → working; first prompt captured |
 | `Stop` | status → idle |
 | `Notification` | status → needs input |
 | `PostToolUse` | appends an activity row; clears a stale needs-input |
@@ -217,6 +216,5 @@ scheme.
 | `wezterm` | `wezterm cli` argv, exec, list parsing |
 | `events` | event enum and Unix-socket transport |
 | `scheduler` | applies events to the store |
-| `title` | one-shot prompt→summary, used to seed the change description |
 | `cli` | argument parsing and the `report-event` subcommand |
 | `tui` | ratatui app: state, event loop, rendering, actions |

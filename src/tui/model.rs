@@ -217,8 +217,8 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         } else if let Some(t) = task {
             // A task node; a conflicted revision gets the × glyph, else a filled ●.
             // Prefer the change's own jj description when set (it's live and authoritative
-            // — the agent's `jj describe`, or the one-time seed), falling back to the
-            // prompt-derived label before the change has been described. Status is the
+            // — the agent's own `jj describe`), falling back to the prompt-derived label
+            // before the change has been described. Status is the
             // emoji alone, inline before the title; the whole agent is one line, so the
             // renderer folds it to a single `├─●` row anchored above its fork point.
             let g = if rev.conflict { '×' } else { '●' };
@@ -571,8 +571,8 @@ mod tests {
 
     #[test]
     fn task_node_falls_back_to_prompt_without_a_description() {
-        // No jj description yet (e.g. before the seed lands): the row shows the
-        // prompt-derived label, untruncated (the render step clips to the pane width).
+        // No jj description yet (e.g. before the agent runs `jj describe`): the row shows
+        // the prompt-derived label, untruncated (the render step clips to the pane width).
         let revs = vec![rev("t1", &["p"], false, true, "")];
         let workspaces = vec![Workspace {
             name: "faf-task-1".into(),

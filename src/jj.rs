@@ -235,14 +235,6 @@ pub fn description(repo: &Path, revset: &str) -> Result<String> {
     Ok(out.lines().next().unwrap_or("").to_string())
 }
 
-/// `jj describe -r <revset> -m <message>` — set a change's description. Used to seed a
-/// task change's description from its first prompt; the caller guards against clobbering
-/// an existing one (see `title::spawn_seed_job`).
-pub fn describe(repo: &Path, revset: &str, message: &str) -> Result<()> {
-    run_jj(repo, &["describe", "-r", revset, "-m", message])?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,8 +408,8 @@ mod tests {
 
         // A fresh working copy has no description.
         assert_eq!(description(&repo, "@").unwrap(), "");
-        // describe sets it; description reads back its first line.
-        describe(&repo, "@", "seeded from the prompt").unwrap();
-        assert_eq!(description(&repo, "@").unwrap(), "seeded from the prompt");
+        // Setting a description makes `description` read back its first line.
+        jj_setup(&repo, &cfg, &["describe", "-r", "@", "-m", "a described change"]);
+        assert_eq!(description(&repo, "@").unwrap(), "a described change");
     }
 }
