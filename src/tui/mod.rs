@@ -795,7 +795,7 @@ impl App {
         let mut revs = jj::log(&self.repo, &revset)?;
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
         // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
-        model::order_by_fork_point(&mut revs);
+        model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
             .iter()

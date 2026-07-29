@@ -45,10 +45,14 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
 /// trunk revision it forked from. Each agent then renders as a one-row `├─●` stub anchored
 /// to its fork point, and no lane is ever held open across an unrelated node.
 ///
+/// Agents sharing a fork point are ordered by task id, newest (highest) first — a stable
+/// order that doesn't shuffle as agents become active, unlike jj log's recency order.
+/// `workspaces`/`tasks` supply the change_id→task-id mapping this needs.
+///
 /// Falls back to [`pin_current_wc_first`] when there is no working copy in the set, or when
 /// some revision forks off a non-trunk node — shapes this flat anchoring isn't meant for,
 /// where the conservative "HEAD's line first, rest untouched" pin stays correct.
-pub fn order_by_fork_point(revs: &mut [RevInfo]) {
+pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks: &[Task]) {
     let Some(head_id) = revs
         .iter()
         .find(|r| r.is_current_wc)
@@ -84,7 +88,7 @@ pub fn order_by_fork_point(revs: &mut [RevInfo]) {
         return;
     }
 
-    // Bucket the non-trunk revisions under their fork-base trunk node, preserving order.
+    // Bucket the non-trunk revisions under their fork-base trunk node.
     let mut children: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     let mut trunk_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -95,6 +99,25 @@ pub fn order_by_fork_point(revs: &mut [RevInfo]) {
             let base = r.parents.first().cloned().unwrap(); // clean ⇒ Some, and in trunk
             children.entry(base).or_default().push(i);
         }
+    }
+
+    // Order each fork-point bucket by task id — newest (highest) first — so the list is
+    // stable: an agent no longer jumps position when it becomes active (jj log's recency
+    // order did that). change_id breaks ties, keeping the order total and deterministic;
+    // a bucketed rev with no faff task (a stray workspace) sorts last.
+    let task_id_of = |cid: &str| -> Option<i64> {
+        workspaces
+            .iter()
+            .filter(|w| w.change_id == cid)
+            .find_map(|w| tasks.iter().find(|t| t.ws_name.as_deref() == Some(&w.name)))
+            .map(|t| t.id.0)
+    };
+    for kids in children.values_mut() {
+        kids.sort_by(|&a, &b| {
+            let (ka, kb) = (task_id_of(&revs[a].change_id), task_id_of(&revs[b].change_id));
+            kb.cmp(&ka)
+                .then_with(|| revs[a].change_id.cmp(&revs[b].change_id))
+        });
     }
 
     // Emit each trunk node top→bottom, with its forked children lifted just above it.
@@ -477,9 +500,46 @@ mod tests {
             rev("ur", &["tp"], false, false, "ur"),
             rev("tp", &[], false, false, "tp"),
         ];
-        order_by_fork_point(&mut revs);
+        order_by_fork_point(&mut revs, &[], &[]);
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
         assert_eq!(order, vec!["head", "a15", "pk", "a7", "ur", "a9", "tp"]);
+    }
+
+    #[test]
+    fn agents_sharing_a_fork_point_order_by_task_id_descending() {
+        // #3, #7 and #12 all fork off the same trunk node (`base`). Whatever order jj
+        // log hands them in (recency — the input below is deliberately unsorted), they
+        // must stack newest-id-first and stay put regardless of which one is active.
+        let mut revs = vec![
+            rev("head", &["base"], true, true, ""), // @
+            rev("a3", &["base"], false, true, ""),  // #3
+            rev("a12", &["base"], false, true, ""), // #12
+            rev("a7", &["base"], false, true, ""),  // #7
+            rev("base", &[], false, false, "base"),
+        ];
+        let workspaces = vec![
+            Workspace {
+                name: "faf-task-3".into(),
+                change_id: "a3".into(),
+            },
+            Workspace {
+                name: "faf-task-12".into(),
+                change_id: "a12".into(),
+            },
+            Workspace {
+                name: "faf-task-7".into(),
+                change_id: "a7".into(),
+            },
+        ];
+        let tasks = vec![
+            task(3, "faf-task-3", TaskStatus::Idle),
+            task(12, "faf-task-12", TaskStatus::Working),
+            task(7, "faf-task-7", TaskStatus::NeedsInput),
+        ];
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        // HEAD leads on lane 0; then the shared-base agents newest-id-first, then base.
+        assert_eq!(order, vec!["head", "a12", "a7", "a3", "base"]);
     }
 
     #[test]
@@ -493,7 +553,7 @@ mod tests {
             rev("a2", &["a1"], false, true, ""), // off an agent, not the trunk
             rev("base", &[], false, false, "base"),
         ];
-        order_by_fork_point(&mut revs);
+        order_by_fork_point(&mut revs, &[], &[]);
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
         assert_eq!(order, vec!["head", "a1", "a2", "base"]);
     }
@@ -533,7 +593,7 @@ mod tests {
             task(9, "faf-task-9", TaskStatus::Idle),
         ];
 
-        order_by_fork_point(&mut revs);
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
         let m = build(&revs, &workspaces, &tasks);
         let rows = crate::graph::render(&m.nodes);
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
