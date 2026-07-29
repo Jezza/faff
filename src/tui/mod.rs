@@ -30,6 +30,12 @@ type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
 /// Fixed display width of the change-id column (jj pads its shortest id to 8).
 const ID_W: usize = 8;
 
+/// The prompt `d` injects into an agent's pane: it asks the agent to summarise the end
+/// result of its current revision as a short jj description. faff never runs `jj describe`
+/// itself — the agent, which holds the live working copy, does.
+const DESCRIBE_PROMPT: &str = "Set a short description of what this revision accomplishes. \
+     Run: jj describe -m \"<summary>\" where <summary> is a 4-7 word description of the end result.";
+
 /// Entry point for the `Tui` command.
 pub fn run(repo: Option<PathBuf>) -> Result<()> {
     let repo = resolve_repo(repo)?;
@@ -125,6 +131,10 @@ struct App {
     /// (a redirect prompt is disruptive mid-turn), anything else cancels. `freeze`
     /// records which of `r` (true) / `R` (false) armed it.
     pending_rebase: Option<(TaskId, bool)>,
+    /// Set to a task id after `d` on a *working* agent: a second `d` confirms (injecting a
+    /// prompt mid-turn is disruptive, and a description is premature until work settles),
+    /// anything else cancels.
+    pending_describe: Option<TaskId>,
 }
 
 impl App {
@@ -164,6 +174,7 @@ impl App {
             pending_refresh: false,
             pending_swap: None,
             pending_rebase: None,
+            pending_describe: None,
         };
         app.refresh();
         Ok(app)
@@ -234,6 +245,17 @@ impl App {
             }
             return;
         }
+        // A pending describe-confirmation swallows the next key: a second `d` confirms,
+        // anything else cancels (the describe prompt is only injected on a deliberate
+        // re-press).
+        if let Some(id) = self.pending_describe.take() {
+            if action == Action::Describe {
+                self.perform_describe(id);
+            } else {
+                self.status = "describe cancelled".to_string();
+            }
+            return;
+        }
         match action {
             Action::Quit => self.should_quit = true,
             Action::Up => self.move_selection(-1),
@@ -246,6 +268,7 @@ impl App {
             Action::Snapshot => self.snapshot_selected(),
             Action::Rebase => self.rebase_selected(true),
             Action::RebaseParent => self.rebase_selected(false),
+            Action::Describe => self.describe_selected(),
             Action::None => {}
         }
     }
@@ -562,6 +585,58 @@ impl App {
                 Err(e) => self.status = format!("rebase send failed: {e}"),
             },
             Err(e) => self.status = format!("rebase failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    /// `d`: ask the selected agent to describe its own revision. faff never runs `jj
+    /// describe` itself — it injects a prompt telling the agent to set a short 4-7 word
+    /// description of the end result, so the log row shows what the revision actually did
+    /// (not just the seeded title from the first prompt). On a working agent the first
+    /// press only arms a confirmation (a mid-turn prompt is disruptive, and a description
+    /// is premature before the work settles); a second `d` goes through (via `handle_key`).
+    fn describe_selected(&mut self) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        if t.ws_name.is_none() {
+            self.status = "no workspace to describe for this task".to_string();
+            return;
+        }
+        if t.pane_id.is_none() {
+            self.status = "no live pane to send the describe prompt to".to_string();
+            return;
+        }
+        // Like rebase: the first prompt is captured as the task title, so an injected
+        // describe prompt sent before the user's own first prompt would become that title.
+        // Hold off until the task has a real prompt (and thus some work to describe).
+        if t.prompt.is_empty() {
+            self.status = "send the task its first prompt before describing".to_string();
+            return;
+        }
+        if t.status == TaskStatus::Working {
+            self.pending_describe = Some(t.id);
+            self.status = format!(
+                "#{} is working — press d to confirm describe, any other key cancels",
+                t.id.0
+            );
+            return;
+        }
+        self.perform_describe(t.id);
+    }
+
+    /// Inject the describe prompt into the agent's pane (already validated / confirmed).
+    fn perform_describe(&mut self, id: TaskId) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let Some(pane) = t.pane_id else {
+            self.status = "no pane to describe for this task".to_string();
+            return;
+        };
+        match wezterm::send_text(pane, DESCRIBE_PROMPT) {
+            Ok(()) => self.status = format!("sent describe to #{}", id.0),
+            Err(e) => self.status = format!("describe send failed: {e}"),
         }
         self.refresh();
     }
@@ -952,7 +1027,7 @@ impl App {
             "[↵]open"
         };
         let keys = format!(
-            " [n]ew {enter} [s]wap [S]napshot [r]ebase [x]remove [X]remove+drop [q]uit   {}",
+            " [n]ew {enter} [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   {}",
             self.status
         );
         f.render_widget(
@@ -995,6 +1070,7 @@ mod tests {
             pending_refresh: false,
             pending_swap: None,
             pending_rebase: None,
+            pending_describe: None,
             last_refresh: Instant::now(),
         }
     }
@@ -1076,6 +1152,53 @@ mod tests {
 
         app.rebase_selected(true);
         assert_eq!(app.pending_rebase, None, "must not arm without a prompt");
+        assert!(app.status.contains("first prompt"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn describe_on_working_agent_arms_then_cancels() {
+        // `d` on a working agent must not send anything; it only arms a confirmation.
+        // A non-`d` key then cancels and clears the pending state.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.describe_selected();
+        assert_eq!(
+            app.pending_describe,
+            Some(t.id),
+            "first d arms the confirmation"
+        );
+        assert!(app.status.contains("press d to confirm"));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.pending_describe, None, "a non-d key cancels");
+        assert_eq!(app.status, "describe cancelled");
+    }
+
+    #[test]
+    fn describe_before_first_prompt_is_blocked() {
+        // Before the task has a prompt of its own, an injected describe prompt would be
+        // captured as the task's title — so `d` refuses until a real prompt exists.
+        let mut app = test_app();
+        let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.describe_selected();
+        assert_eq!(app.pending_describe, None, "must not arm without a prompt");
         assert!(app.status.contains("first prompt"), "status: {}", app.status);
     }
 
