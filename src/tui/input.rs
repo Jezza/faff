@@ -24,6 +24,10 @@ pub enum Action {
     Rebase,
     /// `R`: like `Rebase`, but base the agent on your parent line (read-only, WIP excluded).
     RebaseParent,
+    /// `d`: describe — tell the agent to set a short 4-7 word jj description summarising
+    /// the end result of its current revision. faff injects the prompt; the agent runs
+    /// `jj describe` itself.
+    Describe,
     None,
 }
 
@@ -41,6 +45,7 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('S') => Action::Snapshot,
         KeyCode::Char('r') => Action::Rebase,
         KeyCode::Char('R') => Action::RebaseParent,
+        KeyCode::Char('d') => Action::Describe,
         _ => Action::None,
     }
 }
@@ -74,6 +79,7 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('S'))), Action::Snapshot);
         assert_eq!(map_key(k(KeyCode::Char('r'))), Action::Rebase);
         assert_eq!(map_key(k(KeyCode::Char('R'))), Action::RebaseParent);
+        assert_eq!(map_key(k(KeyCode::Char('d'))), Action::Describe);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }

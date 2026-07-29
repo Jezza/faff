@@ -40,6 +40,7 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `S` | snapshot the selected agent's workspace |
 | `r` | refresh: tell the agent to rebase onto the latest fork point (freezes your WIP first) |
 | `R` | refresh onto your parent line instead (read-only; your WIP excluded) |
+| `d` | describe: tell the agent to set a short 4-7 word jj description of the revision's end result |
 | `x` | remove the selected task (keeps its revision as history) |
 | `X` | remove the selected task *and* abandon its revision (discards the work) |
 | `q` | quit |
@@ -60,7 +61,7 @@ revisions                                      │ ┃   from postcard to JSON
 ○  [ntlpqxos] import                           │ ┃
 ── detached (integrated / no node) ──          │ ┃ >
 · #5 Add OAuth login ✓                         │ ┃
- [n]ew [↵]detach [s]wap [S]napshot [r]ebase [x]remove [X]remove+drop [q]uit   ready ┃
+ [n]ew [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   ready ┃
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -125,6 +126,18 @@ excluded. Either is a no-op (reported, nothing sent) when the agent already sits
 newest base. On a working agent the first press arms a confirmation (a redirect mid-turn is
 disruptive); the same key again sends it. This needs the send side of the pane, so faff adds
 `wezterm cli send-text` alongside the `get-text` it already uses.
+
+### Describing a revision (`d`)
+
+When a task captures its first prompt, faff seeds the change's jj description from that
+prompt — a fair *intent* label, but not what the work actually turned into. `d` closes that
+gap: like `r`, it **injects a prompt into the agent's pane**, here telling the agent to run
+`jj describe` with a short 4-7 word summary of the revision's *end result*. faff never runs
+`jj describe` itself; the agent does, and the log row picks up the new description on the next
+refresh. Run it once the agent has finished — on a working agent the first press arms a
+confirmation (a describe mid-turn is premature, and the prompt is disruptive), and a second
+`d` sends it. It needs a live pane and a task that already has a prompt of its own (otherwise
+the injected prompt would be captured as the title, exactly as with `r`).
 
 ### Removing a task
 
