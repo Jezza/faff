@@ -50,17 +50,16 @@ One session is docked at a time. Docking another detaches the current one.
 With task #7's session docked, faff on the left and the real `claude` pane on the right:
 
 ```
- faf · faff · 1 working · ▶ #7                   ┃ ⏺ Convert the HTTP and MQTT bridges
-revisions                                      │ ┃   from postcard to JSON
-@  [wvrsmsyk] (no description set)             │ ┃
-│ ●  [kmkxwzqr] #7 Convert bridges to JSON  ▶  │ ┃ ● Read src/bridge/http.rs
-├─╯             ⚙ working · %12                │ ┃ ● Edit src/bridge/http.rs
-│ ●  [rzqlvksp] #8 Fix flaky store tests       │ ┃ ● Bash cargo test -p bridge
-├─╯             🔔 needs you · %14             │ ┃
-○  [yuvnmxxo] initial code commit              │ ┃ ✻ Thinking…
-○  [ntlpqxos] import                           │ ┃
-── detached (integrated / no node) ──          │ ┃ >
-· #5 Add OAuth login ✓                         │ ┃
+ faf · faff · 1 working · ▶ #7                         ┃ ⏺ Convert the HTTP and MQTT bridges
+revisions                                            │ ┃   from postcard to JSON
+@  [wvrsmsyk] ░ (no description set)                 │ ┃
+├─●  [kmkxwzqr] █ #7 ⚙ :: Convert bridges to JSON  ▶ │ ┃ ● Read src/bridge/http.rs
+├─●  [rzqlvksp] █ #8 🔔 :: Fix flaky store tests     │ ┃ ● Edit src/bridge/http.rs
+○  [yuvnmxxo] █ initial code commit                  │ ┃ ● Bash cargo test -p bridge
+○  [ntlpqxos] █ import                               │ ┃
+── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
+· #5 Add OAuth login ✓                               │ ┃
+                                                       ┃ >
  [n]ew [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   ready ┃
 ```
 
@@ -161,11 +160,14 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 
 - `@` your working copy — drawn green (like jj log), labelled with its description
   (or `(no description set)`)
-- `●` a faff agent's revision, labelled with the change's jj description (falling back to
-  the first line of the prompt until it's described), with a status line under it
-  (`⚙ working`, `🔔 needs you`, `✓ review-ready`) and its pane id
+- `●` a faff agent's revision, shown on one row as `#<id> <status> :: <title>` — the
+  title is the change's jj description (falling back to the first line of the prompt until
+  it's described), and `<status>` is the emoji `⚙` working / `🔔` needs you / `✓` review-ready
 - `○` ordinary history, or another workspace's working copy
 - `×` a conflict
+
+Right after each row's `[change-id]`, a fill glyph marks whether the change has content:
+`█` when it does, `░` when it's empty — on every visible node.
 
 Empty description-less single-parent commits collapse out. Merges and conflicts never
 collapse. Row labels are clipped to the current pane width — and only when they overflow —
