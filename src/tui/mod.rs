@@ -1325,13 +1325,13 @@ mod tests {
         app.rows = vec![
             graph::GraphRow {
                 gutter: "@".into(),
-                content: "░ (no description set)".into(),
+                content: "◻ (no description set)".into(),
                 node_index: Some(0),
                 change_id: Some("wcwcwcwc".into()),
             },
             graph::GraphRow {
                 gutter: "◆".into(),
-                content: "█ base".into(),
+                content: "◼ base".into(),
                 node_index: Some(1),
                 change_id: Some("basebase".into()),
             },
@@ -1367,7 +1367,7 @@ mod tests {
         let mut app = test_app();
         app.rows = vec![graph::GraphRow {
             gutter: "@".into(),
-            content: "█ my work".into(),
+            content: "◼ my work".into(),
             node_index: Some(0),
             change_id: Some("wcwcwcwc".into()),
         }];
@@ -1395,18 +1395,18 @@ mod tests {
         // A trunk node (`○`, a 1-column gutter) and a folded agent stub (`├─●`, a
         // 3-column gutter) must line their `[id]` column, block indicator, and
         // description into one straight vertical column: the gutter is padded to a
-        // uniform width so branch depth never pushes the `[id] ░ …` block sideways.
+        // uniform width so branch depth never pushes the `[id] ◻ …` block sideways.
         let mut app = test_app();
         app.rows = vec![
             graph::GraphRow {
                 gutter: "○".into(),
-                content: "█ trunk work".into(),
+                content: "◼ trunk work".into(),
                 node_index: Some(0),
                 change_id: Some("aaaaaaaa".into()),
             },
             graph::GraphRow {
                 gutter: "├─●".into(),
-                content: "░ #11 :: agent work".into(),
+                content: "◻ #11 :: agent work".into(),
                 node_index: Some(1),
                 change_id: Some("bbbbbbbb".into()),
             },
@@ -1433,15 +1433,15 @@ mod tests {
                 .collect()
         };
 
-        // The block indicators are unique to the graph rows (█ on the trunk row, ░ on
+        // The fill indicators are unique to the graph rows (◼ on the trunk row, ◻ on
         // the agent stub) — they must share one x column.
-        let full = find("█");
-        let empty = find("░");
-        assert_eq!(full.len(), 1, "one █ indicator: {full:?}");
-        assert_eq!(empty.len(), 1, "one ░ indicator: {empty:?}");
+        let full = find("◼");
+        let empty = find("◻");
+        assert_eq!(full.len(), 1, "one ◼ indicator: {full:?}");
+        assert_eq!(empty.len(), 1, "one ◻ indicator: {empty:?}");
         assert_eq!(
             full[0].0, empty[0].0,
-            "block indicators aligned: █@{full:?} vs ░@{empty:?}"
+            "fill indicators aligned: ◼@{full:?} vs ◻@{empty:?}"
         );
 
         // The `[` opening each id column (found on the indicator's own row, so footer/
