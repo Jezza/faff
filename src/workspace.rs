@@ -83,6 +83,64 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
     create(repo, &name, &path)
 }
 
+/// Hand off your current work to an agent (`N`): the agent's workspace takes over your
+/// current revision `W` — it continues editing that exact commit — while your own `@`
+/// retreats to a fresh empty commit on the fork point from *before* your changes.
+///
+/// End state, with `P = heads(::@- ~ empty())` (your parent line, the `R` recipe):
+///
+/// ```text
+/// ● W   agent @  (your WIP — the agent continues it)
+/// │
+/// │ @   you (fresh empty)
+/// ├─┘
+/// ○ P   fork point, before your changes
+/// ```
+///
+/// Mechanics mirror [`swap`]'s snapshot-then-edits, ordered so **your workspace moves
+/// last** — any failure before that leaves you untouched on `W`:
+/// 1. Snapshot your workspace so `W` captures your uncommitted edits.
+/// 2. Bail if `W` is empty (nothing to hand off), or has no non-empty ancestor to retreat
+///    onto (no fork point) — neither creates a workspace.
+/// 3. `jj workspace add -r W` makes the agent's working copy an empty child of `W`; a
+///    `jj edit W` inside it then moves the agent *onto* `W` (the empty child is auto-
+///    abandoned). Your workspace and the agent transiently share `W` — the same combined
+///    node `swap` relies on.
+/// 4. `jj new P` in your workspace: your `@` becomes a fresh empty child of `P`, leaving
+///    `W` solely to the agent.
+///
+/// The task's `fork_point` is `P`, not `W`: `W` is part of the agent's own line
+/// `(P..head)`, so removal treats the handed-off work as the task's — `x` keeps it as
+/// history, `X` discards the whole line (both still shielded by `~ ::@`).
+pub fn handoff(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
+    // Capture your uncommitted edits first: `W` may look empty until snapshotted, and the
+    // agent adopts `W` by change_id — its content must already be in the commit.
+    jj::snapshot_in(repo).context("snapshotting your workspace")?;
+    let w = jj::resolve_change_id(repo, "@").context("resolving @")?;
+    if !jj::any_revision(repo, "@ ~ empty()")? {
+        bail!("nothing to hand off — your @ has no changes");
+    }
+    let fork_point = jj::resolve_change_id(repo, "heads(::@- ~ empty())")
+        .context("no fork point before your changes to retreat onto")?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace root {}", parent.display()))?;
+    }
+    // Agent workspace: created as an empty child of `W`, then moved onto `W` itself.
+    jj::workspace_add(repo, name, &w, path).context("jj workspace add")?;
+    jj::edit_in(path, &w).context("moving the agent onto your revision")?;
+    // Your workspace retreats last: a fresh empty commit on the pre-changes fork point.
+    jj::new_at(repo, &fork_point).context("jj new (retreating your @)")?;
+
+    Ok(WorkspaceInfo {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        change_id: w,
+        fork_point,
+    })
+}
+
 /// Outcome of computing a refresh (`r`/`R`) for an agent workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refresh {
@@ -1053,5 +1111,118 @@ mod tests {
         assert!(!info.path.exists(), "workspace dir removed");
         let ws2 = jj::workspace_list(&repo).unwrap();
         assert!(!ws2.iter().any(|w| w.name == "faf-task-1"));
+    }
+
+    #[test]
+    fn integration_handoff_moves_agent_onto_wip_and_retreats_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path()); // @ empty on top of "base"
+        let base = jj::resolve_change_id(&repo, "@-").unwrap(); // the "base" content commit
+
+        // You start some work of your own in your workspace.
+        fs::write(repo.join("wip.txt"), "my work in progress").unwrap();
+        let w = jj::resolve_change_id(&repo, "@").unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = handoff(&repo, "faf-task-1", &ws_path).unwrap();
+
+        // The agent's workspace took over your exact revision W (continues that commit).
+        assert_eq!(info.change_id, w, "agent adopts your current revision");
+        let agent_head = jj::workspace_list(&repo)
+            .unwrap()
+            .into_iter()
+            .find(|ws| ws.name == "faf-task-1")
+            .expect("agent workspace exists")
+            .change_id;
+        assert_eq!(agent_head, w, "agent workspace @ is W itself, not a child");
+        assert!(
+            ws_path.join("wip.txt").exists(),
+            "agent holds your WIP in its working tree"
+        );
+
+        // fork_point is the pre-changes line — here, the base commit.
+        assert_eq!(info.fork_point, base);
+
+        // Your own @ retreated to a fresh empty commit on that fork point.
+        let user_at = jj::resolve_change_id(&repo, "@").unwrap();
+        assert_ne!(user_at, w, "you left W");
+        assert!(
+            !jj::any_revision(&repo, &format!("{user_at} ~ empty()")).unwrap(),
+            "your new @ is empty"
+        );
+        assert_eq!(
+            jj::resolve_change_id(&repo, &format!("{user_at}-")).unwrap(),
+            base,
+            "your new @ is a child of the pre-changes fork point"
+        );
+
+        // W survives (the agent sits on it) and still carries your work.
+        assert!(
+            jj::any_revision(&repo, &format!("{w} ~ empty()")).unwrap(),
+            "W is kept and non-empty"
+        );
+    }
+
+    #[test]
+    fn integration_handoff_bails_on_empty_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path()); // @ empty — nothing to hand off
+        let ws_path = tmp.path().join("ws").join("0001-task");
+
+        let err = handoff(&repo, "faf-task-1", &ws_path).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to hand off"),
+            "empty @ is rejected: {err}"
+        );
+        // No workspace and no directory were created.
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|w| w.name == "faf-task-1")
+        );
+        assert!(!ws_path.exists());
+    }
+
+    #[test]
+    fn integration_handoff_then_discard_abandons_whole_line() {
+        // fork_point = P means the handed-off W is part of the agent's own line, so `X`
+        // (discard) throws the whole thing away.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        fs::write(repo.join("wip.txt"), "handed off work").unwrap();
+        jj(&repo, &cfg, &["describe", "-m", "HANDEDOFF"]);
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = handoff(&repo, "faf-task-1", &ws_path).unwrap();
+
+        teardown_discarding_revision(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
+
+        let after = jj::log(&repo, "all()").unwrap();
+        assert!(
+            !after.iter().any(|r| r.description == "HANDEDOFF"),
+            "X after handoff discards the handed-off revision"
+        );
+    }
+
+    #[test]
+    fn integration_handoff_then_remove_keeps_line() {
+        // plain `x`: real handed-off work is preserved as ordinary history.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        fs::write(repo.join("wip.txt"), "handed off work").unwrap();
+        jj(&repo, &cfg, &["describe", "-m", "HANDEDOFF"]);
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = handoff(&repo, "faf-task-1", &ws_path).unwrap();
+
+        teardown(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
+
+        let after = jj::log(&repo, "all()").unwrap();
+        assert!(
+            after.iter().any(|r| r.description == "HANDEDOFF"),
+            "x after handoff keeps the handed-off work as history"
+        );
+        assert!(!ws_path.exists(), "workspace dir removed");
     }
 }

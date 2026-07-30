@@ -163,6 +163,15 @@ pub fn new(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `jj new <rev>` in the default workspace: create a fresh empty commit as a child of
+/// `rev` and check it out. Unlike [`new`] (a child of the current `@`), this bases the
+/// new working copy on an arbitrary revision — `handoff` uses it to retreat your `@` onto
+/// the fork point from before your changes. `-R` pins the default workspace (see `edit`).
+pub fn new_at(repo: &Path, rev: &str) -> Result<()> {
+    run_jj(repo, &["new", rev])?;
+    Ok(())
+}
+
 /// `jj workspace add --name <name> -r <revset> <path>`.
 pub fn workspace_add(repo: &Path, name: &str, revset: &str, path: &Path) -> Result<()> {
     let path_s = path.to_string_lossy();
