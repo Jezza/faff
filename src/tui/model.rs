@@ -133,10 +133,34 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     revs.clone_from_slice(&reordered);
 }
 
-/// Nodes to render, plus which task (if any) each node represents.
+/// The current fork point: the revision new tasks (`n`) branch from — `heads(::@ ~ empty())`,
+/// the newest non-empty ancestor of `@` (including `@` itself). Computed by walking `@`'s
+/// first-parent chain to the first non-empty revision, matching the flat trunk the rest of
+/// the layout assumes. Returns `None` when there is no working copy in the set, or when every
+/// ancestor along the trunk is empty (the fork point is off the loaded window).
+pub fn current_fork_point(revs: &[RevInfo]) -> Option<String> {
+    let by_id: std::collections::HashMap<&str, &RevInfo> =
+        revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
+    let mut cur = revs.iter().find(|r| r.is_current_wc)?;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur.change_id.as_str()) {
+            return None; // cycle guard — never on a DAG
+        }
+        if !cur.empty {
+            return Some(cur.change_id.clone());
+        }
+        cur = by_id.get(cur.parents.first()?.as_str()).copied()?;
+    }
+}
+
+/// Nodes to render, which task (if any) each node represents, and the current fork point —
+/// the revision new agents branch from (see [`current_fork_point`]), so the view can tint
+/// its glyph.
 pub struct GraphModel {
     pub nodes: Vec<GraphNode>,
     pub task_of: Vec<Option<TaskId>>,
+    pub fork_point: Option<String>,
 }
 
 /// Map each rendered row to the task it represents, for selection highlight and the
@@ -196,6 +220,7 @@ fn head_label(rev: &RevInfo) -> String {
 pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> GraphModel {
     let mut nodes = Vec::with_capacity(revs.len());
     let mut task_of = Vec::with_capacity(revs.len());
+    let fork_point = current_fork_point(revs);
 
     // Widest task-id (in digits) across the tasks, so every `#id` field pads to a common
     // width and the status emoji that follows lines up down the stacked agent rows.
@@ -299,6 +324,16 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             ('○', vec![d], false, None)
         };
 
+        // Mark the current fork point — where new agents branch from — with a diamond. The
+        // `@` you-are-here glyph wins when `@` itself is the fork point (the view tints it
+        // instead), and a conflict `×` is never masked.
+        let is_fork = fork_point.as_deref() == Some(rev.change_id.as_str());
+        let glyph = if is_fork && glyph != '@' && glyph != '×' {
+            '◆'
+        } else {
+            glyph
+        };
+
         // Lead the label with a fill glyph — right after the id column — marking whether
         // the change has content: █ non-empty, ░ empty. Every visible node carries one;
         // collapsed graph-noise nodes are spliced out before render, so they get none.
@@ -317,7 +352,11 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         task_of.push(tid);
     }
 
-    GraphModel { nodes, task_of }
+    GraphModel {
+        nodes,
+        task_of,
+        fork_point,
+    }
 }
 
 #[cfg(test)]
@@ -394,13 +433,14 @@ mod tests {
         assert_eq!(m.nodes[1].lines, vec!["░ #7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
 
-        // fork-point collapses
+        // empty fork-point commit collapses out
         assert!(m.nodes[2].collapse);
         assert_eq!(m.task_of[2], None);
 
-        // base commit: ordinary non-agent history → hollow ○, non-empty (█), shows its
-        // description
-        assert_eq!(m.nodes[3].glyph, '○');
+        // base commit: the newest non-empty ancestor of @, so it's the current fork point
+        // (where new agents branch from) → diamond ◆, non-empty (█), shows its description.
+        assert_eq!(m.fork_point, Some("p".to_string()));
+        assert_eq!(m.nodes[3].glyph, '◆');
         assert_eq!(m.nodes[3].lines, vec!["█ base"]);
         assert!(!m.nodes[3].collapse);
     }
@@ -599,8 +639,9 @@ mod tests {
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
         assert_eq!(
             gutters,
-            vec!["@", "├─●", "○", "├─●", "○", "├─●", "○", "○"],
-            "trunk stays one clean column; each agent folds to a single ├─● row above its base"
+            vec!["@", "├─●", "◆", "├─●", "○", "├─●", "○", "○"],
+            "trunk stays one clean column; each agent folds to a single ├─● row above its \
+             base, and the current fork point (pk, newest non-empty ancestor of @) is a ◆"
         );
         // Agent rows lead with the ░ empty-fill (these forks are empty), then
         // `#id emoji :: title`. Ids pad to the widest (#15) so the emojis align: #7/#9
@@ -833,5 +874,84 @@ mod tests {
         let m = build(&revs, &[], &[]);
         assert!(!m.nodes[0].collapse);
         assert_eq!(m.nodes[0].parents, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn current_fork_point_is_first_nonempty_ancestor_of_at() {
+        // @ is empty, its parent is empty too, its grandparent has content — the fork
+        // point is that first non-empty ancestor walking down the trunk.
+        let revs = vec![
+            rev("wc", &["mid"], true, true, ""),
+            rev("mid", &["base"], false, true, ""),
+            rev("base", &[], false, false, "base"),
+        ];
+        assert_eq!(current_fork_point(&revs), Some("base".to_string()));
+    }
+
+    #[test]
+    fn current_fork_point_is_at_itself_when_working_copy_has_content() {
+        // Non-empty @ (uncommitted content) is itself the fork point.
+        let revs = vec![
+            rev("wc", &["base"], true, false, "my work"),
+            rev("base", &[], false, false, "base"),
+        ];
+        assert_eq!(current_fork_point(&revs), Some("wc".to_string()));
+    }
+
+    #[test]
+    fn current_fork_point_is_none_when_every_ancestor_is_empty() {
+        let revs = vec![
+            rev("wc", &["base"], true, true, ""),
+            rev("base", &[], false, true, ""),
+        ];
+        assert_eq!(current_fork_point(&revs), None);
+    }
+
+    #[test]
+    fn current_fork_point_is_none_without_a_working_copy() {
+        let revs = vec![rev("base", &[], false, false, "base")];
+        assert_eq!(current_fork_point(&revs), None);
+    }
+
+    #[test]
+    fn build_marks_the_fork_point_node_with_a_diamond() {
+        // Empty @ above a non-empty ordinary commit: that commit is the fork point, so its
+        // glyph becomes ◆ (instead of the plain ○) and the model reports it.
+        let revs = vec![
+            rev("wc", &["base"], true, true, ""),
+            rev("base", &[], false, false, "base"),
+        ];
+        let m = build(&revs, &[], &[]);
+        assert_eq!(m.fork_point, Some("base".to_string()));
+        assert_eq!(m.nodes[0].glyph, '@', "the working copy keeps @");
+        assert_eq!(m.nodes[1].glyph, '◆', "the fork point is a diamond");
+    }
+
+    #[test]
+    fn build_keeps_at_glyph_when_the_working_copy_is_the_fork_point() {
+        // Non-empty @ is the fork point: the you-are-here @ glyph wins (the view tints it),
+        // no diamond is drawn on it.
+        let revs = vec![
+            rev("wc", &["base"], true, false, "my work"),
+            rev("base", &[], false, false, "base"),
+        ];
+        let m = build(&revs, &[], &[]);
+        assert_eq!(m.fork_point, Some("wc".to_string()));
+        assert_eq!(m.nodes[0].glyph, '@', "@ wins over the diamond");
+    }
+
+    #[test]
+    fn build_never_masks_a_conflict_with_the_diamond() {
+        // A conflicted fork point keeps its × glyph — never hidden behind a diamond.
+        let revs = vec![
+            rev("wc", &["c"], true, true, ""),
+            RevInfo {
+                conflict: true,
+                ..rev("c", &[], false, false, "")
+            },
+        ];
+        let m = build(&revs, &[], &[]);
+        assert_eq!(m.fork_point, Some("c".to_string()));
+        assert_eq!(m.nodes[1].glyph, '×', "conflict glyph survives");
     }
 }
