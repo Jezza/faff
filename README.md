@@ -163,6 +163,8 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
   title is the change's jj description (falling back to the first line of the prompt until
   it's described), and `<status>` is the emoji `⚙` working / `🔔` needs you / `✓` review-ready
 - `○` ordinary history, or another workspace's working copy
+- `◆` the current fork point — drawn cyan — the revision new agents branch from
+  (`heads(::@ ~ empty())`); when it coincides with your working copy the `@` itself turns cyan
 - `×` a conflict
 
 Right after each row's `[change-id]`, a fill glyph marks whether the change has content:

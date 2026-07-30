@@ -105,6 +105,9 @@ struct App {
     tasks: Vec<Task>,
     rows: Vec<GraphRow>,
     task_of_node: Vec<Option<TaskId>>,
+    /// The current fork point (`heads(::@ ~ empty())`) — the revision new agents branch
+    /// from. Its glyph (`◆`, or `@` when it coincides) is tinted cyan in the graph.
+    fork_point: Option<String>,
     task_order: Vec<TaskId>,
     /// Live tasks with no distinct graph node (workspace inlined into HEAD, or a
     /// stale row). Still selectable/removable; shown in a "detached" footer list.
@@ -153,6 +156,7 @@ impl App {
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
+            fork_point: None,
             task_order: Vec::new(),
             detached: Vec::new(),
             selected: 0,
@@ -668,10 +672,11 @@ impl App {
         // Build the revision graph from the (already-fetched) workspace list.
         if let Some(ws) = &ws_list {
             match self.build_rows(ws) {
-                Ok((rows, task_of, id_display)) => {
+                Ok((rows, task_of, id_display, fork_point)) => {
                     self.rows = rows;
                     self.task_of_node = task_of;
                     self.id_display = id_display;
+                    self.fork_point = fork_point;
                 }
                 Err(e) => self.status = format!("jj error: {e}"),
             }
@@ -788,6 +793,7 @@ impl App {
         Vec<GraphRow>,
         Vec<Option<TaskId>>,
         std::collections::HashMap<String, (String, String)>,
+        Option<String>,
     )> {
         let mut heads: Vec<String> = workspaces.iter().map(|w| w.change_id.clone()).collect();
         heads.push("@".to_string());
@@ -811,7 +817,7 @@ impl App {
         // task_of is parallel to rows: which task (if any) each row represents. For the
         // combined HEAD+agent node this hangs on the agent line, not the HEAD header.
         let task_of = model::row_tasks(&rows, &m.nodes, &m.task_of);
-        Ok((rows, task_of, id_display))
+        Ok((rows, task_of, id_display, m.fork_point))
     }
 
     // ---- rendering ----
@@ -899,18 +905,31 @@ impl App {
             match &row.change_id {
                 // Node row: gutter + [id] + content, with the unique prefix highlighted.
                 Some(cid) => {
-                    // Color the working-copy glyph `@` green (bold), like jj log; every
-                    // other gutter character keeps the base style. Only the `@` node's
-                    // commit row ever carries `@`, and there is at most one.
+                    // Tint one node glyph in the gutter (bold), leaving every other gutter
+                    // character at the base style. The current fork point — where new agents
+                    // branch from — is a cyan `◆`, or a cyan `@` when it coincides with the
+                    // working copy; a non-fork working-copy `@` is green, like jj log.
                     let gutter = format!("{:<gutter_w$}", row.gutter);
-                    match gutter.find('@') {
-                        Some(at) => {
+                    let is_fork = self.fork_point.as_deref() == Some(cid.as_str());
+                    let highlight = if is_fork {
+                        gutter
+                            .find('◆')
+                            .map(|at| (at, '◆', Color::Cyan))
+                            .or_else(|| gutter.find('@').map(|at| (at, '@', Color::Cyan)))
+                    } else {
+                        gutter.find('@').map(|at| (at, '@', Color::Green))
+                    };
+                    match highlight {
+                        Some((at, ch, color)) => {
                             spans.push(Span::styled(gutter[..at].to_string(), base));
                             spans.push(Span::styled(
-                                "@",
-                                base.fg(Color::Green).add_modifier(Modifier::BOLD),
+                                ch.to_string(),
+                                base.fg(color).add_modifier(Modifier::BOLD),
                             ));
-                            spans.push(Span::styled(gutter[at + 1..].to_string(), base));
+                            spans.push(Span::styled(
+                                gutter[at + ch.len_utf8()..].to_string(),
+                                base,
+                            ));
                         }
                         None => spans.push(Span::styled(gutter, base)),
                     }
@@ -1030,6 +1049,7 @@ mod tests {
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
+            fork_point: None,
             task_order: Vec::new(),
             detached: Vec::new(),
             selected: 0,
@@ -1273,6 +1293,79 @@ mod tests {
             .find(|c| c.symbol() == "@")
             .expect("@ glyph rendered");
         assert_eq!(at.fg, Color::Green, "working-copy `@` is green");
+    }
+
+    #[test]
+    fn graph_renders_fork_point_diamond_in_cyan() {
+        // The fork-point node carries a ◆; the view tints it cyan. A non-fork `@` on
+        // another row stays green.
+        let mut app = test_app();
+        app.rows = vec![
+            graph::GraphRow {
+                gutter: "@".into(),
+                content: "░ (no description set)".into(),
+                node_index: Some(0),
+                change_id: Some("wcwcwcwc".into()),
+            },
+            graph::GraphRow {
+                gutter: "◆".into(),
+                content: "█ base".into(),
+                node_index: Some(1),
+                change_id: Some("basebase".into()),
+            },
+        ];
+        app.task_of_node = vec![None, None];
+        app.id_display = std::collections::HashMap::from([
+            ("wcwcwcwc".to_string(), ("wcwcwcwc".to_string(), String::new())),
+            ("basebase".to_string(), ("basebase".to_string(), String::new())),
+        ]);
+        app.fork_point = Some("basebase".to_string());
+
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let diamond = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "◆")
+            .expect("◆ glyph rendered");
+        assert_eq!(diamond.fg, Color::Cyan, "fork-point ◆ is cyan");
+        let at = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "@")
+            .expect("@ glyph rendered");
+        assert_eq!(at.fg, Color::Green, "a non-fork `@` stays green");
+    }
+
+    #[test]
+    fn graph_tints_working_copy_cyan_when_it_is_the_fork_point() {
+        // @ itself is the fork point: keep the @ glyph but tint it cyan, not green.
+        let mut app = test_app();
+        app.rows = vec![graph::GraphRow {
+            gutter: "@".into(),
+            content: "█ my work".into(),
+            node_index: Some(0),
+            change_id: Some("wcwcwcwc".into()),
+        }];
+        app.task_of_node = vec![None];
+        app.id_display = std::collections::HashMap::from([(
+            "wcwcwcwc".to_string(),
+            ("wcwcwcwc".to_string(), String::new()),
+        )]);
+        app.fork_point = Some("wcwcwcwc".to_string());
+
+        let backend = TestBackend::new(80, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let at = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "@")
+            .expect("@ glyph rendered");
+        assert_eq!(at.fg, Color::Cyan, "the `@` that is the fork point is cyan");
     }
 
     #[test]
