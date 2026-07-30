@@ -127,30 +127,47 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
             .filter_map(|(j, l)| (l.as_deref() == Some(n.change_id.as_str())).then_some(j))
             .collect();
 
-        // Fold: a branch head (nothing flows into it) whose single parent is already
-        // targeted by an open lane renders as ONE row — `├─●` — instead of a branch row
-        // plus a separate `├─╯` merge row. The `├` sits on the trunk lane, a short `─`
-        // reaches right to the node's glyph, and the branch closes immediately. So N
-        // agents forked from one point render as N single rows stacked directly above
-        // their shared base, at a constant two columns. (Extra content lines — rare, now
-        // that an agent is one line — hang beneath as connected continuation rows.)
-        if incoming.is_empty()
-            && n.parents.len() == 1
+        // Fold: a branch whose single parent is already targeted by an open lane renders as
+        // ONE row — `├─●` — instead of a branch row plus a separate `├─╯` merge row. The `├`
+        // sits on the trunk (parent) lane, a short `─` reaches right to the node's glyph, and
+        // the branch closes immediately, freeing its lane. So N agents forked from one point
+        // render as N single rows stacked directly above their shared base, at a constant two
+        // columns. (Extra content lines — rare, now that an agent is one line — hang beneath
+        // as connected continuation rows.)
+        //
+        // This covers two shapes, both merging straight back into the trunk to its left:
+        //   * a leaf branch head (nothing flows in) — it borrows a fresh stub lane; and
+        //   * a node continuing a single incoming lane sitting right of the trunk — that
+        //     lane IS the stub and closes here, so a side branch never runs a parallel lane
+        //     down across later forks to a deferred merge (which pushed those forks out to
+        //     `├─│─●` and trailed a lone `├─╯`).
+        // A node left of its parent's lane, or one with several lanes flowing in, is a real
+        // merge — left to the general path below.
+        if n.parents.len() == 1
+            && incoming.len() <= 1
             && let Some(trunk) = lanes
                 .iter()
                 .position(|l| l.as_deref() == Some(n.parents[0].as_str()))
+            && incoming.first().is_none_or(|&j| j > trunk)
         {
-            // Temporary lane for the branch, always to the right of the trunk so the
-            // connector reads left-to-right (`├─●`).
-            let stub = match (trunk + 1..lanes.len()).find(|&j| lanes[j].is_none()) {
-                Some(s) => {
-                    lanes[s] = Some(n.change_id.clone());
-                    s
+            // The stub lane carrying the node's glyph, always to the right of the trunk so
+            // the connector reads left-to-right (`├─●`): reuse the incoming lane when one
+            // already flows in, else borrow a free lane right of the trunk.
+            let stub = match incoming.first() {
+                Some(&j) => {
+                    lanes[j] = Some(n.change_id.clone());
+                    j
                 }
-                None => {
-                    lanes.push(Some(n.change_id.clone()));
-                    lanes.len() - 1
-                }
+                None => match (trunk + 1..lanes.len()).find(|&j| lanes[j].is_none()) {
+                    Some(s) => {
+                        lanes[s] = Some(n.change_id.clone());
+                        s
+                    }
+                    None => {
+                        lanes.push(Some(n.change_id.clone()));
+                        lanes.len() - 1
+                    }
+                },
             };
             // The folded row carries the node's id + first content line; the branch closes
             // on this same row.
@@ -539,5 +556,28 @@ mod tests {
     #[test]
     fn empty_input_is_empty() {
         assert!(render(&[]).is_empty());
+    }
+
+    #[test]
+    fn branch_merging_back_folds_instead_of_holding_a_lane_across_later_forks() {
+        // A side branch (`s`) merges back into the trunk node `base`, but three agents fork
+        // off `base` between `s`'s row and `base`'s. `s` has a child (`c`) sitting above it,
+        // so a lane already flows into it — it isn't a leaf branch head. It must still fold
+        // to a single `├─○` row that cuts straight back to the trunk, freeing its lane, so
+        // the three agents fold to plain `├─●` (not `├─│─●`) and no deferred `├─╯` merge row
+        // trails the agents. Mirrors the screenshot: task forked off a non-trunk side commit.
+        let nodes = vec![
+            node("head", &["base"], '@', &["(no description set)"]),
+            node("c", &["s"], '●', &["#30 :: new task"]),
+            node("s", &["base"], '○', &["(no description set)"]),
+            node("a28", &["base"], '●', &["#28 :: evt"]),
+            node("a29", &["base"], '●', &["#29 :: sorg http"]),
+            node("a27", &["base"], '●', &["#27 :: app-specs"]),
+            node("base", &[], '○', &["Convert timers"]),
+        ];
+        assert_eq!(
+            gutters(&render(&nodes)),
+            vec!["@", "│ ●", "├─○", "├─●", "├─●", "├─●", "○"],
+        );
     }
 }
