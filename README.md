@@ -53,11 +53,11 @@ With task #7's session docked, faff on the left and the real `claude` pane on th
 ```
  faf · faff · 1 working · ▶ #7                         ┃ ⏺ Convert the HTTP and MQTT bridges
 revisions                                            │ ┃   from postcard to JSON
-@  [wvrsmsyk] ░ (no description set)                 │ ┃
-├─●  [kmkxwzqr] █ #7 ⚙ :: Convert bridges to JSON  ▶ │ ┃ ● Read src/bridge/http.rs
-├─●  [rzqlvksp] █ #8 🔔 :: Fix flaky store tests     │ ┃ ● Edit src/bridge/http.rs
-○  [yuvnmxxo] █ initial code commit                  │ ┃ ● Bash cargo test -p bridge
-○  [ntlpqxos] █ import                               │ ┃
+@  [wvrsmsyk] ◻ (no description set)                 │ ┃
+├─●  [kmkxwzqr] ◼ #7 ⚙ :: Convert bridges to JSON  ▶ │ ┃ ● Read src/bridge/http.rs
+├─●  [rzqlvksp] ◼ #8 🔔 :: Fix flaky store tests     │ ┃ ● Edit src/bridge/http.rs
+○  [yuvnmxxo] ◼ initial code commit                  │ ┃ ● Bash cargo test -p bridge
+○  [ntlpqxos] ◼ import                               │ ┃
 ── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
 · #5 Add OAuth login ✓                               │ ┃
                                                        ┃ >
@@ -196,7 +196,7 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 - `×` a conflict
 
 Right after each row's `[change-id]`, a fill glyph marks whether the change has content:
-`█` when it does, `░` when it's empty — on every visible node.
+`◼` when it does, `◻` when it's empty — on every visible node.
 
 Empty description-less single-parent commits collapse out. Merges and conflicts never
 collapse. Row labels are clipped to the current pane width — and only when they overflow —

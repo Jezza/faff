@@ -335,10 +335,10 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         };
 
         // Lead the label with a fill glyph — right after the id column — marking whether
-        // the change has content: █ non-empty, ░ empty. Every visible node carries one;
+        // the change has content: ◼ non-empty, ◻ empty. Every visible node carries one;
         // collapsed graph-noise nodes are spliced out before render, so they get none.
         if !collapse && let Some(first) = lines.first_mut() {
-            let fill = if rev.empty { '░' } else { '█' };
+            let fill = if rev.empty { '◻' } else { '◼' };
             *first = format!("{fill} {first}");
         }
 
@@ -421,16 +421,16 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes.len(), 4);
 
-        // HEAD @ — empty and no description, so the fill is ░ and the label is jj's
+        // HEAD @ — empty and no description, so the fill is ◻ and the label is jj's
         // placeholder.
         assert_eq!(m.nodes[0].glyph, '@');
-        assert_eq!(m.nodes[0].lines, vec!["░ (no description set)"]);
+        assert_eq!(m.nodes[0].lines, vec!["◻ (no description set)"]);
         assert_eq!(m.task_of[0], None);
 
         // task node: one line `#id emoji :: title`, glyph ● (a faf agent), mapped to task
         // 7. The title is the change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '●');
-        assert_eq!(m.nodes[1].lines, vec!["░ #7 ⚙ :: Add OAuth flow"]);
+        assert_eq!(m.nodes[1].lines, vec!["◻ #7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
 
         // empty fork-point commit collapses out
@@ -438,10 +438,10 @@ mod tests {
         assert_eq!(m.task_of[2], None);
 
         // base commit: the newest non-empty ancestor of @, so it's the current fork point
-        // (where new agents branch from) → diamond ◆, non-empty (█), shows its description.
+        // (where new agents branch from) → diamond ◆, non-empty (◼), shows its description.
         assert_eq!(m.fork_point, Some("p".to_string()));
         assert_eq!(m.nodes[3].glyph, '◆');
-        assert_eq!(m.nodes[3].lines, vec!["█ base"]);
+        assert_eq!(m.nodes[3].lines, vec!["◼ base"]);
         assert!(!m.nodes[3].collapse);
     }
 
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(m.nodes[0].glyph, '@');
         // HEAD keeps its own line — the shared revision's description; the agent hangs
         // beneath as one indented `↳ #id emoji :: title` sub-line.
-        assert_eq!(m.nodes[0].lines[0], "█ agent: did work");
+        assert_eq!(m.nodes[0].lines[0], "◼ agent: did work");
         assert!(m.nodes[0].lines[1].starts_with("↳ #1 ⚙ :: "));
         assert_eq!(m.nodes[0].lines.len(), 2);
         // Mapped to the task → the refresh's detached list won't claim it.
@@ -643,15 +643,15 @@ mod tests {
             "trunk stays one clean column; each agent folds to a single ├─● row above its \
              base, and the current fork point (pk, newest non-empty ancestor of @) is a ◆"
         );
-        // Agent rows lead with the ░ empty-fill (these forks are empty), then
+        // Agent rows lead with the ◻ empty-fill (these forks are empty), then
         // `#id emoji :: title`. Ids pad to the widest (#15) so the emojis align: #7/#9
         // gain a trailing space.
-        assert!(rows[1].content.starts_with("░ #15 ⚙ :: "));
-        assert!(rows[3].content.starts_with("░ #7  🔔 :: "));
-        assert!(rows[5].content.starts_with("░ #9  ✓ :: "));
-        // Trunk rows are the user's own revisions, non-empty (█), shown by description.
-        assert_eq!(rows[2].content, "█ spawn: declare! child-class refs");
-        assert_eq!(rows[4].content, "█ Generate bridge clients from JSON Schema");
+        assert!(rows[1].content.starts_with("◻ #15 ⚙ :: "));
+        assert!(rows[3].content.starts_with("◻ #7  🔔 :: "));
+        assert!(rows[5].content.starts_with("◻ #9  ✓ :: "));
+        // Trunk rows are the user's own revisions, non-empty (◼), shown by description.
+        assert_eq!(rows[2].content, "◼ spawn: declare! child-class refs");
+        assert_eq!(rows[4].content, "◼ Generate bridge clients from JSON Schema");
     }
 
     #[test]
@@ -681,7 +681,7 @@ mod tests {
         }];
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
-        assert_eq!(m.nodes[0].lines[0], "░ #1 ⚙ :: add oauth login");
+        assert_eq!(m.nodes[0].lines[0], "◻ #1 ⚙ :: add oauth login");
     }
 
     #[test]
@@ -711,8 +711,8 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         let l7 = &m.nodes[0].lines[0];
         let l12 = &m.nodes[1].lines[0];
-        assert_eq!(l7, "░ #7  ⚙ :: add oauth login");
-        assert_eq!(l12, "░ #12 🔔 :: add oauth login");
+        assert_eq!(l7, "◻ #7  ⚙ :: add oauth login");
+        assert_eq!(l12, "◻ #12 🔔 :: add oauth login");
         // The emoji begins at the same char column on both rows.
         assert_eq!(
             l7.chars().position(|c| c == '⚙'),
@@ -730,7 +730,7 @@ mod tests {
         let revs = vec![rev("abcd1234", &["p"], false, false, "")];
         let m = build(&revs, &[], &[]);
         assert_eq!(m.nodes[0].glyph, '○');
-        assert_eq!(m.nodes[0].lines, vec!["█ (no description set)"]);
+        assert_eq!(m.nodes[0].lines, vec!["◼ (no description set)"]);
         assert!(
             !m.nodes[0].lines[0].contains("abcd"),
             "the label must not echo the change id"
@@ -740,21 +740,21 @@ mod tests {
     #[test]
     fn visible_nodes_carry_an_empty_fill_indicator() {
         // Every visible node leads its label with a fill glyph, right after the id column:
-        // █ when the change has content, ░ when it is empty. Collapsed graph-noise nodes
+        // ◼ when the change has content, ◻ when it is empty. Collapsed graph-noise nodes
         // never render, so they get none.
         let revs = vec![
-            rev("full", &["e"], false, false, "did work"), // non-empty ordinary → █
-            rev("e", &["m"], false, true, "empty wip"),    // empty, described (no collapse) → ░
-            rev("m", &["a", "b"], false, true, ""),        // empty merge (2 parents, no collapse) → ░
+            rev("full", &["e"], false, false, "did work"), // non-empty ordinary → ◼
+            rev("e", &["m"], false, true, "empty wip"),    // empty, described (no collapse) → ◻
+            rev("m", &["a", "b"], false, true, ""),        // empty merge (2 parents, no collapse) → ◻
             rev("a", &[], false, false, "a"),
             rev("b", &[], false, false, "b"),
         ];
         let m = build(&revs, &[], &[]);
-        assert_eq!(m.nodes[0].lines[0], "█ did work", "non-empty → full block");
-        assert_eq!(m.nodes[1].lines[0], "░ empty wip", "empty → light shade");
+        assert_eq!(m.nodes[0].lines[0], "◼ did work", "non-empty → filled square");
+        assert_eq!(m.nodes[1].lines[0], "◻ empty wip", "empty → hollow square");
         assert_eq!(
-            m.nodes[2].lines[0], "░ (no description set)",
-            "empty merge → light shade, keeps its placeholder label"
+            m.nodes[2].lines[0], "◻ (no description set)",
+            "empty merge → hollow square, keeps its placeholder label"
         );
     }
 
