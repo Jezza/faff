@@ -18,7 +18,7 @@ faff does not review, rebase, or merge. Integration is yours, in your own jj.
 
 ```sh
 cargo build
-cargo test              # 89 tests; the workspace integration tests shell out to jj
+cargo test              # 115 tests; the workspace integration tests shell out to jj
 cargo clippy --all-targets
 ```
 
@@ -34,6 +34,7 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | Key | Action |
 |---|---|
 | `n` | new task |
+| `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes |
 | `↑`/`↓` or `k`/`j` | move selection |
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab |
 | `s` | swap: trade your `@` with the selected agent's revision |
@@ -60,7 +61,7 @@ revisions                                            │ ┃   from postcard to 
 ── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
 · #5 Add OAuth login ✓                               │ ┃
                                                        ┃ >
- [n]ew [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   ready ┃
+ [n]ew [N]handoff [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   ready ┃
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -88,6 +89,33 @@ titled `#<id>`.
 
 Steps 2 to 4 are best-effort; a failure there doesn't abort the task. A failed workspace
 add or pane spawn rolls the whole thing back.
+
+### Handing off (`N`)
+
+`N` (Shift + n) hands your in-progress work to an agent. Where `n` forks *beside* your work
+and leaves you on it, `N` gives the work *away*: the agent takes over your current revision
+`W` — it continues editing that exact commit — and your own `@` retreats to a fresh empty
+commit on the fork point from *before* your changes (`heads(::@- ~ empty())`, faff's `R`
+recipe). The end result:
+
+```
+● W   agent @  (your WIP — the agent continues it)
+│
+│ @   you (fresh empty)
+├─┘
+○ P   the fork point, before your changes
+```
+
+Mechanically it mirrors `swap`: it snapshots your workspace first (so nothing uncommitted is
+lost), forks the agent workspace and moves it onto `W`, then retreats your `@` *last* — so a
+failure before that leaves you untouched on your work. Like `n`, it then docks and focuses
+the new agent so you type what you want it to finish; the agent already holds your WIP in its
+tree for context. It bails if your `@` has no changes (nothing to hand off).
+
+The task's fork point is recorded as `P`, so `W` counts as the agent's own work: `x` keeps it
+as history and `X` discards the whole handed-off line (both still shielded from anything you
+later re-integrate). If you've stacked several of your own commits, `N` hands off the current
+one and retreats to its parent line.
 
 ### Swapping (`s`)
 

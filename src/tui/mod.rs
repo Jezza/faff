@@ -251,6 +251,7 @@ impl App {
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
             Action::NewTask => self.new_task(),
+            Action::Handoff => self.handoff_task(),
             Action::ToggleSession => self.toggle_session(),
             Action::Remove => self.remove_selected(false),
             Action::RemoveDiscard => self.remove_selected(true),
@@ -292,7 +293,7 @@ impl App {
     /// it beside faf so the user types their task straight into the session. The task
     /// prompt (and title) are captured later from the first UserPromptSubmit hook.
     fn new_task(&mut self) {
-        match self.try_new_task() {
+        match self.try_new_task(false) {
             Ok(id) => {
                 self.status = format!("new task #{id} — type your task in the pane");
             }
@@ -301,13 +302,30 @@ impl App {
         self.refresh();
     }
 
-    fn try_new_task(&mut self) -> Result<TaskId> {
+    /// `N` (Shift+n): hand off your current work. Like `new_task`, but the agent takes
+    /// over your current revision — it continues your exact commit — and your own `@`
+    /// retreats to the fork point from before your changes (see `workspace::handoff`).
+    /// You still type what you want the agent to finish into its pane, exactly as `n`.
+    fn handoff_task(&mut self) {
+        match self.try_new_task(true) {
+            Ok(id) => {
+                self.status = format!("handed off #{id} — type what to finish in the pane");
+            }
+            Err(e) => self.status = format!("handoff failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    /// Shared task-creation path for `n` (`handoff == false`) and `N` (`handoff == true`).
+    /// The only difference is how the workspace is forked (`prepare_workspace`); spawning,
+    /// docking, rollback, and status are identical.
+    fn try_new_task(&mut self, handoff: bool) -> Result<TaskId> {
         let faf = self
             .faf_pane
             .context("run faf inside WezTerm to spawn agents")?;
         let task = self.store.create_task("", 0, Autonomy::Inherit)?;
         // Roll the row back if workspace prep fails (no invisible zombie).
-        if let Err(e) = self.prepare_workspace(task.id, "") {
+        if let Err(e) = self.prepare_workspace(task.id, "", handoff) {
             let _ = self.store.delete_task(task.id);
             return Err(e);
         }
@@ -333,11 +351,15 @@ impl App {
         }
     }
 
-    fn prepare_workspace(&self, id: TaskId, prompt: &str) -> Result<()> {
+    fn prepare_workspace(&self, id: TaskId, prompt: &str, handoff: bool) -> Result<()> {
         let slug = config::slugify(prompt, 4);
         let name = format!("faf-task-{}", id.0);
         let path = config::task_workspace_dir(&self.repo, id.0, &slug)?;
-        let ws = workspace::create(&self.repo, &name, &path)?;
+        let ws = if handoff {
+            workspace::handoff(&self.repo, &name, &path)?
+        } else {
+            workspace::create(&self.repo, &name, &path)?
+        };
         // The workspace now exists on disk + in jj. If recording it fails, tear it
         // back down so we don't leak an untracked jj workspace (the DB row is rolled
         // back separately by the caller).
@@ -1020,7 +1042,7 @@ impl App {
             "[↵]open"
         };
         let keys = format!(
-            " [n]ew {enter} [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   {}",
+            " [n]ew [N]handoff {enter} [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   {}",
             self.status
         );
         f.render_widget(

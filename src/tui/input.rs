@@ -8,6 +8,10 @@ pub enum Action {
     Up,
     Down,
     NewTask,
+    /// `N` (Shift+n): hand off your current work — spawn an agent that takes over your
+    /// current revision (continues your exact commit) and retreat your own `@` to the
+    /// fork point from before your changes. See `workspace::handoff`.
+    Handoff,
     /// Enter: open / detach / retarget the selected task's session (toggle).
     ToggleSession,
     /// `x`: remove the task — kill its pane, tear down its workspace, drop it from faf.
@@ -38,6 +42,7 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Char('n') => Action::NewTask,
+        KeyCode::Char('N') => Action::Handoff,
         KeyCode::Enter => Action::ToggleSession,
         KeyCode::Char('x') => Action::Remove,
         KeyCode::Char('X') => Action::RemoveDiscard,
@@ -72,6 +77,7 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Down)), Action::Down);
         assert_eq!(map_key(k(KeyCode::Char('j'))), Action::Down);
         assert_eq!(map_key(k(KeyCode::Char('n'))), Action::NewTask);
+        assert_eq!(map_key(k(KeyCode::Char('N'))), Action::Handoff);
         assert_eq!(map_key(k(KeyCode::Enter)), Action::ToggleSession);
         assert_eq!(map_key(k(KeyCode::Char('x'))), Action::Remove);
         assert_eq!(map_key(k(KeyCode::Char('X'))), Action::RemoveDiscard);
