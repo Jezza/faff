@@ -286,19 +286,19 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
                 Some(t.id),
             )
         } else if let Some(t) = task {
-            // A task node — an agent, drawn as a square: a conflicted revision keeps the ×
-            // glyph, else a filled ◼ when the revision has content, a hollow ◻ when it's
+            // A task node — an agent, drawn as a circle: a conflicted revision keeps the ×
+            // glyph, else a filled ● when the revision has content, a hollow ○ when it's
             // empty. Prefer the change's own jj description when set (it's live and
             // authoritative — the agent's own `jj describe`), falling back to the
             // prompt-derived label before the change has been described. Status is the
             // emoji alone, inline before the title; the whole agent is one line, so the
-            // renderer folds it to a single `├─◼` row anchored above its fork point.
+            // renderer folds it to a single `├─●` row anchored above its fork point.
             let g = if rev.conflict {
                 '×'
             } else if rev.empty {
-                '◻'
+                '○'
             } else {
-                '◼'
+                '●'
             };
             let label = if rev.description.is_empty() {
                 t.label()
@@ -330,19 +330,19 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             };
             ('×', vec![d], false, None)
         } else if ws.is_some() {
-            // Some other workspace's @ (not a faff task) — non-agent, so a hollow ○.
+            // Some other workspace's @ (not a faff task) — non-agent, so a hollow ◻.
             let d = if rev.description.is_empty() {
                 "(working copy)".to_string()
             } else {
                 rev.description.clone()
             };
-            ('○', vec![d], false, None)
+            ('◻', vec![d], false, None)
         } else if rev.empty && rev.description.is_empty() && rev.parents.len() < 2 {
             // Empty, description-less, single-parent fork-point / noise: collapse out of
             // the graph. Never collapse a merge (2+ parents) — that would drop a parent.
-            ('○', vec![String::new()], true, None)
+            ('◻', vec![String::new()], true, None)
         } else {
-            // An ordinary (non-agent) commit — your own history — gets a hollow ○; a
+            // An ordinary (non-agent) commit — your own history — gets a hollow ◻; a
             // faff agent's revision is a filled ● (see the task branch above). No
             // description falls back to jj's "(no description set)" (as the `@` nodes do),
             // never the change id — that's already drawn in the "[abcdefgh]" id column.
@@ -351,7 +351,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             } else {
                 rev.description.clone()
             };
-            ('○', vec![d], false, None)
+            ('◻', vec![d], false, None)
         };
 
         // Mark the current fork point — where new agents branch from — with a diamond. The
@@ -391,8 +391,8 @@ mod tests {
         // Closer to the reported screenshot: TWO agents (#21, #15) both floating high in
         // jj's recency order while their shared fork base `fb` sits low, plus a full-height
         // side branch (sb1..sb3) whose base runs off the loaded window (parent `sbX` absent
-        // from the set). Both agents must anchor above `fb` as `├─●`, newest id first, while
-        // the side branch stays its own lane and simply dangles at the window edge.
+        // from the set). Both agents must anchor above `fb` as `├─○` (empty agents), newest
+        // id first, while the side branch stays its own lane and simply dangles at the edge.
         let mut revs = vec![
             rev("head", &["t1"], true, true, ""),
             rev("a21", &["fb"], false, true, ""), // #21, floats (recency order)
@@ -432,8 +432,8 @@ mod tests {
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
         assert_eq!(
             gutters,
-            vec!["@", "◆", "│ ○", "│ ○", "│ ○", "○", "○", "├─◻", "├─◻", "○", "○"],
-            "each agent folds to one ├─◻ above fb; the side branch keeps its own lane"
+            vec!["@", "◆", "│ ◻", "│ ◻", "│ ◻", "◻", "◻", "├─○", "├─○", "◻", "◻"],
+            "each agent folds to one ├─○ above fb; the side branch keeps its own lane"
         );
     }
 
@@ -448,9 +448,9 @@ mod tests {
         // reorder to the conservative pin, so a21 kept its jj position (index 1) and floated
         // far above tC, holding a lane down to a deferred `╯` merge at the bottom.
         //
-        // Now a21 is lifted to sit directly above tC and folds to one `├─◻` row (empty
-        // agent → hollow square), while the side branch keeps its own intact lane (`│ ○` …
-        // `├─○` folding back at tB).
+        // Now a21 is lifted to sit directly above tC and folds to one `├─○` row (empty
+        // agent → hollow circle), while the side branch keeps its own intact lane (`│ ◻` …
+        // `├─◻` folding back at tB).
         let mut revs = vec![
             rev("head", &["tA"], true, true, ""),
             rev("a21", &["tC"], false, true, ""), // agent, forks off tC (low)
@@ -478,8 +478,8 @@ mod tests {
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
         assert_eq!(
             gutters,
-            vec!["@", "◆", "│ ○", "│ ○", "├─○", "○", "├─◻", "○"],
-            "a21 folds to a single ├─◻ row directly above tC — not a lane held to a bottom merge"
+            vec!["@", "◆", "│ ◻", "│ ◻", "├─◻", "◻", "├─○", "◻"],
+            "a21 folds to a single ├─○ row directly above tC — not a lane held to a bottom merge"
         );
     }
 
@@ -545,10 +545,10 @@ mod tests {
         assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert_eq!(m.task_of[0], None);
 
-        // task node: one line `#id emoji :: title`; the agent is a square, empty here (a
-        // description but no content) → hollow ◻, mapped to task 7. The title is the
+        // task node: one line `#id emoji :: title`; the agent is a circle, empty here (a
+        // description but no content) → hollow ○, mapped to task 7. The title is the
         // change's jj description, not the prompt.
-        assert_eq!(m.nodes[1].glyph, '◻');
+        assert_eq!(m.nodes[1].glyph, '○');
         assert_eq!(m.nodes[1].lines, vec!["#7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
 
@@ -720,8 +720,8 @@ mod tests {
     #[test]
     fn end_to_end_flat_fork_anchored_lanes() {
         // Three agents forked from three different trunk revisions (#15 off pk, #7 off ur,
-        // #9 off tp). Ordered → built → rendered, each must fold to a single `├─◻` row
-        // (empty agents → hollow square) sitting directly above its fork base, the trunk a
+        // #9 off tp). Ordered → built → rendered, each must fold to a single `├─○` row
+        // (empty agents → hollow circle) sitting directly above its fork base, the trunk a
         // clean vertical column.
         let mut revs = vec![
             rev("ymuz", &["pk"], true, true, ""), // @
@@ -759,8 +759,8 @@ mod tests {
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
         assert_eq!(
             gutters,
-            vec!["@", "├─◻", "◆", "├─◻", "○", "├─◻", "○", "○"],
-            "trunk stays one clean column; each agent folds to a single ├─◻ row above its \
+            vec!["@", "├─○", "◆", "├─○", "◻", "├─○", "◻", "◻"],
+            "trunk stays one clean column; each agent folds to a single ├─○ row above its \
              base, and the current fork point (pk, newest non-empty ancestor of @) is a ◆"
         );
         // Agent rows are `#id emoji :: title`. Ids pad to the widest (#15) so the emojis
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn task_node_uses_filled_glyph_and_status_label() {
-        // A non-empty agent revision → the filled square ◼.
+        // A non-empty agent revision → the filled circle ●.
         let revs = vec![rev("t1", &["p"], false, false, "did the work")];
         let workspaces = vec![Workspace {
             name: "faf-task-1".into(),
@@ -783,7 +783,7 @@ mod tests {
         }];
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
-        assert_eq!(m.nodes[0].glyph, '◼');
+        assert_eq!(m.nodes[0].glyph, '●');
         // One line, status as the bare emoji before the `::` title separator.
         assert_eq!(m.nodes[0].lines.len(), 1);
         assert!(m.nodes[0].lines[0].contains("⚙"));
@@ -849,7 +849,7 @@ mod tests {
         // doesn't collapse; two-char id keeps the old-fallback substring easy to spot.
         let revs = vec![rev("abcd1234", &["p"], false, false, "")];
         let m = build(&revs, &[], &[]);
-        assert_eq!(m.nodes[0].glyph, '○');
+        assert_eq!(m.nodes[0].glyph, '◻');
         assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert!(
             !m.nodes[0].lines[0].contains("abcd"),
@@ -937,11 +937,11 @@ mod tests {
 
     #[test]
     fn ordinary_agent_node_keeps_the_task_on_its_own_row() {
-        // A normal agent branch (glyph ◼) forked from the same point as HEAD keeps its
+        // A normal agent branch (glyph ●) forked from the same point as HEAD keeps its
         // task on its own commit row — untouched by the combined-node special case.
         let nodes = vec![
             gnode("h", &["fp"], '@', &["(no description set)"]),
-            gnode("a", &["fp"], '◼', &["#7 ⚙ :: add-auth"]),
+            gnode("a", &["fp"], '●', &["#7 ⚙ :: add-auth"]),
             gnode("fp", &[], '◆', &["base"]),
         ];
         let node_task = vec![None, Some(TaskId(7)), None];
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn build_marks_the_fork_point_node_with_a_diamond() {
         // Empty @ above a non-empty ordinary commit: that commit is the fork point, so its
-        // glyph becomes ◆ (instead of the plain ○) and the model reports it.
+        // glyph becomes ◆ (instead of the plain ◻) and the model reports it.
         let revs = vec![
             rev("wc", &["base"], true, true, ""),
             rev("base", &[], false, false, "base"),

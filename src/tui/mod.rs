@@ -822,7 +822,7 @@ impl App {
         let revset = format!("ancestors({}, 25)", heads.join(" | "));
         let mut revs = jj::log(&self.repo, &revset)?;
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
-        // the trunk revision it forked from, so each folds to a one-row `├─◼` stub.
+        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
         model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
@@ -900,7 +900,7 @@ impl App {
         let id_col = ID_W + 3;
         // Pad every gutter to one uniform width so the [id] column and description line up
         // into straight columns regardless of branch depth — a folded
-        // agent stub `├─◼` is wider than a trunk glyph `○`, and without this the whole
+        // agent stub `├─●` is wider than a trunk glyph `◻`, and without this the whole
         // right-hand block shifts sideways by the difference. The 2-space separator that
         // was previously appended per-row is folded into this width. (Gutter cells are all
         // single-column box-drawing chars, so char count is the display width.)
@@ -1395,26 +1395,26 @@ mod tests {
         // Rows of differing gutter widths must line their `[id]` column into one straight
         // vertical column: the gutter is padded to a uniform width so branch depth never
         // pushes the block sideways. Three rows of increasing gutter width:
-        //   • trunk         `○`
-        //   • folded fork   `├─○`
-        //   • agent stub    `├─◼`
+        //   • trunk         `◻`
+        //   • folded fork   `├─◻`
+        //   • agent stub    `├─●`
         // Every `[id]` must start at the same x regardless.
         let mut app = test_app();
         app.rows = vec![
             graph::GraphRow {
-                gutter: "○".into(),
+                gutter: "◻".into(),
                 content: "trunk work".into(),
                 node_index: Some(0),
                 change_id: Some("aaaaaaaa".into()),
             },
             graph::GraphRow {
-                gutter: "├─○".into(),
+                gutter: "├─◻".into(),
                 content: "side work".into(),
                 node_index: Some(1),
                 change_id: Some("bbbbbbbb".into()),
             },
             graph::GraphRow {
-                gutter: "├─◼".into(),
+                gutter: "├─●".into(),
                 content: "#11 ⚙ :: agent work".into(),
                 node_index: Some(2),
                 change_id: Some("cccccccc".into()),
