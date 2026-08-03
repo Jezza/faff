@@ -94,7 +94,7 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
 /// │
 /// │ @   you (fresh empty)
 /// ├─┘
-/// ○ P   fork point, before your changes
+/// ◆ P   fork point, before your changes
 /// ```
 ///
 /// Mechanics mirror [`swap`]'s snapshot-then-edits, ordered so **your workspace moves

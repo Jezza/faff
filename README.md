@@ -56,8 +56,8 @@ revisions                                            │ ┃   from postcard to 
 @  [wvrsmsyk] (no description set)                   │ ┃
 ├─●  [kmkxwzqr] #7 ⚙ :: Convert bridges to JSON  ▶   │ ┃ ● Read src/bridge/http.rs
 ├─●  [rzqlvksp] #8 🔔 :: Fix flaky store tests       │ ┃ ● Edit src/bridge/http.rs
-○  [yuvnmxxo] initial code commit                    │ ┃ ● Bash cargo test -p bridge
-○  [ntlpqxos] import                                 │ ┃
+◻  [yuvnmxxo] initial code commit                    │ ┃ ● Bash cargo test -p bridge
+◻  [ntlpqxos] import                                 │ ┃
 ── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
 · #5 Add OAuth login ✓                               │ ┃
                                                        ┃ >
@@ -103,7 +103,7 @@ recipe). The end result:
 │
 │ @   you (fresh empty)
 ├─┘
-○ P   the fork point, before your changes
+◆ P   the fork point, before your changes
 ```
 
 Mechanically it mirrors `swap`: it snapshots your workspace first (so nothing uncommitted is
@@ -187,10 +187,11 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 
 - `@` your working copy — drawn green (like jj log), labelled with its description
   (or `(no description set)`)
-- `●` a faff agent's revision, shown on one row as `#<id> <status> :: <title>` — the
-  title is the change's jj description (falling back to the first line of the prompt until
-  it's described), and `<status>` is the emoji `⚙` working / `🔔` needs you / `✓` review-ready
-- `○` ordinary history, or another workspace's working copy
+- `●` a faff agent's revision (hollow `○` when the revision is still empty), shown on one
+  row as `#<id> <status> :: <title>` — the title is the change's jj description (falling back
+  to the first line of the prompt until it's described), and `<status>` is the emoji
+  `⚙` working / `🔔` needs you / `✓` review-ready
+- `◻` ordinary history, or another workspace's working copy
 - `◆` the current fork point — drawn cyan — the revision new agents branch from
   (`heads(::@ ~ empty())`); when it coincides with your working copy the `@` itself turns cyan
 - `×` a conflict
