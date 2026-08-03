@@ -265,7 +265,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             .filter(|w| w.change_id == rev.change_id)
             .find_map(|w| tasks.iter().find(|t| t.ws_name.as_deref() == Some(&w.name)));
 
-        let (glyph, mut lines, collapse, tid) = if let (Some(t), true) = (task, rev.is_current_wc) {
+        let (glyph, lines, collapse, tid) = if let (Some(t), true) = (task, rev.is_current_wc) {
             // HEAD is parked on this agent's revision (you `jj edit`ed it). Keep HEAD's
             // own line — the revision's description — on the node and hang the agent
             // beneath it as one indented line, in the same `#id emoji :: title` form the
@@ -363,17 +363,6 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         } else {
             glyph
         };
-
-        // Lead the label with a fill glyph — right after the id column — marking whether
-        // the change has content: ◼ non-empty, ◻ empty. Skip it when the node's own gutter
-        // glyph is already that square (an agent, whose ◼/◻ carries the same signal), so
-        // the marker isn't drawn twice; every other visible node carries one — its gutter
-        // glyph (○/◆/@/×) says nothing about content. Collapsed graph-noise nodes are
-        // spliced out before render, so they get none.
-        let fill = if rev.empty { '◻' } else { '◼' };
-        if !collapse && glyph != fill && let Some(first) = lines.first_mut() {
-            *first = format!("{fill} {first}");
-        }
 
         nodes.push(GraphNode {
             change_id: rev.change_id.clone(),
@@ -551,16 +540,14 @@ mod tests {
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes.len(), 4);
 
-        // HEAD @ — empty and no description, so the fill is ◻ and the label is jj's
-        // placeholder.
+        // HEAD @ — empty and no description, so the label is jj's placeholder.
         assert_eq!(m.nodes[0].glyph, '@');
-        assert_eq!(m.nodes[0].lines, vec!["◻ (no description set)"]);
+        assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert_eq!(m.task_of[0], None);
 
         // task node: one line `#id emoji :: title`; the agent is a square, empty here (a
-        // description but no content) → hollow ◻, mapped to task 7. Its gutter square is
-        // the content marker, so the label carries no redundant leading fill glyph. The
-        // title is the change's jj description, not the prompt.
+        // description but no content) → hollow ◻, mapped to task 7. The title is the
+        // change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '◻');
         assert_eq!(m.nodes[1].lines, vec!["#7 ⚙ :: Add OAuth flow"]);
         assert_eq!(m.task_of[1], Some(TaskId(7)));
@@ -570,10 +557,10 @@ mod tests {
         assert_eq!(m.task_of[2], None);
 
         // base commit: the newest non-empty ancestor of @, so it's the current fork point
-        // (where new agents branch from) → diamond ◆, non-empty (◼), shows its description.
+        // (where new agents branch from) → diamond ◆, non-empty, shows its description.
         assert_eq!(m.fork_point, Some("p".to_string()));
         assert_eq!(m.nodes[3].glyph, '◆');
-        assert_eq!(m.nodes[3].lines, vec!["◼ base"]);
+        assert_eq!(m.nodes[3].lines, vec!["base"]);
         assert!(!m.nodes[3].collapse);
     }
 
@@ -602,7 +589,7 @@ mod tests {
         assert_eq!(m.nodes[0].glyph, '@');
         // HEAD keeps its own line — the shared revision's description; the agent hangs
         // beneath as one indented `↳ #id emoji :: title` sub-line.
-        assert_eq!(m.nodes[0].lines[0], "◼ agent: did work");
+        assert_eq!(m.nodes[0].lines[0], "agent: did work");
         assert!(m.nodes[0].lines[1].starts_with("↳ #1 ⚙ :: "));
         assert_eq!(m.nodes[0].lines.len(), 2);
         // Mapped to the task → the refresh's detached list won't claim it.
@@ -776,15 +763,14 @@ mod tests {
             "trunk stays one clean column; each agent folds to a single ├─◻ row above its \
              base, and the current fork point (pk, newest non-empty ancestor of @) is a ◆"
         );
-        // Agent rows carry no leading fill glyph (their gutter square is the marker); the
-        // content is `#id emoji :: title`. Ids pad to the widest (#15) so the emojis align:
-        // #7/#9 gain a trailing space.
+        // Agent rows are `#id emoji :: title`. Ids pad to the widest (#15) so the emojis
+        // align: #7/#9 gain a trailing space.
         assert!(rows[1].content.starts_with("#15 ⚙ :: "));
         assert!(rows[3].content.starts_with("#7  🔔 :: "));
         assert!(rows[5].content.starts_with("#9  ✓ :: "));
-        // Trunk rows are the user's own revisions, non-empty (◼), shown by description.
-        assert_eq!(rows[2].content, "◼ spawn: declare! child-class refs");
-        assert_eq!(rows[4].content, "◼ Generate bridge clients from JSON Schema");
+        // Trunk rows are the user's own revisions, shown by description.
+        assert_eq!(rows[2].content, "spawn: declare! child-class refs");
+        assert_eq!(rows[4].content, "Generate bridge clients from JSON Schema");
     }
 
     #[test]
@@ -864,74 +850,10 @@ mod tests {
         let revs = vec![rev("abcd1234", &["p"], false, false, "")];
         let m = build(&revs, &[], &[]);
         assert_eq!(m.nodes[0].glyph, '○');
-        assert_eq!(m.nodes[0].lines, vec!["◼ (no description set)"]);
+        assert_eq!(m.nodes[0].lines, vec!["(no description set)"]);
         assert!(
             !m.nodes[0].lines[0].contains("abcd"),
             "the label must not echo the change id"
-        );
-    }
-
-    #[test]
-    fn visible_nodes_carry_an_empty_fill_indicator() {
-        // Every visible non-agent node leads its label with a fill glyph, right after the
-        // id column: ◼ when the change has content, ◻ when it is empty. (Agents are the
-        // exception — their gutter square already carries the signal, see
-        // `agent_rows_omit_the_redundant_leading_fill_glyph`.) Collapsed graph-noise nodes
-        // never render, so they get none.
-        let revs = vec![
-            rev("full", &["e"], false, false, "did work"), // non-empty ordinary → ◼
-            rev("e", &["m"], false, true, "empty wip"),    // empty, described (no collapse) → ◻
-            rev("m", &["a", "b"], false, true, ""),        // empty merge (2 parents, no collapse) → ◻
-            rev("a", &[], false, false, "a"),
-            rev("b", &[], false, false, "b"),
-        ];
-        let m = build(&revs, &[], &[]);
-        assert_eq!(m.nodes[0].lines[0], "◼ did work", "non-empty → filled square");
-        assert_eq!(m.nodes[1].lines[0], "◻ empty wip", "empty → hollow square");
-        assert_eq!(
-            m.nodes[2].lines[0], "◻ (no description set)",
-            "empty merge → hollow square, keeps its placeholder label"
-        );
-    }
-
-    #[test]
-    fn agent_rows_omit_the_redundant_leading_fill_glyph() {
-        // An agent's gutter glyph is itself the fill square (◼ non-empty, ◻ empty), so the
-        // label must NOT repeat it as a leading marker — unlike every non-agent node. A
-        // conflicted agent is the exception within the exception: its gutter is ×, which
-        // says nothing about content, so it keeps the leading fill glyph.
-        let revs = vec![
-            rev("full", &["p"], false, false, "did work"), // non-empty agent → gutter ◼
-            rev("bare", &["p"], false, true, ""),          // empty agent → gutter ◻
-            RevInfo {
-                conflict: true,
-                ..rev("cf", &["p"], false, false, "clashed")
-            }, // conflicted agent → gutter ×
-            rev("p", &[], false, false, "base"),
-        ];
-        let workspaces = vec![
-            Workspace { name: "faf-task-1".into(), change_id: "full".into() },
-            Workspace { name: "faf-task-2".into(), change_id: "bare".into() },
-            Workspace { name: "faf-task-3".into(), change_id: "cf".into() },
-        ];
-        let tasks = vec![
-            task(1, "faf-task-1", TaskStatus::Working),
-            task(2, "faf-task-2", TaskStatus::Working),
-            task(3, "faf-task-3", TaskStatus::Working),
-        ];
-        let m = build(&revs, &workspaces, &tasks);
-
-        assert_eq!(m.nodes[0].glyph, '◼');
-        assert_eq!(m.nodes[0].lines[0], "#1 ⚙ :: did work", "filled agent: no leading ◼");
-        assert_eq!(m.nodes[1].glyph, '◻');
-        assert_eq!(m.nodes[1].lines[0], "#2 ⚙ :: add oauth login", "empty agent: no leading ◻");
-        // Conflicted agent keeps ×, and its × gutter doesn't encode content, so the leading
-        // fill glyph stays (◼ here — the revision is non-empty).
-        assert_eq!(m.nodes[2].glyph, '×');
-        assert!(
-            m.nodes[2].lines[0].starts_with("◼ "),
-            "conflicted agent keeps the leading fill glyph: {:?}",
-            m.nodes[2].lines[0]
         );
     }
 

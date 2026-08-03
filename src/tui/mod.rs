@@ -898,8 +898,8 @@ impl App {
         let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len());
         // Width of the "[abcdefgh] " id column, so continuation lines align under content.
         let id_col = ID_W + 3;
-        // Pad every gutter to one uniform width so the [id] column, block indicator, and
-        // description line up into straight columns regardless of branch depth — a folded
+        // Pad every gutter to one uniform width so the [id] column and description line up
+        // into straight columns regardless of branch depth — a folded
         // agent stub `├─◼` is wider than a trunk glyph `○`, and without this the whole
         // right-hand block shifts sideways by the difference. The 2-space separator that
         // was previously appended per-row is folded into this width. (Gutter cells are all
@@ -1325,13 +1325,13 @@ mod tests {
         app.rows = vec![
             graph::GraphRow {
                 gutter: "@".into(),
-                content: "◻ (no description set)".into(),
+                content: "(no description set)".into(),
                 node_index: Some(0),
                 change_id: Some("wcwcwcwc".into()),
             },
             graph::GraphRow {
                 gutter: "◆".into(),
-                content: "◼ base".into(),
+                content: "base".into(),
                 node_index: Some(1),
                 change_id: Some("basebase".into()),
             },
@@ -1367,7 +1367,7 @@ mod tests {
         let mut app = test_app();
         app.rows = vec![graph::GraphRow {
             gutter: "@".into(),
-            content: "◼ my work".into(),
+            content: "my work".into(),
             node_index: Some(0),
             change_id: Some("wcwcwcwc".into()),
         }];
@@ -1391,27 +1391,25 @@ mod tests {
     }
 
     #[test]
-    fn graph_aligns_id_and_indicator_columns_across_gutter_widths() {
-        // Rows of differing gutter widths must line their `[id]` column, fill indicator,
-        // and description into one straight vertical column: the gutter is padded to a
-        // uniform width so branch depth never pushes the block sideways. Three rows:
-        //   • trunk         `○`   — non-agent, leads its content with the ◼ indicator
-        //   • folded fork   `├─○` — non-agent, wider gutter, leads with ◻
-        //   • agent stub    `├─◼` — an agent; its gutter square IS the marker, so its
-        //                           content carries no leading indicator
-        // Every `[id]` must align; the two non-agent indicators must align; the agent row
-        // must contribute no content indicator (only two indicators render, not three).
+    fn graph_aligns_id_column_across_gutter_widths() {
+        // Rows of differing gutter widths must line their `[id]` column into one straight
+        // vertical column: the gutter is padded to a uniform width so branch depth never
+        // pushes the block sideways. Three rows of increasing gutter width:
+        //   • trunk         `○`
+        //   • folded fork   `├─○`
+        //   • agent stub    `├─◼`
+        // Every `[id]` must start at the same x regardless.
         let mut app = test_app();
         app.rows = vec![
             graph::GraphRow {
                 gutter: "○".into(),
-                content: "◼ trunk work".into(),
+                content: "trunk work".into(),
                 node_index: Some(0),
                 change_id: Some("aaaaaaaa".into()),
             },
             graph::GraphRow {
                 gutter: "├─○".into(),
-                content: "◻ side work".into(),
+                content: "side work".into(),
                 node_index: Some(1),
                 change_id: Some("bbbbbbbb".into()),
             },
@@ -1435,13 +1433,9 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
 
         let buf = term.backend().buffer();
-        let is_square = |s: &str| s == "◼" || s == "◻";
         // For each rendered graph row — the ones carrying the `[abcdefgh]` id column, a
-        // `[`…`]` pair spanning the 8-char id — record the x of its `[` and, if present,
-        // the x of its fill indicator (the first square after `]`). An agent row's only
-        // square lives in the gutter, before the `[`, so it contributes no indicator.
+        // `[`…`]` pair spanning the 8-char id — record the x of its `[`.
         let mut bracket_xs = vec![];
-        let mut indicator_xs = vec![];
         for y in 0..(buf.content.len() / width) {
             let row = &buf.content[y * width..(y + 1) * width];
             let (Some(open), Some(close)) = (
@@ -1454,23 +1448,11 @@ mod tests {
                 continue; // not the id column (footer/header hint brackets)
             }
             bracket_xs.push(open);
-            if let Some(rel) = row[close..].iter().position(|c| is_square(c.symbol())) {
-                indicator_xs.push(close + rel);
-            }
         }
         assert_eq!(bracket_xs.len(), 3, "three graph rows carry an id column: {bracket_xs:?}");
         assert!(
             bracket_xs.iter().all(|x| *x == bracket_xs[0]),
             "id columns aligned: {bracket_xs:?}"
-        );
-        assert_eq!(
-            indicator_xs.len(),
-            2,
-            "only the two non-agent rows carry a content indicator: {indicator_xs:?}"
-        );
-        assert_eq!(
-            indicator_xs[0], indicator_xs[1],
-            "fill indicators aligned: {indicator_xs:?}"
         );
     }
 
