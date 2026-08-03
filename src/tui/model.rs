@@ -41,17 +41,25 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
 }
 
 /// Order revisions for the flat lane layout: the trunk — HEAD's first-parent chain — stays
-/// in child→parent order, and every other revision is lifted to sit directly above the
+/// in child→parent order, and every *liftable* fork is moved to sit directly above the
 /// trunk revision it forked from. Each agent then renders as a one-row `├─●` stub anchored
 /// to its fork point, and no lane is ever held open across an unrelated node.
+///
+/// A **liftable** fork is a single-commit tip whose first parent is a trunk node — i.e. a
+/// faff agent. Those get lifted. A multi-commit side branch (its interior nodes fork off
+/// each other, not the trunk) is left in its jj position and renders as its own lane; it no
+/// longer disables the agents' anchoring. An earlier all-or-nothing rule bailed the *whole*
+/// reorder to the conservative pin the moment any revision forked off a non-trunk node,
+/// which stranded genuine agents high above their fork points whenever a side branch was in
+/// the window (the "item super high up compared to the fork point" bug).
 ///
 /// Agents sharing a fork point are ordered by task id, newest (highest) first — a stable
 /// order that doesn't shuffle as agents become active, unlike jj log's recency order.
 /// `workspaces`/`tasks` supply the change_id→task-id mapping this needs.
 ///
-/// Falls back to [`pin_current_wc_first`] when there is no working copy in the set, or when
-/// some revision forks off a non-trunk node — shapes this flat anchoring isn't meant for,
-/// where the conservative "HEAD's line first, rest untouched" pin stays correct.
+/// Degrades cleanly: with nothing liftable this is exactly [`pin_current_wc_first`]; with
+/// every non-trunk rev a liftable fork it is the fully flat fork-anchored layout. Returns
+/// the input untouched when there is no working copy in the set.
 pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks: &[Task]) {
     let Some(head_id) = revs
         .iter()
@@ -61,42 +69,50 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
         return;
     };
 
+    // Base arrangement: HEAD's line pinned to the front, everything else left in jj order.
+    // We lift the liftable forks out of *this* order below, so with nothing liftable the
+    // result is exactly the pin.
+    pin_current_wc_first(revs);
+
     // Trunk (lane 0): HEAD, then its first parent, then that node's first parent, … while
     // each is present in the set.
     let by_id: std::collections::HashMap<&str, &RevInfo> =
         revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
-    let mut trunk: Vec<String> = Vec::new();
     let mut on_trunk: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cur = Some(head_id);
+    let mut cur = Some(head_id.clone());
     while let Some(id) = cur {
         if !on_trunk.insert(id.clone()) {
             break; // cycle guard — never on a DAG
         }
         let Some(r) = by_id.get(id.as_str()) else { break };
         cur = r.parents.first().cloned();
-        trunk.push(id);
     }
-
-    // Every non-trunk revision must fork off a trunk node (its first parent). If any forks
-    // off something else, this isn't the flat shape — leave it to the conservative pin.
-    let clean = revs.iter().all(|r| {
-        on_trunk.contains(&r.change_id) || r.parents.first().is_some_and(|p| on_trunk.contains(p))
-    });
     drop(by_id);
-    if !clean {
-        pin_current_wc_first(revs);
-        return;
-    }
 
-    // Bucket the non-trunk revisions under their fork-base trunk node.
+    // Change ids that are some revision's FIRST parent — i.e. have a child riding their
+    // lane. A liftable fork must be a tip (nothing rides its lane), so moving it to sit
+    // above its fork point never strands a descendant above an emptied lane.
+    let has_child: std::collections::HashSet<&str> = revs
+        .iter()
+        .filter_map(|r| r.parents.first().map(String::as_str))
+        .collect();
+
+    // Liftable: a single-commit fork straight off a trunk node, and a tip. These are the
+    // faff agents. A side-branch base (has a child) or interior (first parent off-trunk) is
+    // NOT liftable — it keeps its jj position so a multi-commit side branch stays an intact
+    // lane rather than blocking the agents from anchoring.
+    let liftable = |r: &RevInfo| -> bool {
+        !on_trunk.contains(&r.change_id)
+            && !has_child.contains(r.change_id.as_str())
+            && r.parents.first().is_some_and(|p| on_trunk.contains(p))
+    };
+
+    // Bucket the liftable forks under their fork-base trunk node.
     let mut children: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
-    let mut trunk_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, r) in revs.iter().enumerate() {
-        if on_trunk.contains(&r.change_id) {
-            trunk_pos.insert(r.change_id.clone(), i);
-        } else {
-            let base = r.parents.first().cloned().unwrap(); // clean ⇒ Some, and in trunk
+        if liftable(r) {
+            let base = r.parents.first().cloned().unwrap(); // liftable ⇒ Some, and in trunk
             children.entry(base).or_default().push(i);
         }
     }
@@ -120,13 +136,20 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
         });
     }
 
-    // Emit each trunk node top→bottom, with its forked children lifted just above it.
+    // Walk the pinned order, dropping the lifted forks and re-inserting each bucket just
+    // above its fork-base trunk node (bucket keys are always trunk nodes, present here, so
+    // nothing is dropped). Trunk stays in child→parent order — it is a linear first-parent
+    // chain, so any topological order (jj's, which the pin preserves) already lists it so.
+    let lifted: std::collections::HashSet<usize> = children.values().flatten().copied().collect();
     let mut order: Vec<usize> = Vec::with_capacity(revs.len());
-    for t in &trunk {
-        if let Some(kids) = children.get(t) {
+    for (i, r) in revs.iter().enumerate() {
+        if lifted.contains(&i) {
+            continue;
+        }
+        if let Some(kids) = children.get(&r.change_id) {
             order.extend(kids.iter().copied());
         }
-        order.push(trunk_pos[t]);
+        order.push(i);
     }
 
     let reordered: Vec<RevInfo> = order.iter().map(|&i| revs[i].clone()).collect();
@@ -363,6 +386,102 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
 mod tests {
     use super::*;
     use crate::domain::Autonomy;
+
+    #[test]
+    fn two_agents_anchor_above_shared_fork_point_with_a_side_branch_off_window() {
+        // Closer to the reported screenshot: TWO agents (#21, #15) both floating high in
+        // jj's recency order while their shared fork base `fb` sits low, plus a full-height
+        // side branch (sb1..sb3) whose base runs off the loaded window (parent `sbX` absent
+        // from the set). Both agents must anchor above `fb` as `├─●`, newest id first, while
+        // the side branch stays its own lane and simply dangles at the window edge.
+        let mut revs = vec![
+            rev("head", &["t1"], true, true, ""),
+            rev("a21", &["fb"], false, true, ""), // #21, floats (recency order)
+            rev("a15", &["fb"], false, true, ""), // #15, floats
+            rev("t1", &["t2"], false, false, "t1"),
+            rev("sb1", &["sb2"], false, false, "sb1"), // side branch, off-trunk
+            rev("sb2", &["sb3"], false, false, "sb2"),
+            rev("sb3", &["sbX"], false, false, "sb3"), // base dangles off-window
+            rev("t2", &["t3"], false, false, "t2"),
+            rev("t3", &["fb"], false, false, "t3"),
+            rev("fb", &["root"], false, false, "fb"),
+            rev("root", &[], false, false, "root"),
+        ];
+        let workspaces = vec![
+            Workspace {
+                name: "faf-task-21".into(),
+                change_id: "a21".into(),
+            },
+            Workspace {
+                name: "faf-task-15".into(),
+                change_id: "a15".into(),
+            },
+        ];
+        let tasks = vec![
+            task(21, "faf-task-21", TaskStatus::Idle),
+            task(15, "faf-task-15", TaskStatus::Working),
+        ];
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["head", "t1", "sb1", "sb2", "sb3", "t2", "t3", "a21", "a15", "fb", "root"],
+            "both agents drop to just above their shared fork base fb (newest id first)"
+        );
+        let m = build(&revs, &workspaces, &tasks);
+        let rows = crate::graph::render(&m.nodes);
+        let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
+        assert_eq!(
+            gutters,
+            vec!["@", "◆", "│ ○", "│ ○", "│ ○", "○", "○", "├─●", "├─●", "○", "○"],
+            "each agent folds to one ├─● above fb; the side branch keeps its own lane"
+        );
+    }
+
+    #[test]
+    fn agent_anchors_above_fork_point_despite_a_multi_commit_side_branch() {
+        // Regression: an agent stranded "super high up compared to the fork point".
+        //
+        // Trunk: head -> tA -> tB -> tC. Agent a21 forks off the LOW trunk node tC. A
+        // multi-commit side branch s1 -> s2 -> s3 sits off-trunk — its interiors (s1, s2)
+        // fork off each other, only its base s3 anchors to the trunk (tB). That off-trunk
+        // chain used to flip an all-or-nothing "clean" check to false, bailing the whole
+        // reorder to the conservative pin, so a21 kept its jj position (index 1) and floated
+        // far above tC, holding a lane down to a deferred `╯` merge at the bottom.
+        //
+        // Now a21 is lifted to sit directly above tC and folds to one `├─●` row, while the
+        // side branch keeps its own intact lane (`│ ○` … `├─○` folding back at tB).
+        let mut revs = vec![
+            rev("head", &["tA"], true, true, ""),
+            rev("a21", &["tC"], false, true, ""), // agent, forks off tC (low)
+            rev("tA", &["tB"], false, false, "tA"),
+            rev("s1", &["s2"], false, false, "s1"), // side head (off-trunk)
+            rev("s2", &["s3"], false, false, "s2"),
+            rev("s3", &["tB"], false, false, "s3"), // side base, off trunk tB
+            rev("tB", &["tC"], false, false, "tB"),
+            rev("tC", &[], false, false, "tC"),
+        ];
+        let workspaces = vec![Workspace {
+            name: "faf-task-21".into(),
+            change_id: "a21".into(),
+        }];
+        let tasks = vec![task(21, "faf-task-21", TaskStatus::Idle)];
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["head", "tA", "s1", "s2", "s3", "tB", "a21", "tC"],
+            "the agent is lifted to just above its fork point; the side branch stays put"
+        );
+        let m = build(&revs, &workspaces, &tasks);
+        let rows = crate::graph::render(&m.nodes);
+        let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
+        assert_eq!(
+            gutters,
+            vec!["@", "◆", "│ ○", "│ ○", "├─○", "○", "├─●", "○"],
+            "a21 folds to a single ├─● row directly above tC — not a lane held to a bottom merge"
+        );
+    }
 
     fn rev(id: &str, parents: &[&str], cwc: bool, empty: bool, desc: &str) -> RevInfo {
         RevInfo {
