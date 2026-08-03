@@ -1,4 +1,4 @@
-//! faf — a jj-native TUI for managing parallel Claude Code agents.
+//! faff — a jj-native TUI for managing parallel Claude Code agents.
 //!
 //! See `docs/superpowers/specs/2026-07-21-faf-design.md` for the full design.
 

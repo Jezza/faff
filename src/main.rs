@@ -1,4 +1,4 @@
-//! faf entry point: parse CLI, dispatch to the TUI or the internal report-event hook.
+//! faff entry point: parse CLI, dispatch to the TUI or the internal report-event hook.
 
 use clap::Parser;
 use faff::cli::{Cli, Command};

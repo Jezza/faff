@@ -6,7 +6,7 @@
 pub enum Toggle {
     /// Nothing to do (selected task has no running agent).
     Nothing,
-    /// Open the selected agent beside faf.
+    /// Open the selected agent beside faff.
     Open(u64),
     /// Detach the currently-open agent (selection == open).
     Detach(u64),
@@ -14,7 +14,7 @@ pub enum Toggle {
     Retarget { detach: u64, open: u64 },
 }
 
-/// Decide the toggle. `open` is the pane currently docked beside faf (if any);
+/// Decide the toggle. `open` is the pane currently docked beside faff (if any);
 /// `selected` is the selected task's pane (None if it has no agent).
 pub fn decide(open: Option<u64>, selected: Option<u64>) -> Toggle {
     match (open, selected) {

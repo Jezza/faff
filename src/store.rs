@@ -1,6 +1,6 @@
 //! SQLite persistence. One database per repo. See spec §4.
 //!
-//! The TUI process owns a `Store`; short-lived `faf report-event` processes open
+//! The TUI process owns a `Store`; short-lived `faff report-event` processes open
 //! their own connection. WAL mode + a busy timeout keep those from colliding.
 
 use crate::domain::{Autonomy, Task, TaskId, TaskStatus};

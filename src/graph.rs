@@ -5,7 +5,7 @@
 //! Input nodes are in display order (top→bottom = child→parent, as jj log emits).
 //! Output rows are: commit rows (carry a `node_index`), continuation rows (extra
 //! content lines of a node), and link rows (the `├─╯` connectors). The renderer
-//! handles the shape faf produces — a mostly-linear HEAD trunk with short task
+//! handles the shape faff produces — a mostly-linear HEAD trunk with short task
 //! branches merging back in — and degrades gracefully on deeper graphs.
 
 use std::collections::HashMap;

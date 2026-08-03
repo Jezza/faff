@@ -1,6 +1,6 @@
 //! WezTerm controller: `wezterm cli` argv construction + exec + `list` parsing.
 //! Verified primitives (spec §8): split-pane --move-pane-id (open a session beside
-//! faf) and move-pane-to-new-tab (detach). Builders are separated from exec so they
+//! faff) and move-pane-to-new-tab (detach). Builders are separated from exec so they
 //! can be unit-tested without mutating any live panes.
 
 use anyhow::{Context, Result, bail};
@@ -52,9 +52,9 @@ pub fn activate_pane_args(pane_id: u64) -> Vec<String> {
     vec![s("cli"), s("activate-pane"), s("--pane-id"), s(pane_id)]
 }
 
-/// Open a session beside faf: move the agent pane into a right split of faf's pane.
-/// `wezterm cli split-pane --right --move-pane-id <agent> --pane-id <faf>`.
-pub fn split_move_args(faf_pane: u64, agent_pane: u64) -> Vec<String> {
+/// Open a session beside faff: move the agent pane into a right split of faff's pane.
+/// `wezterm cli split-pane --right --move-pane-id <agent> --pane-id <faff>`.
+pub fn split_move_args(faff_pane: u64, agent_pane: u64) -> Vec<String> {
     vec![
         s("cli"),
         s("split-pane"),
@@ -62,7 +62,7 @@ pub fn split_move_args(faf_pane: u64, agent_pane: u64) -> Vec<String> {
         s("--move-pane-id"),
         s(agent_pane),
         s("--pane-id"),
-        s(faf_pane),
+        s(faff_pane),
     ]
 }
 
@@ -149,9 +149,9 @@ pub fn activate_pane(pane_id: u64) -> Result<()> {
     run(&activate_pane_args(pane_id)).map(|_| ())
 }
 
-/// Move `agent_pane` into a right split of `faf_pane` (open session mode).
-pub fn open_beside(faf_pane: u64, agent_pane: u64) -> Result<()> {
-    run(&split_move_args(faf_pane, agent_pane)).map(|_| ())
+/// Move `agent_pane` into a right split of `faff_pane` (open session mode).
+pub fn open_beside(faff_pane: u64, agent_pane: u64) -> Result<()> {
+    run(&split_move_args(faff_pane, agent_pane)).map(|_| ())
 }
 
 /// Eject `agent_pane` back into its own tab, still running (detach).
@@ -271,7 +271,7 @@ mod tests {
         let json = r##"[
           {"window_id":6,"tab_id":6,"pane_id":36,"workspace":"default",
            "size":{"rows":30,"cols":94,"pixel_width":940,"pixel_height":570,"dpi":96},
-           "title":"faf","cwd":"file://host/home/jezza/work/faf"},
+           "title":"faff","cwd":"file://host/home/jezza/work/faff"},
           {"window_id":6,"tab_id":7,"pane_id":40,"workspace":"default",
            "size":{"rows":30,"cols":94,"pixel_width":940,"pixel_height":570,"dpi":96},
            "title":"#7 add-auth","cwd":"file://host/ws/0007"}
@@ -279,7 +279,7 @@ mod tests {
         let panes = parse_list(json).unwrap();
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].pane_id, 36);
-        assert_eq!(panes[0].title, "faf");
+        assert_eq!(panes[0].title, "faff");
         assert_eq!(panes[1].pane_id, 40);
         assert_eq!(panes[1].tab_id, 7);
         assert_eq!(panes[1].title, "#7 add-auth");

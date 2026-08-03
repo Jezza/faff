@@ -183,8 +183,8 @@ pub fn refresh(repo: &Path, ws_name: &str, freeze: bool) -> Result<Refresh> {
 ///
 /// The task's own commits are `(fork_point..head) ~ ::@` — its branch, minus anything
 /// already integrated into HEAD's `@` (which must never be rewritten). Of that set:
-/// - if any commit carries real content, faf leaves the whole branch alone as ordinary
-///   history — you integrate or `jj abandon` it yourself. faf never discards real work
+/// - if any commit carries real content, faff leaves the whole branch alone as ordinary
+///   history — you integrate or `jj abandon` it yourself. faff never discards real work
 ///   on removal;
 /// - if they are all empty (a bare fork, an empty tip — graph noise), they're abandoned
 ///   so no empty heads linger.
@@ -273,7 +273,7 @@ fn retire(
 ///    agent's revision.
 ///
 /// If the second edit fails the swap is left half-applied — recoverable, since "both
-/// workspaces on one revision" is exactly the combined HEAD+agent node faf already renders
+/// workspaces on one revision" is exactly the combined HEAD+agent node faff already renders
 /// (re-run swap or fix by hand). Bails untouched if `@` is already the agent's revision.
 pub fn swap(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
     let user_head = jj::resolve_change_id(repo, "@").context("resolving @")?;
@@ -318,7 +318,7 @@ pub fn snapshot(ws_path: &Path) -> Result<()> {
 /// (not inherited from a parent dir), so every workspace needs its own entry.
 ///
 /// Best-effort atomic merge: read the JSON, set `projects[ws].hasTrustDialogAccepted`,
-/// write to a temp file and rename over. faf writes this once at task creation,
+/// write to a temp file and rename over. faff writes this once at task creation,
 /// before that agent is spawned; a rare race with another claude updating the shared
 /// file at the same instant would at worst drop this entry (the dialog reappears once).
 pub fn trust_workspace(ws_path: &Path) -> Result<()> {
@@ -357,7 +357,7 @@ fn trust_workspace_in(cfg: &Path, ws_path: &Path) -> Result<()> {
         .unwrap()
         .insert("hasTrustDialogAccepted".to_string(), json!(true));
 
-    let tmp = cfg.with_extension("json.faf-tmp");
+    let tmp = cfg.with_extension("json.faff-tmp");
     fs::write(&tmp, serde_json::to_string(&root)?)
         .with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, cfg).with_context(|| format!("replacing {}", cfg.display()))?;
@@ -418,19 +418,19 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Write the auto-injected Claude Code hooks into `<ws>/.claude/settings.local.json`.
-/// Each hook invokes the faf binary's `report-event`, which persists to `db` and
+/// Each hook invokes the faff binary's `report-event`, which persists to `db` and
 /// nudges the TUI on `socket`.
 pub fn write_hooks(
     ws_path: &Path,
     task_id: i64,
-    faf_exe: &Path,
+    faff_exe: &Path,
     socket: &Path,
     db: &Path,
 ) -> Result<PathBuf> {
     let dir = ws_path.join(".claude");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("settings.local.json");
-    let settings = hook_settings(task_id, faf_exe, socket, db);
+    let settings = hook_settings(task_id, faff_exe, socket, db);
     fs::write(&path, serde_json::to_string_pretty(&settings)?)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
@@ -442,10 +442,10 @@ fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
 }
 
-fn hook_cmd(task_id: i64, faf_exe: &Path, event: &str, socket: &Path, db: &Path) -> String {
+fn hook_cmd(task_id: i64, faff_exe: &Path, event: &str, socket: &Path, db: &Path) -> String {
     format!(
         "{} report-event --task {} --event {} --socket {} --db {}",
-        shell_quote(faf_exe),
+        shell_quote(faff_exe),
         task_id,
         event,
         shell_quote(socket),
@@ -453,9 +453,9 @@ fn hook_cmd(task_id: i64, faf_exe: &Path, event: &str, socket: &Path, db: &Path)
     )
 }
 
-fn hook_settings(task_id: i64, faf_exe: &Path, socket: &Path, db: &Path) -> Value {
-    let group = |event: &str| json!([{ "hooks": [{ "type": "command", "command": hook_cmd(task_id, faf_exe, event, socket, db) }] }]);
-    let matched = |event: &str| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": hook_cmd(task_id, faf_exe, event, socket, db) }] }]);
+fn hook_settings(task_id: i64, faff_exe: &Path, socket: &Path, db: &Path) -> Value {
+    let group = |event: &str| json!([{ "hooks": [{ "type": "command", "command": hook_cmd(task_id, faff_exe, event, socket, db) }] }]);
+    let matched = |event: &str| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": hook_cmd(task_id, faff_exe, event, socket, db) }] }]);
     json!({
         "hooks": {
             "Stop": group("stop"),
@@ -476,18 +476,18 @@ mod tests {
     fn write_hooks_produces_expected_settings() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
-        let faf = Path::new("/opt/my apps/faf"); // note the space
+        let faff = Path::new("/opt/my apps/faff"); // note the space
         let sock = Path::new("/run/faf/7.sock");
         let db = Path::new("/data/faf/repo/faf.db");
-        let path = write_hooks(ws, 7, faf, sock, db).unwrap();
+        let path = write_hooks(ws, 7, faff, sock, db).unwrap();
         assert!(path.ends_with(".claude/settings.local.json"));
 
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
-        // faf_exe path contains a space, so it must be shell-quoted
-        assert!(stop.contains("'/opt/my apps/faf' report-event"));
+        // faff_exe path contains a space, so it must be shell-quoted
+        assert!(stop.contains("'/opt/my apps/faff' report-event"));
         assert!(stop.contains("--task 7"));
         assert!(stop.contains("--event stop"));
         assert!(stop.contains("--socket '/run/faf/7.sock'"));
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn integration_teardown_keeps_nonempty_work() {
-        // faf never discards real work on removal: a task branch with content is left
+        // faff never discards real work on removal: a task branch with content is left
         // as ordinary history (workspace forgotten, dir gone, commits preserved).
         let tmp = tempfile::tempdir().unwrap();
         let (repo, cfg) = scratch_repo(tmp.path());

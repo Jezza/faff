@@ -210,7 +210,7 @@ pub fn edit_in(ws_dir: &Path, rev: &str) -> Result<()> {
 }
 
 /// `jj util snapshot` inside a workspace dir (no `-R`): fold that workspace's
-/// working-copy changes into its `@`, with no other effect. Lets faf capture edits from
+/// working-copy changes into its `@`, with no other effect. Lets faff capture edits from
 /// an agent that never ran a jj command itself (so nothing snapshotted it).
 pub fn snapshot_in(ws_dir: &Path) -> Result<()> {
     run_jj_in(ws_dir, &["util", "snapshot"])?;
