@@ -822,7 +822,7 @@ impl App {
         let revset = format!("ancestors({}, 25)", heads.join(" | "));
         let mut revs = jj::log(&self.repo, &revset)?;
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
-        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
+        // the trunk revision it forked from, so each folds to a one-row `├─◼` stub.
         model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
@@ -900,7 +900,7 @@ impl App {
         let id_col = ID_W + 3;
         // Pad every gutter to one uniform width so the [id] column, block indicator, and
         // description line up into straight columns regardless of branch depth — a folded
-        // agent stub `├─●` is wider than a trunk glyph `○`, and without this the whole
+        // agent stub `├─◼` is wider than a trunk glyph `○`, and without this the whole
         // right-hand block shifts sideways by the difference. The 2-space separator that
         // was previously appended per-row is folded into this width. (Gutter cells are all
         // single-column box-drawing chars, so char count is the display width.)
@@ -1392,10 +1392,15 @@ mod tests {
 
     #[test]
     fn graph_aligns_id_and_indicator_columns_across_gutter_widths() {
-        // A trunk node (`○`, a 1-column gutter) and a folded agent stub (`├─●`, a
-        // 3-column gutter) must line their `[id]` column, block indicator, and
-        // description into one straight vertical column: the gutter is padded to a
-        // uniform width so branch depth never pushes the `[id] ◻ …` block sideways.
+        // Rows of differing gutter widths must line their `[id]` column, fill indicator,
+        // and description into one straight vertical column: the gutter is padded to a
+        // uniform width so branch depth never pushes the block sideways. Three rows:
+        //   • trunk         `○`   — non-agent, leads its content with the ◼ indicator
+        //   • folded fork   `├─○` — non-agent, wider gutter, leads with ◻
+        //   • agent stub    `├─◼` — an agent; its gutter square IS the marker, so its
+        //                           content carries no leading indicator
+        // Every `[id]` must align; the two non-agent indicators must align; the agent row
+        // must contribute no content indicator (only two indicators render, not three).
         let mut app = test_app();
         app.rows = vec![
             graph::GraphRow {
@@ -1405,16 +1410,23 @@ mod tests {
                 change_id: Some("aaaaaaaa".into()),
             },
             graph::GraphRow {
-                gutter: "├─●".into(),
-                content: "◻ #11 :: agent work".into(),
+                gutter: "├─○".into(),
+                content: "◻ side work".into(),
                 node_index: Some(1),
                 change_id: Some("bbbbbbbb".into()),
             },
+            graph::GraphRow {
+                gutter: "├─◼".into(),
+                content: "#11 ⚙ :: agent work".into(),
+                node_index: Some(2),
+                change_id: Some("cccccccc".into()),
+            },
         ];
-        app.task_of_node = vec![None, None];
+        app.task_of_node = vec![None, None, None];
         app.id_display = std::collections::HashMap::from([
             ("aaaaaaaa".to_string(), ("aaaaaaaa".to_string(), String::new())),
             ("bbbbbbbb".to_string(), ("bbbbbbbb".to_string(), String::new())),
+            ("cccccccc".to_string(), ("cccccccc".to_string(), String::new())),
         ]);
 
         let width = 80usize;
@@ -1423,41 +1435,42 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
 
         let buf = term.backend().buffer();
-        // (x, y) of every cell carrying `sym`.
-        let find = |sym: &str| -> Vec<(usize, usize)> {
-            buf.content
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.symbol() == sym)
-                .map(|(i, _)| (i % width, i / width))
-                .collect()
-        };
-
-        // The fill indicators are unique to the graph rows (◼ on the trunk row, ◻ on
-        // the agent stub) — they must share one x column.
-        let full = find("◼");
-        let empty = find("◻");
-        assert_eq!(full.len(), 1, "one ◼ indicator: {full:?}");
-        assert_eq!(empty.len(), 1, "one ◻ indicator: {empty:?}");
-        assert_eq!(
-            full[0].0, empty[0].0,
-            "fill indicators aligned: ◼@{full:?} vs ◻@{empty:?}"
+        let is_square = |s: &str| s == "◼" || s == "◻";
+        // For each rendered graph row — the ones carrying the `[abcdefgh]` id column, a
+        // `[`…`]` pair spanning the 8-char id — record the x of its `[` and, if present,
+        // the x of its fill indicator (the first square after `]`). An agent row's only
+        // square lives in the gutter, before the `[`, so it contributes no indicator.
+        let mut bracket_xs = vec![];
+        let mut indicator_xs = vec![];
+        for y in 0..(buf.content.len() / width) {
+            let row = &buf.content[y * width..(y + 1) * width];
+            let (Some(open), Some(close)) = (
+                row.iter().position(|c| c.symbol() == "["),
+                row.iter().position(|c| c.symbol() == "]"),
+            ) else {
+                continue;
+            };
+            if close - open != 9 {
+                continue; // not the id column (footer/header hint brackets)
+            }
+            bracket_xs.push(open);
+            if let Some(rel) = row[close..].iter().position(|c| is_square(c.symbol())) {
+                indicator_xs.push(close + rel);
+            }
+        }
+        assert_eq!(bracket_xs.len(), 3, "three graph rows carry an id column: {bracket_xs:?}");
+        assert!(
+            bracket_xs.iter().all(|x| *x == bracket_xs[0]),
+            "id columns aligned: {bracket_xs:?}"
         );
-
-        // The `[` opening each id column (found on the indicator's own row, so footer/
-        // header brackets don't interfere) must likewise sit at one x.
-        let bracket_x = |y: usize| -> usize {
-            buf.content
-                .iter()
-                .enumerate()
-                .find(|(i, c)| i / width == y && c.symbol() == "[")
-                .map(|(i, _)| i % width)
-                .expect("id column `[` on the indicator's row")
-        };
         assert_eq!(
-            bracket_x(full[0].1),
-            bracket_x(empty[0].1),
-            "id columns aligned"
+            indicator_xs.len(),
+            2,
+            "only the two non-agent rows carry a content indicator: {indicator_xs:?}"
+        );
+        assert_eq!(
+            indicator_xs[0], indicator_xs[1],
+            "fill indicators aligned: {indicator_xs:?}"
         );
     }
 
