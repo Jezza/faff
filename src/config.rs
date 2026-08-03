@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 /// Encode an absolute path into a single directory segment, matching Claude Code's
 /// project-key scheme (verified against the claude binary): every non-alphanumeric
 /// char becomes `-`, and paths longer than 200 chars are truncated to 200 with a
-/// hash suffix. Used both to name faf's own data dirs and — crucially — to locate
+/// hash suffix. Used both to name faff's own data dirs and — crucially — to locate
 /// the matching `~/.claude/projects/<key>/` directory for memory seeding.
 ///
 /// `/home/jezza/work/x` -> `-home-jezza-work-x`; `/a/.cfg` -> `-a--cfg`.
 ///
-/// Note: for paths over 200 chars the hash suffix is faf's own (stable) hash, which
+/// Note: for paths over 200 chars the hash suffix is faff's own (stable) hash, which
 /// will not match Claude's for such long paths; memory seeding is best-effort there.
 pub fn encode_repo_path(repo: &Path) -> String {
     let s = repo.to_string_lossy();
@@ -30,14 +30,14 @@ pub fn encode_repo_path(repo: &Path) -> String {
     format!("{prefix}-{:x}", h.finish())
 }
 
-/// The local (non-roaming) data root for faf, e.g. `~/.local/share/faf`.
+/// The local (non-roaming) data root for faff, e.g. `~/.local/share/faf`.
 pub fn data_root() -> Result<PathBuf> {
     let pd = ProjectDirs::from("io", "peeriot", "faf")
         .context("could not determine a home/data directory")?;
     Ok(pd.data_local_dir().to_path_buf())
 }
 
-/// Per-repo faf directory: `<data_root>/<encoded-repo>`.
+/// Per-repo faff directory: `<data_root>/<encoded-repo>`.
 pub fn repo_dir(repo: &Path) -> Result<PathBuf> {
     Ok(data_root()?.join(encode_repo_path(repo)))
 }
@@ -91,8 +91,8 @@ mod tests {
             "-home-jezza-work-x"
         );
         assert_eq!(
-            encode_repo_path(Path::new("/home/jezza/projects/faf")),
-            "-home-jezza-projects-faf"
+            encode_repo_path(Path::new("/home/jezza/projects/faff")),
+            "-home-jezza-projects-faff"
         );
         // every non-alphanumeric char becomes '-' (matching Claude): dots, underscores, trailing slash
         assert_eq!(

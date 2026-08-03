@@ -257,7 +257,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
         let ws = workspaces.iter().find(|w| w.change_id == rev.change_id);
         // A rev can be the working copy of several workspaces at once: after
         // `jj edit <agent-rev>` HEAD's default workspace and the agent's own workspace
-        // both point at it. Find the faf task among ALL matching workspaces (not just the
+        // both point at it. Find the faff task among ALL matching workspaces (not just the
         // first), so the agent keeps its node instead of hiding behind HEAD and falling
         // into the detached list.
         let task = workspaces
@@ -323,7 +323,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             };
             ('×', vec![d], false, None)
         } else if ws.is_some() {
-            // Some other workspace's @ (not a faf task) — non-agent, so a hollow ○.
+            // Some other workspace's @ (not a faff task) — non-agent, so a hollow ○.
             let d = if rev.description.is_empty() {
                 "(working copy)".to_string()
             } else {
@@ -336,7 +336,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             ('○', vec![String::new()], true, None)
         } else {
             // An ordinary (non-agent) commit — your own history — gets a hollow ○; a
-            // faf agent's revision is a filled ● (see the task branch above). No
+            // faff agent's revision is a filled ● (see the task branch above). No
             // description falls back to jj's "(no description set)" (as the `@` nodes do),
             // never the change id — that's already drawn in the "[abcdefgh]" id column.
             let d = if rev.description.is_empty() {
@@ -546,7 +546,7 @@ mod tests {
         assert_eq!(m.nodes[0].lines, vec!["◻ (no description set)"]);
         assert_eq!(m.task_of[0], None);
 
-        // task node: one line `#id emoji :: title`, glyph ● (a faf agent), mapped to task
+        // task node: one line `#id emoji :: title`, glyph ● (a faff agent), mapped to task
         // 7. The title is the change's jj description, not the prompt.
         assert_eq!(m.nodes[1].glyph, '●');
         assert_eq!(m.nodes[1].lines, vec!["◻ #7 ⚙ :: Add OAuth flow"]);
@@ -573,7 +573,7 @@ mod tests {
             rev("x", &["base"], true, false, "agent: did work"),
             rev("base", &[], false, false, "base"),
         ];
-        // `default` is listed first — the faf task must still be found behind it.
+        // `default` is listed first — the faff task must still be found behind it.
         let workspaces = vec![
             Workspace {
                 name: "default".into(),

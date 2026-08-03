@@ -14,7 +14,7 @@ pub enum Action {
     Handoff,
     /// Enter: open / detach / retarget the selected task's session (toggle).
     ToggleSession,
-    /// `x`: remove the task — kill its pane, tear down its workspace, drop it from faf.
+    /// `x`: remove the task — kill its pane, tear down its workspace, drop it from faff.
     /// Real work on the revision is preserved (only an all-empty branch is abandoned).
     Remove,
     /// `X` (Shift+x): remove the task *and* abandon its revision, discarding the work.

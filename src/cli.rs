@@ -45,7 +45,7 @@ pub enum Command {
     },
 }
 
-/// Map a hook `event` name + payload to a faf `Event` (pure; unit-tested).
+/// Map a hook `event` name + payload to a faff `Event` (pure; unit-tested).
 pub fn map_event(task: TaskId, event: &str, payload: &Value) -> Result<Event> {
     Ok(match event {
         "stop" => Event::Idle { task },

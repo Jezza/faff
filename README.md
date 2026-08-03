@@ -51,7 +51,7 @@ One session is docked at a time. Docking another detaches the current one.
 With task #7's session docked, faff on the left and the real `claude` pane on the right:
 
 ```
- faf · faff · 1 working · ▶ #7                         ┃ ⏺ Convert the HTTP and MQTT bridges
+ faff · faff · 1 working · ▶ #7                        ┃ ⏺ Convert the HTTP and MQTT bridges
 revisions                                            │ ┃   from postcard to JSON
 @  [wvrsmsyk] ◻ (no description set)                 │ ┃
 ├─●  [kmkxwzqr] ◼ #7 ⚙ :: Convert bridges to JSON  ▶ │ ┃ ● Read src/bridge/http.rs

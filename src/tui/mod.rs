@@ -1,4 +1,4 @@
-//! The faf dashboard TUI: unified revision view, browse/session modes, and the
+//! The faff dashboard TUI: unified revision view, browse/session modes, and the
 //! orchestration actions. See spec §11. Pure logic lives in the submodules
 //! (input, session, model); this file is the app state, event loop, and
 //! rendering glue.
@@ -94,12 +94,12 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
 
 struct App {
     repo: PathBuf,
-    faf_exe: PathBuf,
+    faff_exe: PathBuf,
     socket: PathBuf,
     db: PathBuf,
     store: Store,
     events_rx: Receiver<events::Event>,
-    faf_pane: Option<u64>,
+    faff_pane: Option<u64>,
 
     // View state (owned; recomputed on refresh).
     tasks: Vec<Task>,
@@ -140,19 +140,19 @@ impl App {
         let store = Store::open(&db)?;
         let socket = events::socket_path(&repo);
         let events_rx = events::spawn_listener(&socket)?;
-        let faf_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faf"));
-        let faf_pane = std::env::var("WEZTERM_PANE")
+        let faff_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faff"));
+        let faff_pane = std::env::var("WEZTERM_PANE")
             .ok()
             .and_then(|s| s.parse().ok());
 
         let mut app = App {
             repo,
-            faf_exe,
+            faff_exe,
             socket,
             db,
             store,
             events_rx,
-            faf_pane,
+            faff_pane,
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
@@ -269,7 +269,7 @@ impl App {
         self.tasks.iter().find(|t| &t.id == id).cloned()
     }
 
-    /// The task whose agent pane is currently docked beside faf (the focused session).
+    /// The task whose agent pane is currently docked beside faff (the focused session).
     fn open_task_id(&self) -> Option<TaskId> {
         let open = self.open_pane?;
         self.tasks
@@ -290,7 +290,7 @@ impl App {
     // ---- orchestration actions ----
 
     /// `n`: create an empty task, fork its workspace, spawn a bare `claude`, and open
-    /// it beside faf so the user types their task straight into the session. The task
+    /// it beside faff so the user types their task straight into the session. The task
     /// prompt (and title) are captured later from the first UserPromptSubmit hook.
     fn new_task(&mut self) {
         match self.try_new_task(false) {
@@ -320,9 +320,9 @@ impl App {
     /// The only difference is how the workspace is forked (`prepare_workspace`); spawning,
     /// docking, rollback, and status are identical.
     fn try_new_task(&mut self, handoff: bool) -> Result<TaskId> {
-        let faf = self
-            .faf_pane
-            .context("run faf inside WezTerm to spawn agents")?;
+        let faff = self
+            .faff_pane
+            .context("run faff inside WezTerm to spawn agents")?;
         let task = self.store.create_task("", 0, Autonomy::Inherit)?;
         // Roll the row back if workspace prep fails (no invisible zombie).
         if let Err(e) = self.prepare_workspace(task.id, "", handoff) {
@@ -335,9 +335,9 @@ impl App {
                 let _ = self.store.set_pane(task.id, Some(pane));
                 // Awaiting the user's first prompt — literally needs their input.
                 let _ = self.store.update_status(task.id, TaskStatus::NeedsInput);
-                // Dock it beside faf (detaching any already-open session first) and
+                // Dock it beside faff (detaching any already-open session first) and
                 // focus it — a new task lands the user in the agent to type the task.
-                self.open_session(faf, pane, true);
+                self.open_session(faff, pane, true);
                 Ok(task.id)
             }
             Err(e) => {
@@ -373,7 +373,7 @@ impl App {
         // Best-effort: memory seed, hook injection, and pre-trust the workspace dir
         // so the agent doesn't hit the "trust this folder?" dialog on spawn.
         let _ = workspace::seed_memory(&workspace::claude_projects_dir(), &self.repo, &ws.path);
-        let _ = workspace::write_hooks(&ws.path, id.0, &self.faf_exe, &self.socket, &self.db);
+        let _ = workspace::write_hooks(&ws.path, id.0, &self.faff_exe, &self.socket, &self.db);
         let _ = workspace::trust_workspace(&ws.path);
         Ok(())
     }
@@ -395,37 +395,37 @@ impl App {
         }
         let pane = wezterm::spawn(&ws_path, &prog)?;
         let _ = wezterm::set_tab_title(pane, &format!("#{}", t.id.0));
-        // `wezterm cli spawn` activates the new tab, stealing focus from faf. Return
-        // focus to faf so spawning an agent never yanks the user out of the TUI (a new
+        // `wezterm cli spawn` activates the new tab, stealing focus from faff. Return
+        // focus to faff so spawning an agent never yanks the user out of the TUI (a new
         // task re-focuses its own pane afterward — see open_session).
-        if let Some(faf) = self.faf_pane {
-            let _ = wezterm::activate_pane(faf);
+        if let Some(faff) = self.faff_pane {
+            let _ = wezterm::activate_pane(faff);
         }
         Ok(pane)
     }
 
-    /// Dock `pane` beside faf, ensuring only one session is ever docked: any
+    /// Dock `pane` beside faff, ensuring only one session is ever docked: any
     /// currently-open session is detached first. Idempotent if `pane` is already open.
     /// `focus` decides where the cursor lands: a new task focuses its fresh agent so
-    /// the user can type the task straight away; every other dock leaves focus on faf
+    /// the user can type the task straight away; every other dock leaves focus on faff
     /// (the user swaps with their own WezTerm keybinds).
-    fn open_session(&mut self, faf: u64, pane: u64, focus: bool) {
+    fn open_session(&mut self, faff: u64, pane: u64, focus: bool) {
         if let Some(prev) = self.open_pane
             && prev != pane
         {
             let _ = wezterm::detach(prev);
         }
-        if wezterm::open_beside(faf, pane).is_ok() {
+        if wezterm::open_beside(faff, pane).is_ok() {
             self.open_pane = Some(pane);
             // open_beside activates the moved pane; set focus explicitly either way.
-            let _ = wezterm::activate_pane(if focus { pane } else { faf });
+            let _ = wezterm::activate_pane(if focus { pane } else { faff });
         }
     }
 
     fn toggle_session(&mut self) {
         let selected_pane = self.selected_task().and_then(|t| t.pane_id);
-        let Some(faf) = self.faf_pane else {
-            self.status = "no WEZTERM_PANE; run faf inside WezTerm".to_string();
+        let Some(faff) = self.faff_pane else {
+            self.status = "no WEZTERM_PANE; run faff inside WezTerm".to_string();
             return;
         };
         match session::decide(self.open_pane, selected_pane) {
@@ -433,14 +433,14 @@ impl App {
             // Open and Retarget both route through open_session (which detaches any
             // currently-docked session first).
             session::Toggle::Open(p) | session::Toggle::Retarget { open: p, .. } => {
-                // Docking to view an existing agent keeps focus on faf.
-                self.open_session(faf, p, false)
+                // Docking to view an existing agent keeps focus on faff.
+                self.open_session(faff, p, false)
             }
             session::Toggle::Detach(p) => {
                 if wezterm::detach(p).is_ok() {
                     self.open_pane = None;
-                    // Ejecting the pane to a new tab activates it; stay on faf.
-                    let _ = wezterm::activate_pane(faf);
+                    // Ejecting the pane to a new tab activates it; stay on faff.
+                    let _ = wezterm::activate_pane(faff);
                 }
             }
         }
@@ -684,9 +684,9 @@ impl App {
         // Reload to reflect any status changes the reconcile passes made.
         self.tasks = self.store.list_tasks().unwrap_or_default();
 
-        // Recover which agent (if any) is already docked beside faf. Derived from the
+        // Recover which agent (if any) is already docked beside faff. Derived from the
         // live layout each refresh, so a restart — where `open_pane` starts `None` —
-        // doesn't leave faf blind to an already-docked session and re-open (double) it.
+        // doesn't leave faff blind to an already-docked session and re-open (double) it.
         if let Some(p) = &panes {
             self.open_pane = self.detect_open_pane(p);
         }
@@ -747,24 +747,24 @@ impl App {
         }
     }
 
-    /// Derive which agent pane (if any) is currently docked beside faf: a known task
-    /// pane that shares faf's WezTerm tab (that is how `open_beside` docks it). This
-    /// lets faf recover the docked session after a restart — when `open_pane` starts
+    /// Derive which agent pane (if any) is currently docked beside faff: a known task
+    /// pane that shares faff's WezTerm tab (that is how `open_beside` docks it). This
+    /// lets faff recover the docked session after a restart — when `open_pane` starts
     /// `None` — instead of treating Enter as a fresh open and spawning a duplicate
     /// split. An agent detached to its own tab, or a non-agent pane, is not "open".
     fn detect_open_pane(&self, panes: &[wezterm::Pane]) -> Option<u64> {
-        let faf = self.faf_pane?;
-        let faf_tab = panes.iter().find(|p| p.pane_id == faf)?.tab_id;
+        let faff = self.faff_pane?;
+        let faff_tab = panes.iter().find(|p| p.pane_id == faff)?.tab_id;
         let agent_panes: std::collections::HashSet<u64> =
             self.tasks.iter().filter_map(|t| t.pane_id).collect();
         panes
             .iter()
-            .find(|p| p.tab_id == faf_tab && p.pane_id != faf && agent_panes.contains(&p.pane_id))
+            .find(|p| p.tab_id == faff_tab && p.pane_id != faff && agent_panes.contains(&p.pane_id))
             .map(|p| p.pane_id)
     }
 
     /// Drop tasks whose jj workspace has vanished (integrated + cleaned, or forgotten
-    /// outside faf): the workspace is gone, so the task is done — remove it. Keeps the
+    /// outside faff): the workspace is gone, so the task is done — remove it. Keeps the
     /// active list honest. Only runs with an authoritative workspace list.
     fn reconcile_workspaces(&self, workspaces: &[jj::Workspace]) {
         let live: std::collections::HashSet<&str> =
@@ -869,7 +869,7 @@ impl App {
             None => String::new(),
         };
         let text = format!(
-            " faf · {} · {working} working{session} ",
+            " faff · {} · {working} working{session} ",
             self.repo
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -883,7 +883,7 @@ impl App {
 
     fn render_body(&self, f: &mut Frame, area: Rect) {
         // The revision graph is the whole body: when a session is docked WezTerm owns
-        // the right half (the real claude pane) beside faf's narrowed area, and when
+        // the right half (the real claude pane) beside faff's narrowed area, and when
         // browsing the graph simply uses the full width.
         self.render_graph(f, area);
     }
@@ -1062,12 +1062,12 @@ mod tests {
         let (_ev_tx, events_rx) = std::sync::mpsc::channel();
         App {
             repo: PathBuf::from("/tmp/repo"),
-            faf_exe: PathBuf::from("/bin/faf"),
+            faff_exe: PathBuf::from("/bin/faff"),
             socket: PathBuf::from("/tmp/faf.sock"),
             db: PathBuf::from("/tmp/faf.db"),
             store: Store::open_memory().unwrap(),
             events_rx,
-            faf_pane: Some(1),
+            faff_pane: Some(1),
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
@@ -1467,7 +1467,7 @@ mod tests {
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store.set_pane(t.id, Some(77)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = Some(77); // this agent is docked beside faf
+        app.open_pane = Some(77); // this agent is docked beside faff
         app.rows = vec![graph::GraphRow {
             gutter: "@".into(),
             content: format!("#{} x", t.id.0),
@@ -1499,7 +1499,7 @@ mod tests {
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store.set_pane(t.id, Some(55)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = Some(55); // the agent is docked beside faf
+        app.open_pane = Some(55); // the agent is docked beside faff
         app.rows = vec![
             graph::GraphRow {
                 gutter: "@".into(),
@@ -1568,25 +1568,25 @@ mod tests {
             }
         }
 
-        let mut app = test_app(); // faf_pane = Some(1), open_pane = None (fresh start)
+        let mut app = test_app(); // faff_pane = Some(1), open_pane = None (fresh start)
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap(); // persisted across the restart
         app.tasks = app.store.list_tasks().unwrap();
 
-        // Agent docked in faf's tab (7) -> recovered as the open session.
+        // Agent docked in faff's tab (7) -> recovered as the open session.
         let docked = vec![
-            pane(7, 1, "faf"),
+            pane(7, 1, "faff"),
             pane(7, 42, "#1 x"),
             pane(9, 99, "unrelated other-tab pane"),
         ];
         assert_eq!(app.detect_open_pane(&docked), Some(42));
 
         // Agent detached to its own tab (8) -> nothing docked.
-        let detached = vec![pane(7, 1, "faf"), pane(8, 42, "#1 x")];
+        let detached = vec![pane(7, 1, "faff"), pane(8, 42, "#1 x")];
         assert_eq!(app.detect_open_pane(&detached), None);
 
-        // A non-agent pane sharing faf's tab is ignored (not a known task pane).
-        let stray = vec![pane(7, 1, "faf"), pane(7, 500, "a shell")];
+        // A non-agent pane sharing faff's tab is ignored (not a known task pane).
+        let stray = vec![pane(7, 1, "faff"), pane(7, 500, "a shell")];
         assert_eq!(app.detect_open_pane(&stray), None);
     }
 

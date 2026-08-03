@@ -1,4 +1,4 @@
-//! Core domain types shared across faf.
+//! Core domain types shared across faff.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

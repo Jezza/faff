@@ -1,4 +1,4 @@
-//! Events emitted by injected Claude Code hooks (via `faf report-event`) and the
+//! Events emitted by injected Claude Code hooks (via `faff report-event`) and the
 //! Unix-socket transport that carries them to the running TUI. See spec §9.
 //!
 //! `report-event` always writes to the durable store; the socket send is a
@@ -53,7 +53,7 @@ impl Event {
 /// Unix socket path limit that the long encoded repo path would blow).
 pub fn socket_path(repo: &Path) -> PathBuf {
     use std::hash::{Hash, Hasher};
-    // DefaultHasher::new() uses fixed keys, so this is stable across faf processes.
+    // DefaultHasher::new() uses fixed keys, so this is stable across faff processes.
     let mut h = std::collections::hash_map::DefaultHasher::new();
     repo.hash(&mut h);
     let base = std::env::var_os("XDG_RUNTIME_DIR")
