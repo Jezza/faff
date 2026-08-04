@@ -197,8 +197,18 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
 - `×` a conflict
 
 Empty description-less single-parent commits collapse out. Merges and conflicts never
-collapse. Row labels are clipped to the current pane width — and only when they overflow —
-so they re-fit as docking or detaching a session resizes faff.
+collapse. A merge (a revision with 2+ parents) draws its fork inline on its own row —
+`●─╮` — opening a lane for each extra parent, so both parent lines are visible:
+
+```
+◆─╮  [wvrsmsyk] integrate #7
+● │  [kmkxwzqr] your work
+├─●  [rzqlvksp] #7 :: Convert bridges to JSON
+◻  [yuvnmxxo] fork point
+```
+
+Row labels are clipped to the current pane width — and only when they overflow — so they
+re-fit as docking or detaching a session resizes faff.
 
 A task whose change no longer has a node of its own, which is the usual result of
 integrating it, moves to a "detached" list under the graph. It stays selectable and

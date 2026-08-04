@@ -224,9 +224,38 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
             }
         }
 
-        // Commit row (carries the change_id for the id column).
+        // Advance lanes to this node's parents first, tracking any lane freshly opened for
+        // an extra parent so a merge (2+ parents) can draw its fork inline on the row below.
+        let mut opened: Vec<usize> = Vec::new();
+        match n.parents.first() {
+            Some(p0) => {
+                lanes[col] = Some(p0.clone());
+                for p in n.parents.iter().skip(1) {
+                    let exists = lanes.iter().any(|l| l.as_deref() == Some(p.as_str()));
+                    if !exists {
+                        match lanes.iter().position(|l| l.is_none()) {
+                            Some(s) => {
+                                lanes[s] = Some(p.clone());
+                                opened.push(s);
+                            }
+                            None => {
+                                lanes.push(Some(p.clone()));
+                                opened.push(lanes.len() - 1);
+                            }
+                        }
+                    }
+                }
+            }
+            None => lanes[col] = None,
+        }
+
+        // Commit row (carries the change_id for the id column). A merge fans out to multiple
+        // parents: its freshly opened parent lanes are drawn as an inline fork right on this
+        // row — `●─╮` — so every parent line is visible. (An extra parent that already holds
+        // a lane opens none, so no connector reaches it — a rare cross-merge the module
+        // leaves to degrade, as with other deep shapes.)
         rows.push(GraphRow {
-            gutter: commit_gutter(&lanes, col, n.glyph),
+            gutter: commit_gutter(&lanes, col, n.glyph, &opened),
             content: n.lines[0].clone(),
             node_index: Some(n.orig),
             change_id: Some(n.change_id.clone()),
@@ -243,22 +272,6 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
             });
         }
 
-        // Advance lanes to this node's parents.
-        match n.parents.first() {
-            Some(p0) => {
-                lanes[col] = Some(p0.clone());
-                for p in n.parents.iter().skip(1) {
-                    let exists = lanes.iter().any(|l| l.as_deref() == Some(p.as_str()));
-                    if !exists {
-                        match lanes.iter().position(|l| l.is_none()) {
-                            Some(s) => lanes[s] = Some(p.clone()),
-                            None => lanes.push(Some(p.clone())),
-                        }
-                    }
-                }
-            }
-            None => lanes[col] = None,
-        }
         while matches!(lanes.last(), Some(None)) {
             lanes.pop();
         }
@@ -290,16 +303,29 @@ fn gutter_width(nlanes: usize) -> usize {
     if nlanes == 0 { 1 } else { 2 * nlanes - 1 }
 }
 
-fn commit_gutter(lanes: &[Option<String>], col: usize, glyph: char) -> String {
+fn commit_gutter(lanes: &[Option<String>], col: usize, glyph: char, opened: &[usize]) -> String {
     let mut cells = vec![' '; gutter_width(lanes.len())];
+    let max_open = opened.iter().max().copied();
     for (j, lane) in lanes.iter().enumerate() {
         cells[2 * j] = if j == col {
             glyph
+        } else if opened.contains(&j) {
+            // A merge's freshly opened parent lane: `╮` at the furthest, `┬` between.
+            if Some(j) == max_open { '╮' } else { '┬' }
         } else if lane.is_some() {
             '│'
         } else {
             ' '
         };
+    }
+    // A merge's fork: fill `─` from the glyph out to the furthest freshly opened parent lane
+    // (all open to the right of col). No opened lanes ⇒ a plain single-column commit gutter.
+    if let Some(mo) = max_open {
+        for cell in cells.iter_mut().take(2 * mo).skip(2 * col + 1) {
+            if *cell == ' ' {
+                *cell = '─';
+            }
+        }
     }
     trim_end(cells)
 }
@@ -579,5 +605,75 @@ mod tests {
             gutters(&render(&nodes)),
             vec!["@", "│ ●", "├─○", "├─●", "├─●", "├─●", "○"],
         );
+    }
+
+    #[test]
+    fn merge_node_forks_to_both_parents() {
+        // `@` is a merge of your line (p1) and an agent's (p2), both off a shared base.
+        // The fork is drawn inline on the merge's own row — `@─╮` — opening the second
+        // parent's lane, so both parent lines are visible without a separate connector row.
+        let nodes = vec![
+            node("merge", &["p1", "p2"], '@', &["merge of #7"]),
+            node("p1", &["base"], '●', &["your work"]),
+            node("p2", &["base"], '●', &["#7 agent work"]),
+            node("base", &[], '◆', &["base"]),
+        ];
+        let rows = render(&nodes);
+        assert_eq!(gutters(&rows), vec!["@─╮", "● │", "├─●", "◆"]);
+        // The fork lives on the merge's commit row — it still carries the node.
+        assert_eq!(rows[0].node_index, Some(0));
+        // Every row is a commit row, mapping to its original in order (no extra link row).
+        let idx: Vec<_> = rows.iter().filter_map(|r| r.node_index).collect();
+        assert_eq!(idx, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn merge_mid_trunk_forks_on_its_own_row() {
+        // A merge sitting on the trunk beneath `@`. The fork is inline on the merge row.
+        let nodes = vec![
+            node("head", &["merge"], '@', &["your wc"]),
+            node("merge", &["p1", "p2"], '●', &["a merge commit"]),
+            node("p1", &["base"], '●', &["line one"]),
+            node("p2", &["base"], '●', &["line two"]),
+            node("base", &[], '◆', &["base"]),
+        ];
+        assert_eq!(
+            gutters(&render(&nodes)),
+            vec!["@", "●─╮", "● │", "├─●", "◆"],
+        );
+    }
+
+    #[test]
+    fn conflicted_merge_forks_regardless_of_glyph() {
+        // A conflicted merge carries the `×` glyph, but the fork is glyph-agnostic: it
+        // still opens the second parent's lane inline as `×─╮`.
+        let nodes = vec![
+            node("head", &["cm"], '@', &["your wc"]),
+            node("cm", &["mw", "ag"], '×', &["⚠ conflict"]),
+            node("mw", &["base"], '●', &["merge work"]),
+            node("ag", &["base"], '●', &["#7 agent"]),
+            node("base", &[], '◆', &["base"]),
+        ];
+        assert_eq!(
+            gutters(&render(&nodes)),
+            vec!["@", "×─╮", "● │", "├─●", "◆"],
+        );
+    }
+
+    #[test]
+    fn three_parent_merge_opens_every_extra_lane() {
+        // An octopus merge (rare, but must not regress): every extra parent gets a lane,
+        // so the merge row runs `@─┬─╮` — an intermediate `┬` per middle lane, `╮` at the
+        // last. No parent line is left disconnected.
+        let nodes = vec![
+            node("merge", &["p1", "p2", "p3"], '@', &["octopus"]),
+            node("p1", &["base"], '●', &["one"]),
+            node("p2", &["base"], '●', &["two"]),
+            node("p3", &["base"], '●', &["three"]),
+            node("base", &[], '◆', &["base"]),
+        ];
+        let rows = render(&nodes);
+        assert_eq!(rows[0].gutter, "@─┬─╮", "every extra parent lane is opened inline");
+        assert_eq!(rows[0].node_index, Some(0));
     }
 }
