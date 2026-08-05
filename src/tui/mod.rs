@@ -911,6 +911,24 @@ impl App {
             .max()
             .unwrap_or(0)
             + 2;
+        // Which node rows carry the docked (focused) session, so their revision brackets
+        // can be greened. A combined HEAD+agent node hangs its task on a continuation line
+        // below the bracketed HEAD row, so attribute each row to the nearest node row at
+        // or above it — the one whose brackets are shown.
+        let mut node_is_docked = vec![false; self.rows.len()];
+        if let Some(open_id) = open {
+            let mut last_node: Option<usize> = None;
+            for (i, row) in self.rows.iter().enumerate() {
+                if row.change_id.is_some() {
+                    last_node = Some(i);
+                }
+                if self.task_of_node.get(i).copied().flatten() == Some(open_id)
+                    && let Some(n) = last_node
+                {
+                    node_is_docked[n] = true;
+                }
+            }
+        }
         for (i, row) in self.rows.iter().enumerate() {
             let row_task = self.task_of_node.get(i).copied().flatten();
             let is_sel = selected.is_some() && row_task == selected;
@@ -919,10 +937,6 @@ impl App {
             } else {
                 Style::default()
             };
-            // Reserve columns for the trailing docked-session marker on rows that show it,
-            // so truncating the content never pushes the `▶` off the pane.
-            let show_marker = row_task.is_some() && row_task == open;
-            let marker_w = if show_marker { 3 } else { 0 };
             let mut spans: Vec<Span> = Vec::new();
             match &row.change_id {
                 // Node row: gutter + [id] + content, with the unique prefix highlighted.
@@ -961,22 +975,29 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| (cid.chars().take(ID_W).collect(), String::new()));
                     let id_w = 1 + prefix.chars().count() + rest.chars().count() + 2;
-                    spans.push(Span::styled("[", base.fg(Color::DarkGray)));
+                    // The docked (focused) session shows through its revision brackets:
+                    // green + bold when docked, else the muted dark-gray frame. A fixed
+                    // left-column indicator survives description truncation that a trailing
+                    // marker would not. The docked style starts from `Style::default()`,
+                    // NOT `base`: on the highlighted row `base` carries REVERSED, which
+                    // would swap fg/bg and paint the cell background green instead of the
+                    // bracket glyphs.
+                    let bracket = if node_is_docked[i] {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        base.fg(Color::DarkGray)
+                    };
+                    spans.push(Span::styled("[", bracket));
                     spans.push(Span::styled(
                         prefix,
                         base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(rest, base.fg(Color::DarkGray)));
-                    spans.push(Span::styled("] ", base.fg(Color::DarkGray)));
-                    let avail = text_w.saturating_sub(gutter_w + id_w + marker_w);
+                    spans.push(Span::styled("] ", bracket));
+                    let avail = text_w.saturating_sub(gutter_w + id_w);
                     spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
-                    // Marker for the currently-docked (focused) session.
-                    if show_marker {
-                        spans.push(Span::styled(
-                            "  ▶",
-                            base.fg(Color::Green).add_modifier(Modifier::BOLD),
-                        ));
-                    }
                 }
                 // Link row (no content): gutter only.
                 None if row.content.is_empty() => {
@@ -985,17 +1006,9 @@ impl App {
                 // Continuation row: gutter + id-column padding + content (aligned).
                 None => {
                     let pad = format!("{:<gutter_w$}{}", row.gutter, " ".repeat(id_col));
-                    let avail = text_w.saturating_sub(pad.chars().count() + marker_w);
+                    let avail = text_w.saturating_sub(pad.chars().count());
                     spans.push(Span::styled(pad, base));
                     spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
-                    // The combined HEAD+agent node hangs its task (and so its docked
-                    // marker) on the agent's continuation line, not the HEAD header row.
-                    if show_marker {
-                        spans.push(Span::styled(
-                            "  ▶",
-                            base.fg(Color::Green).add_modifier(Modifier::BOLD),
-                        ));
-                    }
                 }
             }
             lines.push(Line::from(spans));
@@ -1010,23 +1023,32 @@ impl App {
             for id in &self.detached {
                 if let Some(t) = self.tasks.iter().find(|t| &t.id == id) {
                     let (icon, _) = model::status_label(t.status);
-                    let show_marker = open == Some(*id);
-                    let marker_w = if show_marker { 3 } else { 0 };
-                    let text = format!("· #{} {} {icon}", t.id.0, t.label());
-                    let text = truncate_first_line(&text, text_w.saturating_sub(marker_w));
+                    let docked = open == Some(*id);
                     let style = if selected == Some(*id) {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default()
                     };
-                    let mut spans = vec![Span::styled(text, style)];
-                    if show_marker {
-                        spans.push(Span::styled(
-                            "  ▶",
-                            style.fg(Color::Green).add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    lines.push(Line::from(spans));
+                    // A detached row has no revision brackets, so the docked session is
+                    // shown by greening its `· #id` prefix instead — the same fixed
+                    // left-column indicator, never crowded out by a truncated description.
+                    // Start from `Style::default()`, not `style`: on the highlighted row
+                    // `style` carries REVERSED, which would swap fg/bg into a green cell
+                    // background rather than green glyphs.
+                    let prefix = format!("· #{}", t.id.0);
+                    let rest = format!(" {} {icon}", t.label());
+                    let prefix_style = if docked {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    };
+                    let avail = text_w.saturating_sub(prefix.chars().count());
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, prefix_style),
+                        Span::styled(truncate_first_line(&rest, avail), style),
+                    ]));
                 }
             }
         }
@@ -1456,13 +1478,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn focused_session_is_marked_in_graph_and_header() {
+    // A one-row graph whose single node's session is docked beside faff.
+    fn docked_node_app(open: bool) -> (App, TaskId) {
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store.set_pane(t.id, Some(77)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = Some(77); // this agent is docked beside faff
+        app.open_pane = if open { Some(77) } else { None };
         app.rows = vec![graph::GraphRow {
             gutter: "@".into(),
             content: format!("#{} x", t.id.0),
@@ -1470,26 +1492,79 @@ mod tests {
             change_id: Some("abcd1234".into()),
         }];
         app.task_of_node = vec![Some(t.id)];
-
-        let backend = TestBackend::new(90, 10);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let text: String = term
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(text.contains('▶'), "focused marker on the row: {text:?}");
-        assert!(text.contains(&format!("#{}", t.id.0)));
+        (app, t.id)
     }
 
     #[test]
-    fn combined_node_marks_and_highlights_the_agent_line_not_head() {
+    fn focused_session_greens_its_revision_brackets() {
+        let (mut app, tid) = docked_node_app(true);
+        // The docked node is also the highlighted (selected) row — the common case (you
+        // select a task, then dock it). A naive green foreground on the REVERSED selection
+        // style would swap fg/bg and paint the cell background green, not the bracket
+        // glyphs; the brackets must stay green *glyphs*.
+        app.task_order = vec![tid];
+        app.selected = 0;
+
+        let (w, h) = (90usize, 10usize);
+        let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+
+        // The graph node row, found by its revision id — not the header bar above it,
+        // which keeps its own `▶ #id` status chip.
+        let gy = (0..h)
+            .find(|&y| row_text(y).contains("abcd1234"))
+            .expect("graph node row rendered");
+        // The docked session shows through its brackets, not a trailing marker that
+        // would crowd the description off a narrow pane.
+        assert!(!row_text(gy).contains('▶'), "no trailing marker on node row");
+        for needle in ["[", "]"] {
+            let x = (0..w)
+                .find(|&x| buf.content[gy * w + x].symbol() == needle)
+                .expect("bracket on node row");
+            let cell = &buf.content[gy * w + x];
+            assert_eq!(cell.fg, Color::Green, "docked bracket {needle} is green");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "docked bracket {needle} is bold"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::REVERSED),
+                "docked bracket {needle} is a green glyph, not a reversed green cell"
+            );
+        }
+    }
+
+    #[test]
+    fn undocked_node_keeps_gray_brackets() {
+        let (app, _tid) = docked_node_app(false);
+        let (w, h) = (90usize, 10usize);
+        let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+        let gy = (0..h)
+            .find(|&y| row_text(y).contains("abcd1234"))
+            .expect("graph node row rendered");
+        for needle in ["[", "]"] {
+            let x = (0..w)
+                .find(|&x| buf.content[gy * w + x].symbol() == needle)
+                .expect("bracket on node row");
+            assert_eq!(
+                buf.content[gy * w + x].fg,
+                Color::DarkGray,
+                "undocked bracket {needle} stays gray"
+            );
+        }
+    }
+
+    #[test]
+    fn combined_node_greens_head_brackets_not_the_agent_line() {
         // HEAD parked on the agent's revision: the `@` commit row is the HEAD header
         // (its description) and the agent hangs beneath. row_tasks hangs the task on the
-        // agent line, so the docked `▶` marker lands there — never on the HEAD header.
+        // agent line, so the docked indicator is the HEAD row's green brackets above it —
+        // never a trailing marker on the agent line.
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store.set_pane(t.id, Some(55)).unwrap();
@@ -1534,20 +1609,68 @@ mod tests {
         let agent_row = (0..h)
             .find(|&y| row_text(y).contains("↳ #"))
             .expect("agent line rendered");
-        assert!(
-            row_text(agent_row).contains('▶'),
-            "docked marker rides the agent line"
-        );
-        assert!(
-            !row_text(head_row).contains('▶'),
-            "no marker on the HEAD header row"
-        );
+        // No trailing marker rides the graph rows — the indicator moved to HEAD's
+        // brackets. (The header bar keeps its own `▶ #id` status chip.)
+        assert!(!row_text(head_row).contains('▶'), "no marker on the HEAD row");
+        assert!(!row_text(agent_row).contains('▶'), "no marker on the agent line");
+        // HEAD's revision brackets are greened (bold), since its parked agent is docked.
+        // The agent line itself carries no brackets to colour.
+        for needle in ["[", "]"] {
+            let x = (0..w)
+                .find(|&x| buf.content[head_row * w + x].symbol() == needle)
+                .expect("bracket on HEAD row");
+            let cell = &buf.content[head_row * w + x];
+            assert_eq!(cell.fg, Color::Green, "HEAD bracket {needle} is green");
+            assert!(
+                cell.modifier.contains(Modifier::BOLD),
+                "HEAD bracket {needle} is bold"
+            );
+        }
         // The agent line is the selected/highlighted one (reverse video), not HEAD.
         let reversed = |y: usize| {
             (0..w).any(|x| buf.content[y * w + x].modifier.contains(Modifier::REVERSED))
         };
         assert!(reversed(agent_row), "agent line is highlighted when selected");
         assert!(!reversed(head_row), "HEAD header row is not highlighted");
+    }
+
+    #[test]
+    fn docked_detached_task_greens_its_id() {
+        // A detached (integrated / no-node) task has no revision brackets, so when its
+        // session is docked the `#N` id is greened instead — still a left-anchored
+        // indicator that a truncated description can never push off screen.
+        let mut app = test_app();
+        let t = app.store.create_task("cleanup", 0, Autonomy::Inherit).unwrap();
+        app.store.set_pane(t.id, Some(88)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.open_pane = Some(88); // docked, but this task has no graph node
+        app.detached = vec![t.id];
+        // ...and it is the highlighted (selected) row too, so the green prefix must be a
+        // glyph colour, not a REVERSED swap that would paint the cell background green.
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        let (w, h) = (60usize, 8usize);
+        let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+
+        // The detached row, by its `· #` bullet — not the header's `▶ #id` chip.
+        let dy = (0..h)
+            .find(|&y| row_text(y).contains("· #"))
+            .expect("detached row rendered");
+        assert!(!row_text(dy).contains('▶'), "no trailing marker on detached row");
+        let x = (0..w)
+            .find(|&x| buf.content[dy * w + x].symbol() == "#")
+            .expect("# on detached row");
+        let cell = &buf.content[dy * w + x];
+        assert_eq!(cell.fg, Color::Green, "docked detached #id is green");
+        assert!(cell.modifier.contains(Modifier::BOLD), "docked detached #id is bold");
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "docked detached #id is a green glyph, not a reversed green cell"
+        );
     }
 
     #[test]
