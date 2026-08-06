@@ -781,17 +781,35 @@ impl App {
         }
     }
 
-    /// faff-owned jj workspaces (`faf-task-*`) that no live task tracks — ghosts left by
-    /// a remove or swap that didn't fully unregister. Pure: returns the names to forget,
-    /// with no side effects (the effectful wrapper does the forgetting).
+    /// faff-owned jj workspaces (`faf-task-<id>`) that no task row claims — ghosts left by
+    /// a remove or swap that didn't fully unregister. A workspace is a ghost only when the
+    /// store has **no task row for its id** (`faf-task-<id>` ↔ task `<id>` is fixed; see
+    /// `prepare_workspace`).
+    ///
+    /// This keys on row existence, not on the task's `ws_name` — and that is what makes it
+    /// safe against a *concurrent* faff instance mid-create. `create_task` commits the row
+    /// *before* `jj workspace add` registers the workspace, whereas `ws_name` is written
+    /// only *after* the add. So a sibling instance that keyed on `ws_name` would forget an
+    /// in-flight workspace whose task is perfectly live (the bug: "workspace … missing
+    /// after add"). The store is read fresh here rather than from `self.tasks`: `self.tasks`
+    /// is snapshotted at the top of `refresh`, possibly before the sibling committed its
+    /// row, whereas a read *now* is necessarily after we listed the workspace — hence after
+    /// its row was committed. Pure w.r.t. jj: returns names to forget, no side effects.
     fn orphaned_workspaces(&self, workspaces: &[jj::Workspace]) -> Vec<String> {
-        let tracked: std::collections::HashSet<&str> =
-            self.tasks.iter().filter_map(|t| t.ws_name.as_deref()).collect();
+        let live: std::collections::HashSet<i64> = self
+            .store
+            .list_tasks()
+            .unwrap_or_default()
+            .iter()
+            .map(|t| t.id.0)
+            .collect();
         workspaces
             .iter()
-            .map(|w| w.name.as_str())
-            .filter(|name| name.starts_with("faf-task-") && !tracked.contains(name))
-            .map(str::to_string)
+            .filter_map(|w| {
+                // Only faff-owned names with a numeric id; anything else is left alone.
+                let id: i64 = w.name.strip_prefix("faf-task-")?.parse().ok()?;
+                (!live.contains(&id)).then(|| w.name.clone())
+            })
             .collect()
     }
 
@@ -1746,23 +1764,43 @@ mod tests {
     fn orphaned_workspaces_flags_only_untracked_faff_workspaces() {
         use std::path::Path;
         let app = test_app();
-        // A live task whose workspace is still tracked.
+        // A live task; its workspace is `faf-task-<id>` (the invariant prepare_workspace holds).
         let t = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
+        let tracked = format!("faf-task-{}", t.id.0);
         app.store
-            .set_workspace(t.id, "faf-task-3", Path::new("/nope/3"), "c3", "f3")
+            .set_workspace(t.id, &tracked, Path::new("/nope"), "c", "f")
             .unwrap();
         let mut app = app;
         app.tasks = app.store.list_tasks().unwrap();
 
+        // A ghost id with no task row (well past the allocated id).
+        let ghost = format!("faf-task-{}", t.id.0 + 1000);
         let live = vec![
             // The default workspace is never faff-owned — must be left alone.
             jj::Workspace { name: "default".into(), change_id: "x".into() },
             // Tracked by task `t` — must be kept.
-            jj::Workspace { name: "faf-task-3".into(), change_id: "y".into() },
+            jj::Workspace { name: tracked.clone(), change_id: "y".into() },
             // A faff workspace with no DB row — a ghost to forget.
-            jj::Workspace { name: "faf-task-4".into(), change_id: "z".into() },
+            jj::Workspace { name: ghost.clone(), change_id: "z".into() },
         ];
 
-        assert_eq!(app.orphaned_workspaces(&live), vec!["faf-task-4".to_string()]);
+        assert_eq!(app.orphaned_workspaces(&live), vec![ghost]);
+    }
+
+    #[test]
+    fn orphaned_workspaces_keeps_row_created_before_ws_name_set() {
+        // Regression (concurrent-instance race): `create_task` commits the task row
+        // *before* `jj workspace add` registers the workspace and *before* `set_workspace`
+        // records its `ws_name`. A sibling faff instance whose refresh lands in that window
+        // must NOT forget the in-flight workspace. Keying on row existence (not `ws_name`)
+        // is what makes the reaper safe here.
+        let app = test_app();
+        let t = app.store.create_task("mid-create", 0, Autonomy::Inherit).unwrap();
+        // ws_name deliberately left unset, mirroring the window inside prepare_workspace.
+        let live = vec![jj::Workspace {
+            name: format!("faf-task-{}", t.id.0),
+            change_id: "z".into(),
+        }];
+        assert!(app.orphaned_workspaces(&live).is_empty());
     }
 }
