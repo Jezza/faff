@@ -22,6 +22,21 @@ cargo test              # 115 tests; the workspace integration tests shell out t
 cargo clippy --all-targets
 ```
 
+## Nix
+
+A flake is provided. It builds faff and wraps the binary so `jj` and `wezterm` are on
+`PATH` at runtime (`claude` still comes from your interactive session, since faff spawns it
+inside a WezTerm pane).
+
+```sh
+nix run github:Jezza/faff              # run without installing
+nix profile install github:Jezza/faff  # install into your profile
+nix develop                            # dev shell with the toolchain + jj + wezterm
+```
+
+To install declaratively, add the flake as an input and reference
+`faff.packages.${system}.default`.
+
 ## Usage
 
 From your repo root, inside WezTerm:
