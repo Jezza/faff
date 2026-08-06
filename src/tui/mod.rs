@@ -835,9 +835,7 @@ impl App {
         std::collections::HashMap<String, (String, String)>,
         Option<String>,
     )> {
-        let mut heads: Vec<String> = workspaces.iter().map(|w| w.change_id.clone()).collect();
-        heads.push("@".to_string());
-        let revset = format!("ancestors({}, 25)", heads.join(" | "));
+        let revset = jj::workspace_ancestors_revset(workspaces, 25);
         let mut revs = jj::log(&self.repo, &revset)?;
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
         // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
