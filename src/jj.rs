@@ -129,6 +129,20 @@ pub fn log(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
     Ok(parse_log(&out))
 }
 
+/// The revset for the revision graph: `ancestors(<each workspace's @> | @, limit)`.
+///
+/// Each workspace is named by its `<name>@` working-copy reference, **not** by its
+/// change_id. A change_id that has gone *divergent* (two visible commits share it) is
+/// ambiguous as a bare revset symbol, so `jj log` errors out ("Change ID … is divergent")
+/// and takes the whole graph down with it — every task then falls into the detached list.
+/// `<name>@` names the one commit each workspace actually sits on, so a divergent agent
+/// still resolves to a single node. `@` (your own working copy) is included unconditionally.
+pub fn workspace_ancestors_revset(workspaces: &[Workspace], limit: usize) -> String {
+    let mut heads: Vec<String> = workspaces.iter().map(|w| format!("{}@", w.name)).collect();
+    heads.push("@".to_string());
+    format!("ancestors({}, {})", heads.join(" | "), limit)
+}
+
 /// All workspaces attached to the repo and the change_id each is checked out at.
 pub fn workspace_list(repo: &Path) -> Result<Vec<Workspace>> {
     let out = run_jj(repo, &["workspace", "list", "-T", WS_TEMPLATE])?;
@@ -287,6 +301,28 @@ mod tests {
         assert_eq!(revs[0].parents, revs[1].parents);
     }
 
+    #[test]
+    fn workspace_ancestors_revset_names_workspaces_by_at_ref() {
+        // Heads are `<name>@` refs, never change_ids — so a divergent change can't make the
+        // revset ambiguous. `@` (your own working copy) is always included.
+        let ws = vec![
+            Workspace {
+                name: "default".into(),
+                change_id: "aaaaaaaa".into(),
+            },
+            Workspace {
+                name: "faf-task-1".into(),
+                change_id: "bbbbbbbb".into(),
+            },
+        ];
+        let r = workspace_ancestors_revset(&ws, 25);
+        assert_eq!(r, "ancestors(default@ | faf-task-1@ | @, 25)");
+        assert!(
+            !r.contains("aaaaaaaa") && !r.contains("bbbbbbbb"),
+            "must reference workspaces by name, not by (divergence-prone) change_id"
+        );
+    }
+
     // --- Integration: run real jj against a scratch repo (jj must be installed) ---
 
     fn jj_cfg(dir: &Path) -> std::path::PathBuf {
@@ -420,5 +456,88 @@ mod tests {
         // Setting a description makes `description` read back its first line.
         jj_setup(&repo, &cfg, &["describe", "-r", "@", "-m", "a described change"]);
         assert_eq!(description(&repo, "@").unwrap(), "a described change");
+    }
+
+    #[test]
+    fn integration_divergent_workspace_still_logs() {
+        // Regression: when an agent's workspace change goes *divergent* (two visible commits
+        // share its change_id), a revset that names the workspace by its bare change_id makes
+        // `jj log` error ("Change ID … is divergent"). That error blanked faff's whole graph
+        // and dropped every task into the detached list. `workspace_ancestors_revset` names
+        // each workspace by `<name>@`, which resolves to the single commit it sits on.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+
+        let init = Command::new("jj")
+            .args(["git", "init"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success(), "jj git init failed");
+        // Identity in the repo config so production `run_jj` (no JJ_CONFIG) can rewrite commits.
+        jj_setup(&repo, &cfg, &["config", "set", "--repo", "user.name", "Test"]);
+        jj_setup(
+            &repo,
+            &cfg,
+            &["config", "set", "--repo", "user.email", "test@x.io"],
+        );
+
+        // A base commit, then a task workspace forked off it (faff's fork recipe).
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        jj_setup(&repo, &cfg, &["commit", "-m", "base"]);
+        let ws = tmp.path().join("task-ws");
+        jj_setup(
+            &repo,
+            &cfg,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "faf-task-1",
+                "-r",
+                "@-",
+                ws.to_str().unwrap(),
+            ],
+        );
+
+        // Force the task workspace's change divergent: two concurrent describes of it. The
+        // second, run `--at-operation @-`, doesn't see the first, so the change ends up with
+        // two visible commits (jj resolves the concurrent ops on the next command).
+        let task_cid = resolve_change_id(&repo, "faf-task-1@").unwrap();
+        jj_setup(&repo, &cfg, &["describe", "-r", &task_cid, "-m", "v1"]);
+        jj_setup(
+            &repo,
+            &cfg,
+            &["--at-operation", "@-", "describe", "-r", &task_cid, "-m", "v2"],
+        );
+
+        let workspaces = workspace_list(&repo).unwrap();
+
+        // The old change_id-based revset errors on the divergent change — the regression.
+        let old_revset = format!(
+            "ancestors({}, 25)",
+            workspaces
+                .iter()
+                .map(|w| w.change_id.clone())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        assert!(
+            log(&repo, &old_revset).is_err(),
+            "a bare divergent change_id in the revset must error (this is what broke the graph)"
+        );
+
+        // The `<name>@` revset survives, and the divergent workspace resolves to exactly one
+        // node — not duplicated, not dropped.
+        let revs = log(&repo, &workspace_ancestors_revset(&workspaces, 25))
+            .expect("name@ revset must survive a divergent workspace");
+        let count = revs.iter().filter(|r| r.change_id == task_cid).count();
+        assert_eq!(
+            count, 1,
+            "the divergent workspace resolves to a single graph node"
+        );
     }
 }
