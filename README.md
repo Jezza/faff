@@ -207,6 +207,21 @@ collapse. A merge (a revision with 2+ parents) draws its fork inline on its own 
 ◻  [yuvnmxxo] fork point
 ```
 
+An agent is always a stub hanging off the line it forked from — it never occupies the
+leftmost lane, and never holds a lane open across the commits below it. Because the revset
+is bounded, a line can run off the edge of the loaded window; the leftmost lane is then
+picked up by the next line down, and an agent forked off *that* line opens the lane for it
+with a `╭` corner (nothing above belongs to the new lane) rather than taking it:
+
+```
+◻    [qxyvqrtt] update git dep url     ← the line above ends here (its parent is off-window)
+╭─●  [rzmqpztu] #21 :: Migrate db host calls
+◻    [uzqqxmut] Simplify event publishing
+├─●  [qoypxsox] #15 :: Two-phase plugin startup
+├─○  [tztqkvsx] #9  :: Implement OIDC support
+◻    [pkmzqmnr] deploy time class hashes
+```
+
 Row labels are clipped to the current pane width — and only when they overflow — so they
 re-fit as docking or detaching a session resizes faff.
 
