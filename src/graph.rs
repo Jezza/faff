@@ -19,6 +19,11 @@ pub struct GraphNode {
     pub glyph: char,
     pub lines: Vec<String>,
     pub collapse: bool,
+    /// This node never owns a line: it is a leaf pinned to the line it forked from (a faff
+    /// agent). It always renders as a one-row stub hanging off its parent's lane — opening
+    /// that lane itself when the parent hasn't been laid out yet — instead of claiming a
+    /// lane of its own. Ordinary history leaves this `false` and takes a lane as usual.
+    pub stub: bool,
 }
 
 /// One laid-out row. `gutter` is the graph column; `content` the text to the right
@@ -40,6 +45,7 @@ struct SNode {
     glyph: char,
     lines: Vec<String>,
     parents: Vec<String>,
+    stub: bool,
 }
 
 /// Render nodes into laid-out rows.
@@ -100,6 +106,7 @@ fn splice_collapsed(nodes: &[GraphNode]) -> Vec<SNode> {
                 n.lines.clone()
             },
             parents,
+            stub: n.stub,
         });
     }
     out
@@ -109,6 +116,13 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
     let mut rows = Vec::new();
     // Each lane holds the change_id it is currently flowing toward (a pending parent).
     let mut lanes: Vec<Option<String>> = Vec::new();
+    // Where each node sits in the list, so a stub can tell whether its parent is still to
+    // come (it is, in a child→parent order — unless the parent was spliced out).
+    let pos: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.change_id.as_str(), i))
+        .collect();
 
     // Reserve lane 0 for the working copy's line (the `@` node = HEAD), so ONLY its
     // line ever occupies the leftmost lane. Pre-seeding lane 0 with HEAD's id means a
@@ -120,7 +134,7 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         lanes.push(Some(m.change_id.clone()));
     }
 
-    for n in nodes {
+    for (i, n) in nodes.iter().enumerate() {
         let incoming: Vec<usize> = lanes
             .iter()
             .enumerate()
@@ -143,13 +157,30 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         //     `├─│─●` and trailed a lone `├─╯`).
         // A node left of its parent's lane, or one with several lanes flowing in, is a real
         // merge — left to the general path below.
-        if n.parents.len() == 1
-            && incoming.len() <= 1
-            && let Some(trunk) = lanes
-                .iter()
-                .position(|l| l.as_deref() == Some(n.parents[0].as_str()))
-            && incoming.first().is_none_or(|&j| j > trunk)
-        {
+        //
+        // `trunk` is the lane folded back into, and `born` says that lane starts on this very
+        // row. Normally the trunk lane is already flowing toward the node's parent. The
+        // exception is a `stub` (an agent, which never owns a line) whose parent hasn't been
+        // laid out yet: the loaded window is bounded, so a line can run off its edge, and the
+        // leftmost lane is then freed for the next line down. Without this the agent sitting
+        // above that line's first node would just grab the freed lane and leave its own base
+        // to draw a second column; instead it opens the lane for the base and hangs off it.
+        let (trunk, born) = match n.parents.as_slice() {
+            [p] if incoming.len() <= 1 => {
+                match lanes.iter().position(|l| l.as_deref() == Some(p.as_str())) {
+                    Some(t) if incoming.first().is_none_or(|&j| j > t) => (Some(t), false),
+                    None if n.stub
+                        && incoming.is_empty()
+                        && pos.get(p.as_str()).is_some_and(|&j| j > i) =>
+                    {
+                        (Some(open_lane(&mut lanes, p)), true)
+                    }
+                    _ => (None, false),
+                }
+            }
+            _ => (None, false),
+        };
+        if let Some(trunk) = trunk {
             // The stub lane carrying the node's glyph, always to the right of the trunk so
             // the connector reads left-to-right (`├─●`): reuse the incoming lane when one
             // already flows in, else borrow a free lane right of the trunk.
@@ -172,7 +203,7 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
             // The folded row carries the node's id + first content line; the branch closes
             // on this same row.
             rows.push(GraphRow {
-                gutter: fold_gutter(&lanes, trunk, stub, n.glyph),
+                gutter: fold_gutter(&lanes, trunk, stub, n.glyph, born),
                 content: n.lines[0].clone(),
                 node_index: Some(n.orig),
                 change_id: Some(n.change_id.clone()),
@@ -194,19 +225,8 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
 
         let col = match incoming.first() {
             Some(&c) => c,
-            None => {
-                // Branch head: reuse a freed lane, else append.
-                match lanes.iter().position(|l| l.is_none()) {
-                    Some(s) => {
-                        lanes[s] = Some(n.change_id.clone());
-                        s
-                    }
-                    None => {
-                        lanes.push(Some(n.change_id.clone()));
-                        lanes.len() - 1
-                    }
-                }
-            }
+            // Branch head: reuse a freed lane, else append.
+            None => open_lane(&mut lanes, &n.change_id),
         };
         lanes[col] = Some(n.change_id.clone());
 
@@ -233,16 +253,7 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
                 for p in n.parents.iter().skip(1) {
                     let exists = lanes.iter().any(|l| l.as_deref() == Some(p.as_str()));
                     if !exists {
-                        match lanes.iter().position(|l| l.is_none()) {
-                            Some(s) => {
-                                lanes[s] = Some(p.clone());
-                                opened.push(s);
-                            }
-                            None => {
-                                lanes.push(Some(p.clone()));
-                                opened.push(lanes.len() - 1);
-                            }
-                        }
+                        opened.push(open_lane(&mut lanes, p));
                     }
                 }
             }
@@ -301,6 +312,21 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
 
 fn gutter_width(nlanes: usize) -> usize {
     if nlanes == 0 { 1 } else { 2 * nlanes - 1 }
+}
+
+/// Claim a lane flowing toward `target`: the leftmost freed lane, else a new one on the
+/// right. Returns its index.
+fn open_lane(lanes: &mut Vec<Option<String>>, target: &str) -> usize {
+    match lanes.iter().position(|l| l.is_none()) {
+        Some(j) => {
+            lanes[j] = Some(target.to_string());
+            j
+        }
+        None => {
+            lanes.push(Some(target.to_string()));
+            lanes.len() - 1
+        }
+    }
 }
 
 fn commit_gutter(lanes: &[Option<String>], col: usize, glyph: char, opened: &[usize]) -> String {
@@ -369,12 +395,20 @@ fn merge_link_row(lanes: &[Option<String>], col: usize, merges: &[usize]) -> Str
 
 /// Gutter for a folded branch: `├` on the trunk lane, the node's `glyph` on the (right-of-
 /// trunk) `stub` lane, joined by `─`. One row does the work of a branch row plus its merge,
-/// so an agent anchored to its fork point renders as a single `├─●`.
-fn fold_gutter(lanes: &[Option<String>], trunk: usize, stub: usize, glyph: char) -> String {
+/// so an agent anchored to its fork point renders as a single `├─●`. `born` means the trunk
+/// lane starts on this row — nothing above it belongs to that lane — so the T-junction
+/// becomes a `╭` corner, exactly as it does for the topmost fork into HEAD's own lane.
+fn fold_gutter(
+    lanes: &[Option<String>],
+    trunk: usize,
+    stub: usize,
+    glyph: char,
+    born: bool,
+) -> String {
     let mut cells = vec![' '; gutter_width(lanes.len())];
     for (j, lane) in lanes.iter().enumerate() {
         cells[2 * j] = if j == trunk {
-            '├'
+            if born { '╭' } else { '├' }
         } else if j == stub {
             glyph
         } else if lane.is_some() {
@@ -408,6 +442,14 @@ mod tests {
             glyph,
             lines: lines.iter().map(|s| s.to_string()).collect(),
             collapse: false,
+            stub: false,
+        }
+    }
+
+    fn stub(id: &str, parents: &[&str], glyph: char, lines: &[&str]) -> GraphNode {
+        GraphNode {
+            stub: true,
+            ..node(id, parents, glyph, lines)
         }
     }
 
@@ -605,6 +647,56 @@ mod tests {
             gutters(&render(&nodes)),
             vec!["@", "│ ●", "├─○", "├─●", "├─●", "├─●", "○"],
         );
+    }
+
+    #[test]
+    fn stub_opens_its_parents_lane_when_that_line_starts_beneath_it() {
+        // The loaded window is bounded, so HEAD's line can run off its edge: `top`'s parent
+        // isn't in the set, the leftmost lane is freed, and a *second* line (`b1`…) simply
+        // continues on it. An agent forked off that second line sits above its base, whose
+        // lane doesn't exist yet — being a stub it must OPEN that lane for `b1` and hang off
+        // it (`╭─●`, a corner: nothing above belongs to the new lane) rather than grab the
+        // main lane itself and leave `b1` to draw a second column.
+        let nodes = vec![
+            node("head", &["top"], '@', &["HEAD"]),
+            node("top", &["offwindow"], '◻', &["window edge"]),
+            stub("a21", &["b1"], '●', &["#21 :: migrate db calls"]),
+            node("b1", &["b2"], '◻', &["other line"]),
+            node("b2", &[], '◻', &["base"]),
+        ];
+        let rows = render(&nodes);
+        assert_eq!(gutters(&rows), vec!["@", "◻", "╭─●", "◻", "◻"]);
+        assert_eq!(rows[2].node_index, Some(2));
+    }
+
+    #[test]
+    fn a_non_stub_head_still_takes_the_freed_lane() {
+        // Same shape, but the branch head is ordinary history rather than an agent: it keeps
+        // the old behaviour and takes the freed lane, since only agents are pinned off the
+        // line they fork from.
+        let nodes = vec![
+            node("head", &["top"], '@', &["HEAD"]),
+            node("top", &["offwindow"], '◻', &["window edge"]),
+            node("c", &["b1"], '◻', &["ordinary commit"]),
+            node("b1", &["b2"], '◻', &["other line"]),
+            node("b2", &[], '◻', &["base"]),
+        ];
+        assert_eq!(gutters(&render(&nodes)), vec!["@", "◻", "◻", "◻", "◻"]);
+    }
+
+    #[test]
+    fn stubs_sharing_a_base_that_starts_beneath_them_stack_on_one_lane() {
+        // Two agents off the same not-yet-drawn base: the first opens the base's lane
+        // (`╭─●`), the second finds it already open and folds onto it (`├─○`) — they stay a
+        // single block above their base, two columns wide.
+        let nodes = vec![
+            node("head", &["top"], '@', &["HEAD"]),
+            node("top", &["offwindow"], '◻', &["window edge"]),
+            stub("a15", &["b1"], '●', &["#15 :: rendezvous"]),
+            stub("a9", &["b1"], '○', &["#9 :: oidc"]),
+            node("b1", &[], '◻', &["other line"]),
+        ];
+        assert_eq!(gutters(&render(&nodes)), vec!["@", "◻", "╭─●", "├─○", "◻"]);
     }
 
     #[test]

@@ -40,10 +40,14 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
     revs.sort_by_key(|r| !reaches.get(&r.change_id).copied().unwrap_or(false));
 }
 
-/// Order revisions for the flat lane layout: the trunk — HEAD's first-parent chain — stays
-/// in child→parent order, and every *liftable* fork is moved to sit directly above the
+/// Order revisions for the flat lane layout: the trunk — what the leftmost lane draws —
+/// stays in child→parent order, and every *liftable* fork is moved to sit directly above the
 /// trunk revision it forked from. Each agent then renders as a one-row `├─●` stub anchored
 /// to its fork point, and no lane is ever held open across an unrelated node.
+///
+/// The trunk is HEAD's first-parent chain, *continued past the edge of the loaded window*:
+/// the revset is bounded, so that chain can dead-end on a parent that wasn't loaded, and the
+/// lane it held is then taken over by the next line in the log (see the walk below).
 ///
 /// A **liftable** fork is a single-commit tip whose first parent is a trunk node — i.e. a
 /// faff agent. Those get lifted. A multi-commit side branch (its interior nodes fork off
@@ -74,18 +78,46 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     // result is exactly the pin.
     pin_current_wc_first(revs);
 
-    // Trunk (lane 0): HEAD, then its first parent, then that node's first parent, … while
-    // each is present in the set.
+    // change_id → task id, for the revisions that are faff agents' working copies.
+    let task_id_of = |cid: &str| -> Option<i64> {
+        workspaces
+            .iter()
+            .filter(|w| w.change_id == cid)
+            .find_map(|w| tasks.iter().find(|t| t.ws_name.as_deref() == Some(&w.name)))
+            .map(|t| t.id.0)
+    };
+
+    // The trunk: the revisions drawn on the leftmost lane. It starts at HEAD and follows
+    // first parents while each is in the set — but the loaded window is *bounded*
+    // (`ancestors(…, 25)`), so that chain can run off its edge. The lane is then freed and
+    // the next line in the log simply continues on it, so the trunk resumes there: at the
+    // first revision that isn't on it already, isn't an agent (agents never own the lane —
+    // they are stubs off the line they forked from), and doesn't fork off the trunk (those
+    // are the forks we lift, not the line itself). Repeat until nothing is left to start a
+    // line. Without this the revisions below the cut aren't recognised as trunk, so agents
+    // forked off them never anchor: one takes the lane outright, the next holds a lane open
+    // across the whole block, and the third is pushed out to a `├─│─○` third column.
     let by_id: std::collections::HashMap<&str, &RevInfo> =
         revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
     let mut on_trunk: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cur = Some(head_id.clone());
-    while let Some(id) = cur {
-        if !on_trunk.insert(id.clone()) {
-            break; // cycle guard — never on a DAG
+    loop {
+        while let Some(id) = cur.take() {
+            let Some(r) = by_id.get(id.as_str()) else { break };
+            if !on_trunk.insert(id) {
+                break; // cycle guard — never on a DAG
+            }
+            cur = r.parents.first().cloned();
         }
-        let Some(r) = by_id.get(id.as_str()) else { break };
-        cur = r.parents.first().cloned();
+        let next = revs.iter().find(|r| {
+            !on_trunk.contains(&r.change_id)
+                && task_id_of(&r.change_id).is_none()
+                && !r.parents.first().is_some_and(|p| on_trunk.contains(p))
+        });
+        match next {
+            Some(r) => cur = Some(r.change_id.clone()),
+            None => break,
+        }
     }
     drop(by_id);
 
@@ -121,13 +153,6 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     // stable: an agent no longer jumps position when it becomes active (jj log's recency
     // order did that). change_id breaks ties, keeping the order total and deterministic;
     // a bucketed rev with no faff task (a stray workspace) sorts last.
-    let task_id_of = |cid: &str| -> Option<i64> {
-        workspaces
-            .iter()
-            .filter(|w| w.change_id == cid)
-            .find_map(|w| tasks.iter().find(|t| t.ws_name.as_deref() == Some(&w.name)))
-            .map(|t| t.id.0)
-    };
     for kids in children.values_mut() {
         kids.sort_by(|&a, &b| {
             let (ka, kb) = (task_id_of(&revs[a].change_id), task_id_of(&revs[b].change_id));
@@ -364,12 +389,17 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             glyph
         };
 
+        // An agent is a stub: a leaf pinned to the line it forked from, so the renderer never
+        // lets it own a lane — not even the leftmost one, when the loaded window cuts a line
+        // short and frees it. HEAD is not a stub even when parked on an agent's revision (the
+        // combined node above): its line is the trunk.
         nodes.push(GraphNode {
             change_id: rev.change_id.clone(),
             parents: rev.parents.clone(),
             glyph,
             lines,
             collapse,
+            stub: tid.is_some() && !rev.is_current_wc,
         });
         task_of.push(tid);
     }
@@ -480,6 +510,69 @@ mod tests {
             gutters,
             vec!["@", "◆", "│ ◻", "│ ◻", "├─◻", "◻", "├─○", "◻"],
             "a21 folds to a single ├─○ row directly above tC — not a lane held to a bottom merge"
+        );
+    }
+
+    #[test]
+    fn agents_anchor_below_a_window_cut_in_heads_line() {
+        // Regression, from a real screenshot: `ancestors(…, 25)` is a *bounded* window, so
+        // HEAD's line can run off its edge — here `top`'s parent is outside the set. The
+        // revisions below the cut (`c1`…`c5`) are a second line the renderer draws on that
+        // same freed leftmost lane, and four agents fork off it.
+        //
+        // The trunk used to be only HEAD's first-parent chain, which stops at the cut, so
+        // none of those four were recognised as forks off the line: #21 grabbed the main
+        // lane outright, #15 held a lane open across the whole block below it, and #9 was
+        // shoved out to a third column (`├─│─○`) trailing a lone `├─╯` merge row.
+        //
+        // Now the line is followed past the cut, so every agent is lifted onto its own fork
+        // point and folds to one stub row — #15 and #9 side by side above their shared base.
+        let mut revs = vec![
+            rev("head", &["top"], true, true, ""),
+            rev("top", &["offwindow"], false, false, "window edge"), // parent not in the set
+            rev("a21", &["c1"], false, false, "Migrate db host calls"),
+            rev("a15", &["c4"], false, false, "Two-phase plugin startup"),
+            rev("c1", &["c2"], false, false, "Simplify event publishing"),
+            rev("c2", &["c3"], false, false, "Enforce metadata on init"),
+            rev("c3", &["c4"], false, false, "make local name optional"),
+            rev("a9", &["c4"], false, true, "Implement OIDC support"),
+            rev("c4", &["c5"], false, false, "deploy time class hashes"),
+            rev("a7", &["c5"], false, false, "Convert bridges to JSON"),
+            rev("c5", &[], false, false, "Generate bridge clients"),
+        ];
+        let workspaces: Vec<Workspace> = [("21", "a21"), ("15", "a15"), ("9", "a9"), ("7", "a7")]
+            .iter()
+            .map(|(id, cid)| Workspace {
+                name: format!("faf-task-{id}"),
+                change_id: (*cid).into(),
+            })
+            .collect();
+        let tasks = vec![
+            task(21, "faf-task-21", TaskStatus::Idle),
+            task(15, "faf-task-15", TaskStatus::Idle),
+            task(9, "faf-task-9", TaskStatus::Idle),
+            task(7, "faf-task-7", TaskStatus::Idle),
+        ];
+
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["head", "top", "a21", "c1", "c2", "c3", "a15", "a9", "c4", "a7", "c5"],
+            "every agent is lifted to sit directly above its fork point, on both sides of \
+             the window cut; agents sharing c4 stack newest-id first"
+        );
+
+        let m = build(&revs, &workspaces, &tasks);
+        let gutters: Vec<String> = crate::graph::render(&m.nodes)
+            .iter()
+            .map(|r| r.gutter.clone())
+            .collect();
+        assert_eq!(
+            gutters,
+            vec!["@", "◆", "╭─●", "◻", "◻", "◻", "├─●", "├─○", "◻", "├─●", "◻"],
+            "#21 opens the second line's lane rather than taking it (`╭─●`, nothing above \
+             belongs to that lane); #15 and #9 fold side by side above their shared base"
         );
     }
 
@@ -907,6 +1000,7 @@ mod tests {
             glyph,
             lines: lines.iter().map(|s| s.to_string()).collect(),
             collapse: false,
+            stub: false,
         }
     }
 
@@ -1053,4 +1147,6 @@ mod tests {
         assert_eq!(m.fork_point, Some("c".to_string()));
         assert_eq!(m.nodes[1].glyph, '×', "conflict glyph survives");
     }
+
+
 }
