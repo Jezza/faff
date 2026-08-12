@@ -159,6 +159,25 @@ pub fn workspace_list(repo: &Path) -> Result<Vec<Workspace>> {
         .collect())
 }
 
+/// The revset for faff's fork point: the newest ancestor of `head` (inclusive) that
+/// carries real content — `heads(::<head> ~ (empty() ~ merges()))`. See spec §5.
+///
+/// The carve-out is the whole point. jj's `empty()` means "modifies no files *relative to
+/// its parents*", which includes a merge whose parents were combined cleanly with no extra
+/// edits on top — the usual result of `jj new A B` or a conflict-free rebase merge. Such a
+/// commit is `empty()` yet is emphatically not empty *content*: it is the only revision in
+/// the graph that holds both sides. So we subtract only `empty() ~ merges()` — empty
+/// non-merge commits, the bare fork-points and fresh working copies that are genuine noise.
+///
+/// A plain `~ empty()` doesn't just mislabel such a merge, it breaks the recipe: dropping
+/// the merge leaves *both* its parents as maximal elements, so `heads()` returns two
+/// revisions and [`resolve_change_id`] silently keeps whichever jj lists first. New agents
+/// would then fork from one side of the merge with the other side's work missing from their
+/// base. Keeping the merge in the set makes it the single head, as it should be.
+pub fn fork_point_revset(head: &str) -> String {
+    format!("heads(::{head} ~ (empty() ~ merges()))")
+}
+
 /// Resolve a revset expected to identify a single revision into its change_id.
 pub fn resolve_change_id(repo: &Path, revset: &str) -> Result<String> {
     let out = run_jj(

@@ -181,11 +181,17 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     revs.clone_from_slice(&reordered);
 }
 
-/// The current fork point: the revision new tasks (`n`) branch from — `heads(::@ ~ empty())`,
-/// the newest non-empty ancestor of `@` (including `@` itself). Computed by walking `@`'s
-/// first-parent chain to the first non-empty revision, matching the flat trunk the rest of
-/// the layout assumes. Returns `None` when there is no working copy in the set, or when every
-/// ancestor along the trunk is empty (the fork point is off the loaded window).
+/// The current fork point: the revision new tasks (`n`) branch from — the client-side mirror
+/// of [`crate::jj::fork_point_revset`] over `@`, the newest ancestor of `@` (including `@`
+/// itself) with content. Computed by walking `@`'s first-parent chain to the first such
+/// revision, matching the flat trunk the rest of the layout assumes. Returns `None` when there
+/// is no working copy in the set, or when the whole trunk in the window is empty (the fork
+/// point is off the loaded window).
+///
+/// "With content" must match the revset exactly, or the cyan `◆` would mark a revision `n`
+/// doesn't fork from: a merge is content even when jj reports it `empty()`, since it is the
+/// only revision holding both of its parents' work. So the walk stops on a merge, and never
+/// descends past one into a single side of it.
 pub fn current_fork_point(revs: &[RevInfo]) -> Option<String> {
     let by_id: std::collections::HashMap<&str, &RevInfo> =
         revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
@@ -195,7 +201,7 @@ pub fn current_fork_point(revs: &[RevInfo]) -> Option<String> {
         if !seen.insert(cur.change_id.as_str()) {
             return None; // cycle guard — never on a DAG
         }
-        if !cur.empty {
+        if !cur.empty || cur.parents.len() > 1 {
             return Some(cur.change_id.clone());
         }
         cur = by_id.get(cur.parents.first()?.as_str()).copied()?;
@@ -1089,6 +1095,33 @@ mod tests {
             rev("base", &[], false, false, "base"),
         ];
         assert_eq!(current_fork_point(&revs), Some("wc".to_string()));
+    }
+
+    #[test]
+    fn current_fork_point_stops_at_an_empty_merge() {
+        // A merge that combined its parents cleanly is `empty()` to jj, but it is the only
+        // revision holding both sides — so it IS the fork point, and the walk must not
+        // descend past it into `a` (one side of the merge, missing `b`'s work).
+        let revs = vec![
+            rev("wc", &["m"], true, true, ""),
+            rev("m", &["a", "b"], false, true, "merge a+b"),
+            rev("a", &["base"], false, false, "a"),
+            rev("b", &["base"], false, false, "b"),
+            rev("base", &[], false, false, "base"),
+        ];
+        assert_eq!(current_fork_point(&revs), Some("m".to_string()));
+    }
+
+    #[test]
+    fn current_fork_point_is_an_empty_merge_working_copy_itself() {
+        // `@` itself is the clean merge: it's the fork point, not either parent.
+        let revs = vec![
+            rev("m", &["a", "b"], true, true, "merge a+b"),
+            rev("a", &["base"], false, false, "a"),
+            rev("b", &["base"], false, false, "b"),
+            rev("base", &[], false, false, "base"),
+        ];
+        assert_eq!(current_fork_point(&revs), Some("m".to_string()));
     }
 
     #[test]
