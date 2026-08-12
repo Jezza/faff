@@ -19,33 +19,38 @@ pub struct WorkspaceInfo {
 /// Fork + materialise a task workspace, forking from the nearest revision with real
 /// content (spec §5).
 ///
-/// Fork point = `heads(::@ ~ empty())` — the nearest ancestor of `@` (including `@`
-/// itself) that is non-empty. Then:
+/// Fork point = [`jj::fork_point_revset`] of `@` — the nearest ancestor of `@` (including
+/// `@` itself) that carries content, counting a clean merge as content even though jj calls
+/// it `empty()`. Then:
 /// - if `@` *is* that commit (you have uncommitted content), `jj new` freezes it and
 ///   advances HEAD, and the task forks from the frozen commit;
 /// - if `@` is empty (nothing edited since the last fork), we fork straight from the
 ///   existing content commit and **do not** advance HEAD — so repeatedly creating
 ///   tasks without editing doesn't stack up empty fork-points that clutter the log.
 ///
-/// Either way the fork point is non-empty and already has children, so it's frozen
+/// Either way the fork point has content and already has children, so it's frozen
 /// (staleness-safe). The caller supplies `name`/`path`.
-/// The shared fork-point recipe (spec §5): the change_id of the newest non-empty
-/// ancestor of `@` to base new work on. Used by `create` (task creation) and by
-/// `refresh` (the `r`/`R` re-base).
+/// The shared fork-point recipe (spec §5): the change_id of the newest ancestor of `@`
+/// with content to base new work on. Used by `create` (task creation) and by `refresh`
+/// (the `r`/`R` re-base).
 ///
-/// - `freeze == true` (`n`, `r`): fork point = `heads(::@ ~ empty())`. When `@` *is*
+/// - `freeze == true` (`n`, `r`): fork point = `fork_point_revset("@")`. When `@` *is*
 ///   that commit (you have uncommitted content), `jj new` freezes it and advances HEAD,
 ///   so the returned commit is stable / staleness-safe and your WIP goes to the agent.
-/// - `freeze == false` (`R`): fork point = `heads(::@- ~ empty())` — your parent line,
-///   the newest non-empty ancestor strictly below `@`. Never writes; WIP is excluded.
+/// - `freeze == false` (`R`): fork point = `fork_point_revset("@-")` — your parent line,
+///   the newest ancestor with content strictly below `@`. Never writes; WIP is excluded.
+///
+/// "With content" is [`jj::fork_point_revset`]'s definition, not a plain `~ empty()`: a
+/// merge that combined its parents cleanly is `empty()` to jj but is the only revision
+/// holding both sides, so it is a valid — and unambiguous — fork point. See that function.
 pub fn resolve_fork_point(repo: &Path, freeze: bool) -> Result<String> {
     if !freeze {
-        return jj::resolve_change_id(repo, "heads(::@- ~ empty())")
+        return jj::resolve_change_id(repo, &jj::fork_point_revset("@-"))
             .context("resolving parent fork point");
     }
     let at = jj::resolve_change_id(repo, "@").context("resolving @")?;
     let fork_point =
-        jj::resolve_change_id(repo, "heads(::@ ~ empty())").unwrap_or_else(|_| at.clone());
+        jj::resolve_change_id(repo, &jj::fork_point_revset("@")).unwrap_or_else(|_| at.clone());
     // Only advance HEAD when @ itself carries the content we're forking from.
     if fork_point == at {
         jj::new(repo).context("jj new (advancing HEAD)")?;
@@ -87,7 +92,7 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
 /// current revision `W` — it continues editing that exact commit — while your own `@`
 /// retreats to a fresh empty commit on the fork point from *before* your changes.
 ///
-/// End state, with `P = heads(::@- ~ empty())` (your parent line, the `R` recipe):
+/// End state, with `P = fork_point_revset("@-")` (your parent line, the `R` recipe):
 ///
 /// ```text
 /// ● W   agent @  (your WIP — the agent continues it)
@@ -100,7 +105,7 @@ pub fn create_for_task(repo: &Path, task_id: i64, slug: &str) -> Result<Workspac
 /// Mechanics mirror [`swap`]'s snapshot-then-edits, ordered so **your workspace moves
 /// last** — any failure before that leaves you untouched on `W`:
 /// 1. Snapshot your workspace so `W` captures your uncommitted edits.
-/// 2. Bail if `W` is empty (nothing to hand off), or has no non-empty ancestor to retreat
+/// 2. Bail if `W` is empty (nothing to hand off), or has no ancestor with content to retreat
 ///    onto (no fork point) — neither creates a workspace.
 /// 3. `jj workspace add -r W` makes the agent's working copy an empty child of `W`; a
 ///    `jj edit W` inside it then moves the agent *onto* `W` (the empty child is auto-
@@ -120,7 +125,7 @@ pub fn handoff(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
     if !jj::any_revision(repo, "@ ~ empty()")? {
         bail!("nothing to hand off — your @ has no changes");
     }
-    let fork_point = jj::resolve_change_id(repo, "heads(::@- ~ empty())")
+    let fork_point = jj::resolve_change_id(repo, &jj::fork_point_revset("@-"))
         .context("no fork point before your changes to retreat onto")?;
 
     if let Some(parent) = path.parent() {
@@ -663,6 +668,78 @@ mod tests {
             jj::resolve_change_id(&repo, "@").unwrap(),
             head_before,
             "HEAD @ did not advance (no new empty fork-point)"
+        );
+    }
+
+    // Build a diamond on top of "base" and leave `@` on the merge of its two sides:
+    //
+    //   @    M   merge A+B — `(empty)` to jj, yet the only revision holding both sides
+    //   ├─╮
+    //   │ ○  B
+    //   ○ │  A
+    //   ├─╯
+    //   ○    base
+    //
+    // Returns the merge's change_id. `scratch_repo` leaves `@` empty on top of "base".
+    fn diamond_merge_at(repo: &Path, cfg: &Path) -> String {
+        let base = jj::resolve_change_id(repo, "@-").unwrap();
+        fs::write(repo.join("a.txt"), "a").unwrap();
+        jj(repo, cfg, &["commit", "-m", "SIDEA"]);
+        let a = jj::resolve_change_id(repo, "@-").unwrap();
+        jj(repo, cfg, &["new", &base]);
+        fs::write(repo.join("b.txt"), "b").unwrap();
+        jj(repo, cfg, &["commit", "-m", "SIDEB"]);
+        let b = jj::resolve_change_id(repo, "@-").unwrap();
+        jj(repo, cfg, &["new", &a, &b, "-m", "MERGE"]);
+        let merge = jj::resolve_change_id(repo, "@").unwrap();
+        // Precondition: jj really does call this merge empty — that's the whole point.
+        assert!(
+            !jj::any_revision(repo, "@ ~ empty()").unwrap(),
+            "the merge should be jj-`empty()` for this test to mean anything"
+        );
+        merge
+    }
+
+    #[test]
+    fn integration_fork_point_is_an_empty_merge_at_the_working_copy() {
+        // `@` is a clean merge. It is `empty()` to jj but holds both sides, so it must be
+        // the fork point — and, being `@`, HEAD advances to freeze it (the `@`-has-content
+        // path). Subtracting a plain `empty()` instead would leave BOTH merge parents as
+        // heads and silently fork from whichever jj listed first, losing the other side.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let merge = diamond_merge_at(&repo, &cfg);
+
+        let info = create(&repo, "faf-task-1", &tmp.path().join("ws/1")).unwrap();
+
+        assert_eq!(info.fork_point, merge, "the merge itself is the fork point");
+        assert_ne!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            merge,
+            "HEAD @ advanced off the merge, freezing it"
+        );
+        // The agent's base carries both sides of the merge.
+        let ws = tmp.path().join("ws/1");
+        assert!(ws.join("a.txt").exists() && ws.join("b.txt").exists());
+    }
+
+    #[test]
+    fn integration_fork_point_is_an_empty_merge_below_the_working_copy() {
+        // Same diamond, but `@` has moved on to a fresh empty child of the merge. Both
+        // recipes (`freeze` = `n`/`r`, and `!freeze` = `R`) must land on the merge: it's the
+        // newest ancestor with content either way, and HEAD must NOT advance (`@` isn't it).
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let merge = diamond_merge_at(&repo, &cfg);
+        jj(&repo, &cfg, &["new"]); // @ = empty child of the merge
+        let head_before = jj::resolve_change_id(&repo, "@").unwrap();
+
+        assert_eq!(resolve_fork_point(&repo, true).unwrap(), merge, "n/r recipe");
+        assert_eq!(resolve_fork_point(&repo, false).unwrap(), merge, "R recipe");
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            head_before,
+            "HEAD @ did not advance (the merge below it is already frozen)"
         );
     }
 

@@ -72,9 +72,15 @@ padded to 8 columns with the unique prefix highlighted.
 
 `n`:
 
-1. `jj workspace add` at the newest non-empty ancestor of `@`. If `@` is that revision,
-   `jj new` runs first, advancing your working copy onto a fresh empty commit. Uncommitted
-   work is included in the fork.
+1. `jj workspace add` at the newest ancestor of `@` with content
+   (`heads(::@ ~ (empty() ~ merges()))`). If `@` is that revision, `jj new` runs first,
+   advancing your working copy onto a fresh empty commit. Uncommitted work is included in
+   the fork.
+
+   A merge counts as content even though jj reports it `(empty)`: a merge that combined its
+   parents cleanly modifies no files *relative to those parents*, but it is the only
+   revision holding both sides, so it's exactly what an agent should fork from. Only empty
+   *non-merge* commits — bare fork-points, fresh working copies — are skipped as noise.
 2. Copies `~/.claude/projects/<HEAD-key>/memory/` and `MEMORY.md` to the new workspace's
    project key.
 3. Writes `<workspace>/.claude/settings.local.json` with hooks that call
@@ -95,8 +101,8 @@ add or pane spawn rolls the whole thing back.
 `N` (Shift + n) hands your in-progress work to an agent. Where `n` forks *beside* your work
 and leaves you on it, `N` gives the work *away*: the agent takes over your current revision
 `W` — it continues editing that exact commit — and your own `@` retreats to a fresh empty
-commit on the fork point from *before* your changes (`heads(::@- ~ empty())`, faff's `R`
-recipe). The end result:
+commit on the fork point from *before* your changes (`heads(::@- ~ (empty() ~ merges()))`,
+faff's `R` recipe). The end result:
 
 ```
 ● W   agent @  (your WIP — the agent continues it)
@@ -141,7 +147,8 @@ snapshot on its own. `s` does this for you before a swap, too.
 
 Where `s` keeps an agent fresh by *adopting its work onto your line*, `r` keeps it fresh in
 place: it re-bases a running agent forward without moving anything into your repo. faff
-computes the new base — the same fork-point recipe `n` uses, `heads(::@ ~ empty())` — and
+computes the new base — the same fork-point recipe `n` uses,
+`heads(::@ ~ (empty() ~ merges()))` — and
 **injects a prompt into the agent's pane** telling it to run `jj rebase -b @ -d <base>` and
 carry on. faff never runs the rebase itself; the agent does, and resolves any conflicts. If
 the agent is mid-turn, Claude Code queues the prompt; faff keeps no queue of its own.
@@ -193,7 +200,8 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
   `⚙` working / `🔔` needs you / `✓` review-ready
 - `◻` ordinary history, or another workspace's working copy
 - `◆` the current fork point — drawn cyan — the revision new agents branch from
-  (`heads(::@ ~ empty())`); when it coincides with your working copy the `@` itself turns cyan
+  (`heads(::@ ~ (empty() ~ merges()))`); when it coincides with your working copy the `@`
+  itself turns cyan
 - `×` a conflict
 
 Empty description-less single-parent commits collapse out. Merges and conflicts never
