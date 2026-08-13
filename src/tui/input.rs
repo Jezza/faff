@@ -32,6 +32,13 @@ pub enum Action {
     /// the end result of its current revision. faff injects the prompt; the agent runs
     /// `jj describe` itself.
     Describe,
+    /// `a`: toggle the selected agent's revision into/out of the merge train — the set of
+    /// finished revisions faff drains into your workspace one at a time (`jj new` per
+    /// revision, rebasing the rest onto the growing tip). See `tui::train`.
+    Accept,
+    /// `A` (Shift+a): abort the merge train — dequeue everything still pending. Revisions
+    /// already taken over stay; nothing is rolled back.
+    AbortTrain,
     None,
 }
 
@@ -51,6 +58,8 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('r') => Action::Rebase,
         KeyCode::Char('R') => Action::RebaseParent,
         KeyCode::Char('d') => Action::Describe,
+        KeyCode::Char('a') => Action::Accept,
+        KeyCode::Char('A') => Action::AbortTrain,
         _ => Action::None,
     }
 }
@@ -86,6 +95,8 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('r'))), Action::Rebase);
         assert_eq!(map_key(k(KeyCode::Char('R'))), Action::RebaseParent);
         assert_eq!(map_key(k(KeyCode::Char('d'))), Action::Describe);
+        assert_eq!(map_key(k(KeyCode::Char('a'))), Action::Accept);
+        assert_eq!(map_key(k(KeyCode::Char('A'))), Action::AbortTrain);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }

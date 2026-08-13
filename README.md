@@ -4,7 +4,9 @@ A TUI for running several Claude Code agents in parallel on one repo. Each task 
 own [jj](https://jj-vcs.github.io/jj/) workspace forked off your current work, and its own
 `claude` running in a WezTerm pane.
 
-faff does not review, rebase, or merge. Integration is yours, in your own jj.
+By default faff does not review, rebase, or merge — integration is yours, in your own jj.
+The one exception is the opt-in *merge train* (`a`): it drains a set of finished revisions
+into your workspace for you, one at a time. Everything else stays hands-off.
 
 ## Requirements
 
@@ -42,6 +44,8 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `r` | refresh: tell the agent to rebase onto the latest fork point (freezes your WIP first) |
 | `R` | refresh onto your parent line instead (read-only; your WIP excluded) |
 | `d` | describe: tell the agent to set a short 4-7 word jj description of the revision's end result |
+| `a` | accept: toggle the selected revision into/out of the merge train (drained into your `@` one at a time) |
+| `A` | abort the merge train: dequeue everything still pending (already-merged revisions stay) |
 | `x` | remove the selected task (keeps its revision as history) |
 | `X` | remove the selected task *and* abandon its revision (discards the work) |
 | `q` | quit |
@@ -61,7 +65,17 @@ revisions                                            │ ┃   from postcard to 
 ── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
 · #5 Add OAuth login ✓                               │ ┃
                                                        ┃ >
- [n]ew [N]handoff [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   ready ┃
+ [n]ew [N]handoff [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [a]ccept [A]abort [x]remove [X]remove+drop [q]uit   ready ┃
+```
+
+When the merge train is non-empty a panel appears below the hint bar, one row per queued
+revision with its current stage:
+
+```
+─ merge train ────────────────────────────────────────────
+ #7   Convert bridges to JSON              · ready
+ #8   Fix flaky store tests                ✎ describing
+ #9   Two-phase plugin startup             ⚙ rebasing
 ```
 
 `┃` is the WezTerm pane split; faff only draws the left side. The header bar is reverse
@@ -172,6 +186,45 @@ confirmation (a describe mid-turn is premature, and the prompt is disruptive), a
 `d` sends it. It needs a live pane and a task that already has a prompt of its own (otherwise
 the injected prompt would be captured as the first prompt, exactly as with `r`).
 
+### Accepting into the merge train (`a` / `A`)
+
+`a` marks the selected agent's revision to be *accepted* — integrated into your own
+workspace. Where `s` and `r` keep agents fresh, `a` is the one action that pulls their work
+back into your `@`. It's a *set*, not a rigid pipeline: press `a` on several finished tasks
+and faff drains them into your line one at a time.
+
+Accepting needs a clear landing spot — an empty, description-less `@` (commit or hand off
+your own WIP first). `a` refuses a revision with nothing to merge, and a task without a live
+pane or its own first prompt. Press `a` again on a queued task to drop it back out; `A`
+aborts the whole train (revisions already taken over stay; nothing is rolled back).
+
+Each tick, for the set:
+
+1. The revision closest to ready — idle, sitting on the current tip, described — is **taken
+   over**: faff snapshots the agent, then runs `jj new <agent_rev>` in your workspace, so
+   your `@` becomes a fresh empty child of it. That empty `@` is the landing spot for the
+   next one. The agent is then retired (like `x`; the revision is now integrated, so it's
+   kept, not abandoned).
+2. If the front revision lacks a description, faff **injects the `d` prompt** and waits for
+   it (a merge without a summary is premature).
+3. After each take-over the tip moves, so every remaining member is **asked to rebase onto
+   the new tip** — the same agent-side rebase as `r` (faff injects `jj rebase`; the agent
+   runs it). Whichever lands cleanly and idles first is accepted next (ready-first), so a
+   slow task never blocks a quick one.
+
+faff never rebases or resolves conflicts in your workspace — that all happens in the agents'
+workspaces, exactly as with `r`. Your `@` only ever *takes over* an already-clean revision.
+Because `a` is an explicit "merge this", faff sequences on the agent rather than second-guessing
+it: a **working** agent is waited on (its revision isn't settled yet); once its turn is over —
+idle *or* needs-input — the train drives it (describe, rebase, take over). It only *drops* a
+member it genuinely can't merge: a **conflicted** revision, an **empty** one, or a task whose
+workspace has vanished — each left as an ordinary task for you to handle by hand, while the
+rest carry on. The train is in-memory: quit mid-drain and the revisions already taken over
+persist in jj, but the pending set is forgotten.
+
+The panel below the hint bar shows each member and its stage — `rebasing`, `describing`,
+`ready`, `merging`, or `resolving conflict` — updated every refresh.
+
 ### Removing a task
 
 `x` kills the pane, forgets the workspace, deletes its directory, and drops the row (no
@@ -253,7 +306,7 @@ Hooks injected per workspace:
 |---|---|
 | `UserPromptSubmit` | status → working; first prompt captured |
 | `Stop` | status → idle |
-| `Notification` | status → needs input |
+| `Notification` | needs input — but only if the agent was *working* (a permission prompt); a notification while already idle is Claude Code's ~60s "waiting for your input" notice and is ignored, so a finished agent isn't stuck showing 🔔 |
 | `PostToolUse` | appends an activity row; clears a stale needs-input |
 | `SessionStart` | records the claude session id |
 
@@ -273,9 +326,10 @@ scheme.
 | `store` | SQLite (tasks, activity, config) |
 | `graph` | DAG to text lanes, multi-line nodes, collapsing |
 | `jj` | `jj log`/`workspace list` via templates; `edit`/`snapshot` per workspace |
-| `workspace` | fork, memory seed, hook injection, trust, teardown, swap, snapshot |
+| `workspace` | fork, memory seed, hook injection, trust, teardown, swap, snapshot, take-over |
 | `wezterm` | `wezterm cli` argv, exec, list parsing |
 | `events` | event enum and Unix-socket transport |
 | `scheduler` | applies events to the store |
 | `cli` | argument parsing and the `report-event` subcommand |
 | `tui` | ratatui app: state, event loop, rendering, actions |
+| `tui::train` | the merge train: accepted-revision set, per-member stage, membership ops |

@@ -166,6 +166,14 @@ pub enum Refresh {
 /// would be a no-op), mirroring how `swap` bails when there's nothing to trade.
 pub fn refresh(repo: &Path, ws_name: &str, freeze: bool) -> Result<Refresh> {
     let base = resolve_fork_point(repo, freeze)?;
+    refresh_onto(repo, ws_name, &base)
+}
+
+/// Like [`refresh`], but onto an explicit `base` rather than the computed fork point — and
+/// without `freeze`'s side effect of advancing HEAD. The merge train uses this to rebase
+/// every remaining member onto the revision it just took over (the new tip), so the whole
+/// set stays a single line as it drains.
+pub fn refresh_onto(repo: &Path, ws_name: &str, base: &str) -> Result<Refresh> {
     let agent_head = jj::workspace_list(repo)?
         .into_iter()
         .find(|w| w.name == ws_name)
@@ -180,7 +188,30 @@ pub fn refresh(repo: &Path, ws_name: &str, freeze: bool) -> Result<Refresh> {
         "Your task's base has moved. Run: jj rebase -b @ -d {base} — \
          then resolve any conflicts."
     );
-    Ok(Refresh::Rebase { base, prompt })
+    Ok(Refresh::Rebase {
+        base: base.to_string(),
+        prompt,
+    })
+}
+
+/// Take an agent's finished revision over into the main (default) workspace — the merge
+/// train's `a`. Snapshots the agent workspace first (an agent that never ran a jj command
+/// still has its edits captured, exactly as `swap`/`handoff` do), resolves its live head,
+/// then runs `jj new <head>` in the default workspace so your `@` becomes a fresh empty
+/// child of that revision — the landing spot for the next one. Returns the head taken over.
+///
+/// This is the one place faff integrates an agent's work itself. Because `<head>` ends up
+/// in `::@`, the caller's [`teardown`] leaves it in place (its `(fork..head) ~ ::@` set is
+/// empty) rather than abandoning it — the work is kept, the workspace is retired.
+pub fn take_over(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
+    jj::snapshot_in(ws_path).context("snapshotting the agent workspace")?;
+    let head = jj::workspace_list(repo)?
+        .into_iter()
+        .find(|w| w.name == ws_name)
+        .map(|w| w.change_id)
+        .with_context(|| format!("workspace {ws_name} not found"))?;
+    jj::new_at(repo, &head).with_context(|| format!("jj new {head} (taking over {ws_name})"))?;
+    Ok(head)
 }
 
 /// Retire a task workspace: forget it, delete its directory, and abandon its commits
@@ -1105,6 +1136,79 @@ mod tests {
             }
             other => panic!("expected Rebase, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refresh_onto_uses_explicit_base_without_advancing_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let ws_path = tmp.path().join("ws").join("0001");
+        let info = create(&repo, "faf-task-1", &ws_path).unwrap();
+
+        // Onto its own current base: no-op.
+        assert_eq!(
+            refresh_onto(&repo, &info.name, &info.fork_point).unwrap(),
+            Refresh::AlreadyFresh
+        );
+
+        // Land a second content commit and target it as an explicit base — the agent
+        // (still on the old base) must be told to rebase onto exactly that revision.
+        fs::write(repo.join("tip.txt"), "tip").unwrap();
+        jj(&repo, &cfg, &["commit", "-m", "tip"]);
+        let tip = jj::resolve_change_id(&repo, "@-").unwrap();
+        let at_before = jj::resolve_change_id(&repo, "@").unwrap();
+
+        match refresh_onto(&repo, &info.name, &tip).unwrap() {
+            Refresh::Rebase { base, prompt } => {
+                assert_eq!(base, tip);
+                assert!(prompt.contains(&format!("jj rebase -b @ -d {tip}")));
+            }
+            other => panic!("expected Rebase, got {other:?}"),
+        }
+        // Unlike the `freeze` recipe, refresh_onto never advances your @ as a side effect.
+        assert_eq!(jj::resolve_change_id(&repo, "@").unwrap(), at_before);
+    }
+
+    #[test]
+    fn integration_take_over_lands_agent_revision_then_teardown_keeps_it() {
+        // The merge-train core: `a` snapshots the agent, `jj new`s its revision onto your
+        // @, and the follow-up teardown keeps the now-integrated work.
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let ws_path = tmp.path().join("ws").join("0007");
+        let info = create(&repo, "faf-task-7", &ws_path).unwrap();
+
+        // The agent edits a file but never runs jj (no snapshot of its own).
+        fs::write(ws_path.join("agent.txt"), "work").unwrap();
+
+        let head = take_over(&repo, &info.name, &ws_path).unwrap();
+
+        // @ is a fresh empty commit sitting directly on the taken-over revision, and the
+        // agent's (snapshotted) work has materialised in the default workspace.
+        assert!(
+            !jj::any_revision(&repo, "@ ~ empty()").unwrap(),
+            "@ is empty after the take-over"
+        );
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@-").unwrap(),
+            head,
+            "@ sits on the taken-over revision"
+        );
+        assert!(
+            repo.join("agent.txt").exists(),
+            "agent work materialised (proves the pre-take-over snapshot + jj new)"
+        );
+
+        // Retiring the agent afterwards must keep the revision — it's now in ::@.
+        teardown(&repo, &info.name, &ws_path, &info.fork_point).unwrap();
+        assert!(
+            jj::any_revision(&repo, &head).unwrap(),
+            "taken-over revision preserved by teardown"
+        );
+        assert!(
+            repo.join("agent.txt").exists(),
+            "the integrated work is still present after teardown"
+        );
     }
 
     #[test]
