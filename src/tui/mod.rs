@@ -6,6 +6,7 @@
 mod input;
 mod model;
 mod session;
+mod train;
 
 use crate::domain::{Autonomy, Task, TaskId, TaskStatus, truncate_first_line};
 use crate::graph::{self, GraphRow};
@@ -35,6 +36,30 @@ const ID_W: usize = 8;
 /// itself — the agent, which holds the live working copy, does.
 const DESCRIBE_PROMPT: &str = "Set a short description of what this revision accomplishes. \
      Run: jj describe -m \"<summary>\" where <summary> is a 4-7 word description of the end result.";
+
+/// Cap on prompt injections a single merge-train tick will make. `wezterm::send_text` blocks
+/// the event loop (~150ms each), so a large fan-out of rebase prompts is spread over ticks
+/// to keep the UI responsive. Merges are separate and always at most one per tick.
+const MAX_MERGE_INJECTIONS_PER_TICK: usize = 4;
+
+/// Live per-member facts gathered once per merge-train tick, so the decision logic reads
+/// them instead of re-shelling to jj. `empty`/`conflict` are consumed during the drop pass
+/// and don't survive into the struct.
+struct MergeFacts {
+    id: TaskId,
+    name: String,
+    /// The agent's turn is over — idle *or* needs-input — so its revision is settled and the
+    /// train can act on it. `accept` is an explicit "merge this", so faff sequences on the
+    /// agent (wait while it's `working`, proceed once it isn't) rather than ejecting on a
+    /// status heuristic. Only `working` blocks a member from progressing.
+    stable: bool,
+    on_tip: bool,
+    described: bool,
+    /// The revision still carries conflicts (only reached while the agent is working — a
+    /// settled conflicted member is dropped before it becomes a fact).
+    conflict: bool,
+    seq: u64,
+}
 
 /// Entry point for the `Tui` command.
 pub fn run(repo: Option<PathBuf>) -> Result<()> {
@@ -135,6 +160,9 @@ struct App {
     /// Set to a freshly-created task's id (by `n`/`N`) so the next `refresh` lands the
     /// selection on that new row instead of preserving the prior one. Consumed on use.
     pending_select: Option<TaskId>,
+    /// The merge train: revisions marked with `a` to be drained into your workspace one at
+    /// a time. Advanced each refresh tick by `tick_merge_train`. See `tui::train`.
+    merge_train: train::Train,
 }
 
 impl App {
@@ -173,6 +201,7 @@ impl App {
             pending_rebase: None,
             pending_describe: None,
             pending_select: None,
+            merge_train: train::Train::default(),
         };
         app.refresh();
         Ok(app)
@@ -198,6 +227,9 @@ impl App {
             let elapsed = self.last_refresh.elapsed();
             if elapsed >= idle || (self.pending_refresh && elapsed >= min_gap) {
                 self.refresh();
+                // Advance the merge train on the freshly reconciled task state. Runs on the
+                // refresh cadence so it never adds subprocess churn beyond the throttle.
+                self.tick_merge_train();
             }
         }
         Ok(())
@@ -264,6 +296,8 @@ impl App {
             Action::Rebase => self.rebase_selected(true),
             Action::RebaseParent => self.rebase_selected(false),
             Action::Describe => self.describe_selected(),
+            Action::Accept => self.accept_selected(),
+            Action::AbortTrain => self.abort_train(),
             Action::None => {}
         }
     }
@@ -462,6 +496,23 @@ impl App {
         let Some(t) = self.selected_task() else {
             return;
         };
+        let id = t.id;
+        self.remove_task(id, discard_revision);
+        self.status = if discard_revision {
+            format!("removed #{} and discarded its revision", id.0)
+        } else {
+            format!("removed #{}", id.0)
+        };
+        self.refresh();
+    }
+
+    /// Tear a task down by id: undock and kill its pane, retire its workspace (abandoning
+    /// its revision only when `discard_revision`), drop the row, and drop it from the merge
+    /// train. Sets no status and does not refresh — the caller owns both.
+    fn remove_task(&mut self, id: TaskId, discard_revision: bool) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
         if let Some(p) = t.pane_id {
             if self.open_pane == Some(p) {
                 self.open_pane = None;
@@ -477,13 +528,8 @@ impl App {
                 workspace::teardown(&self.repo, &name, &path, &fork)
             };
         }
-        let _ = self.store.delete_task(t.id);
-        self.status = if discard_revision {
-            format!("removed #{} and discarded its revision", t.id.0)
-        } else {
-            format!("removed #{}", t.id.0)
-        };
-        self.refresh();
+        let _ = self.store.delete_task(id);
+        self.merge_train.remove(id);
     }
 
     /// `s`: swap the default workspace's `@` with the selected agent's revision (a
@@ -655,6 +701,287 @@ impl App {
         match wezterm::send_text(pane, DESCRIBE_PROMPT) {
             Ok(()) => self.status = format!("sent describe to #{}", id.0),
             Err(e) => self.status = format!("describe send failed: {e}"),
+        }
+        self.refresh();
+    }
+
+    // ---- merge train (`a` / `A`) ----
+
+    /// `a`: toggle the selected agent's revision into/out of the merge train. Rejects a task
+    /// with nothing to merge or no live pane, refuses before the agent's own first prompt
+    /// (the train may inject a describe prompt, which would otherwise be captured as the
+    /// title — same guard as `d`/`r`), and refuses to *start* a train while your own `@`
+    /// still holds work: the train lands revisions onto an empty, description-less `@`.
+    fn accept_selected(&mut self) {
+        let Some(t) = self.selected_task() else {
+            return;
+        };
+        // Already queued → toggle it back out.
+        if self.merge_train.contains(t.id) {
+            self.merge_train.remove(t.id);
+            self.status = format!("#{} removed from the merge train", t.id.0);
+            return;
+        }
+        let Some(name) = t.ws_name.clone() else {
+            self.status = "no workspace to accept for this task".to_string();
+            return;
+        };
+        if t.pane_id.is_none() {
+            self.status = format!("no live pane to drive #{} through the merge train", t.id.0);
+            return;
+        }
+        if t.prompt.is_empty() {
+            self.status = "send the task its first prompt before accepting".to_string();
+            return;
+        }
+        // Nothing to merge if the agent's revision is empty.
+        if !jj::any_revision(&self.repo, &format!("{name}@ ~ empty()")).unwrap_or(false) {
+            self.status = format!("#{} has no content to merge", t.id.0);
+            return;
+        }
+        // Starting a train needs a clear `@` to land the first revision onto.
+        if self.merge_train.is_empty() && !self.at_is_clear() {
+            self.status =
+                "your @ has content — commit or hand it off before accepting".to_string();
+            return;
+        }
+        self.merge_train.add(t.id);
+        self.status = format!("#{} accepted into the merge train", t.id.0);
+    }
+
+    /// `A`: abort the merge train — dequeue everything still pending. Revisions already
+    /// taken over stay merged; nothing is rolled back.
+    fn abort_train(&mut self) {
+        if self.merge_train.is_empty() {
+            self.status = "no merge train to abort".to_string();
+            return;
+        }
+        let n = self.merge_train.len();
+        self.merge_train.clear();
+        self.status = format!("merge train aborted — {n} dequeued");
+    }
+
+    /// Whether your `@` is an empty, description-less commit — the landing spot the train
+    /// needs. On a jj error it reports "not clear" (never merge onto an unknown `@`).
+    fn at_is_clear(&self) -> bool {
+        let empty = !jj::any_revision(&self.repo, "@ ~ empty()").unwrap_or(true);
+        let described = !jj::description(&self.repo, "@").unwrap_or_default().is_empty();
+        empty && !described
+    }
+
+    fn member_cooling(&self, id: TaskId, now: Instant) -> bool {
+        self.merge_train
+            .members
+            .iter()
+            .find(|m| m.task == id)
+            .map(|m| m.cooling(now))
+            .unwrap_or(false)
+    }
+
+    /// Advance the merge train by at most one integration step (called each refresh tick).
+    ///
+    /// Each tick: drop members faff genuinely can't merge (conflicted, empty, or vanished);
+    /// recompute every survivor's display stage; then, if `@` is a clear landing spot, take
+    /// over one ready revision (`jj new`). If none is ready, nudge work forward concurrently
+    /// — describe the earliest on-tip member that still lacks a description, and ask off-tip
+    /// members to rebase onto the tip (the ready-first fan-out; injections are capped per
+    /// tick so `send_text` never freezes the UI for long). A `working` member is simply
+    /// waited on — never ejected — since `accept` is an explicit request to merge it.
+    fn tick_merge_train(&mut self) {
+        if self.merge_train.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.merge_train.note.clear();
+
+        // The tip the set lands on: the newest non-empty ancestor of @ (which advances as
+        // revisions are taken over). A transient jj error just defers to the next tick.
+        let Ok(tip) = jj::resolve_change_id(&self.repo, "heads(::@ ~ empty())") else {
+            return;
+        };
+
+        // 1. Gather live facts, dropping members that can't be cleanly accepted.
+        let mut facts: Vec<MergeFacts> = Vec::new();
+        let member_ids: Vec<TaskId> = self.merge_train.members.iter().map(|m| m.task).collect();
+        for id in member_ids {
+            let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+                self.merge_train.remove(id); // task vanished
+                continue;
+            };
+            let Some(name) = t.ws_name.clone() else {
+                self.merge_train.remove(id);
+                continue;
+            };
+            let info = jj::log(&self.repo, &format!("{name}@"))
+                .ok()
+                .and_then(|v| v.into_iter().next());
+            let (empty, conflict, described) = match &info {
+                Some(r) => (r.empty, r.conflict, !r.description.is_empty()),
+                None => (false, false, false),
+            };
+            // The agent's turn is over (not `working`) → its revision is settled. A working
+            // agent is waited on, not dropped.
+            let stable = t.status != TaskStatus::Working;
+            // A settled-but-conflicted revision, or a settled one gone empty, genuinely
+            // can't merge — drop it (leaving it as an ordinary task to handle by hand).
+            if stable && conflict {
+                self.merge_train.remove(id);
+                self.status = format!("#{} has conflicts — dropped from the merge train", id.0);
+                continue;
+            }
+            if stable && empty {
+                self.merge_train.remove(id);
+                self.status = format!("#{} has no content to merge — dropped", id.0);
+                continue;
+            }
+            let on_tip =
+                jj::any_revision(&self.repo, &format!("{tip} & ::({name}@)")).unwrap_or(false);
+            let seq = self
+                .merge_train
+                .members
+                .iter()
+                .find(|m| m.task == id)
+                .map(|m| m.seq)
+                .unwrap_or(0);
+            facts.push(MergeFacts {
+                id,
+                name,
+                stable,
+                on_tip,
+                described,
+                conflict,
+                seq,
+            });
+        }
+        if facts.is_empty() {
+            return;
+        }
+
+        // 2. Recompute each survivor's display stage. A settled member is labelled by where it
+        //    sits in the pipeline; a working one by whatever prompt faff last handed it (so an
+        //    agent still on its own task reads "working", not "describing").
+        for f in &facts {
+            let last = self
+                .merge_train
+                .members
+                .iter()
+                .find(|m| m.task == f.id)
+                .and_then(|m| m.last_inject);
+            let stage = if f.conflict {
+                train::Stage::Resolving
+            } else if !f.stable {
+                match last {
+                    Some(train::Injected::Rebase) => train::Stage::Rebasing,
+                    Some(train::Injected::Describe) => train::Stage::Describing,
+                    None => train::Stage::Working,
+                }
+            } else if !f.on_tip {
+                train::Stage::Rebasing
+            } else if !f.described {
+                train::Stage::Describing
+            } else {
+                train::Stage::Ready
+            };
+            if let Some(m) = self.merge_train.member_mut(f.id) {
+                m.stage = stage;
+            }
+        }
+
+        // 3. The landing spot must be a clear `@` — never merge onto your own WIP.
+        if !self.at_is_clear() {
+            self.merge_train.note = "paused — your @ has content; clear it to resume".to_string();
+            return;
+        }
+
+        // 4. Take over one ready revision (settled, on the tip, described), earliest accepted.
+        if let Some(f) = facts
+            .iter()
+            .filter(|f| f.stable && f.on_tip && f.described)
+            .min_by_key(|f| f.seq)
+        {
+            let id = f.id;
+            if let Some(m) = self.merge_train.member_mut(id) {
+                m.stage = train::Stage::Merging;
+            }
+            self.merge_train_take_over(id);
+            return; // state changed under us; the next tick continues the drain
+        }
+
+        // 5. Not merging this tick — nudge work forward concurrently (capped injections).
+        let mut sent = 0usize;
+        // (a) Describe the earliest on-tip settled member that still lacks a description.
+        if let Some(f) = facts
+            .iter()
+            .filter(|f| f.stable && f.on_tip && !f.described)
+            .min_by_key(|f| f.seq)
+        {
+            let id = f.id;
+            if !self.member_cooling(id, now) {
+                self.merge_train_inject(
+                    id,
+                    train::Injected::Describe,
+                    DESCRIBE_PROMPT.to_string(),
+                    now,
+                );
+                sent += 1;
+            }
+        }
+        // (b) Ask off-tip settled members to rebase onto the tip (the ready-first fan-out).
+        let mut off_tip: Vec<&MergeFacts> = facts.iter().filter(|f| f.stable && !f.on_tip).collect();
+        off_tip.sort_by_key(|f| f.seq);
+        for f in off_tip {
+            if sent >= MAX_MERGE_INJECTIONS_PER_TICK {
+                break;
+            }
+            let id = f.id;
+            if self.member_cooling(id, now) {
+                continue;
+            }
+            if let Ok(workspace::Refresh::Rebase { prompt, .. }) =
+                workspace::refresh_onto(&self.repo, &f.name, &tip)
+            {
+                self.merge_train_inject(id, train::Injected::Rebase, prompt, now);
+                sent += 1;
+            }
+        }
+    }
+
+    /// Inject `prompt` into a member's agent pane, record what was sent (for the panel), and
+    /// start its cooldown (see `train::INJECT_COOLDOWN`). Best-effort: a send failure is left
+    /// for the next tick.
+    fn merge_train_inject(
+        &mut self,
+        id: TaskId,
+        kind: train::Injected,
+        prompt: String,
+        now: Instant,
+    ) {
+        let Some(pane) = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.pane_id) else {
+            return;
+        };
+        let _ = wezterm::send_text(pane, &prompt);
+        if let Some(m) = self.merge_train.member_mut(id) {
+            m.cooldown_until = Some(now + train::INJECT_COOLDOWN);
+            m.last_inject = Some(kind);
+        }
+    }
+
+    /// Take a ready member's revision over into your workspace (`jj new <head>`) and retire
+    /// its agent. On success the revision is now integrated into `::@`, so `teardown` keeps
+    /// it. On failure the member stays in the train and is retried next tick.
+    fn merge_train_take_over(&mut self, id: TaskId) {
+        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let (Some(name), Some(path)) = (t.ws_name.clone(), t.ws_path.clone()) else {
+            return;
+        };
+        match workspace::take_over(&self.repo, &name, &path) {
+            Ok(_head) => {
+                self.remove_task(id, false); // also drops it from the train
+                self.status = format!("merged #{} into your workspace", id.0);
+            }
+            Err(e) => self.status = format!("merge of #{} failed: {e}", id.0),
         }
         self.refresh();
     }
@@ -872,17 +1199,71 @@ impl App {
     // ---- rendering ----
 
     fn render(&self, f: &mut Frame) {
+        let train_h = self.merge_train_height();
+        let mut constraints = vec![
+            Constraint::Length(1), // header
+            Constraint::Min(1),    // revision graph
+            Constraint::Length(1), // hint bar
+        ];
+        if train_h > 0 {
+            constraints.push(Constraint::Length(train_h)); // merge-train panel below the hints
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(f.area());
         self.render_header(f, chunks[0]);
         self.render_body(f, chunks[1]);
         self.render_footer(f, chunks[2]);
+        if train_h > 0 {
+            self.render_merge_train(f, chunks[3]);
+        }
+    }
+
+    /// Height of the merge-train panel: a title/border row plus one per member (and a note
+    /// row when present), capped so it never dominates the screen. Zero — panel not drawn —
+    /// when the train is empty.
+    fn merge_train_height(&self) -> u16 {
+        if self.merge_train.is_empty() {
+            return 0;
+        }
+        let note = u16::from(!self.merge_train.note.is_empty());
+        (self.merge_train.members.len() as u16 + note + 1).min(12)
+    }
+
+    fn render_merge_train(&self, f: &mut Frame, area: Rect) {
+        let mut lines: Vec<Line> = Vec::new();
+        if !self.merge_train.note.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(" {}", self.merge_train.note),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        for m in &self.merge_train.members {
+            let label = self
+                .tasks
+                .iter()
+                .find(|t| t.id == m.task)
+                .map(|t| t.label())
+                .unwrap_or_default();
+            let stage = m.stage;
+            let color = match stage {
+                train::Stage::Ready => Color::Green,
+                train::Stage::Merging => Color::Cyan,
+                train::Stage::Resolving => Color::Red,
+                _ => Color::Gray,
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" #{:<3} ", m.task.0),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{:<42} ", truncate_first_line(&label, 40))),
+                Span::styled(stage.label().to_string(), Style::default().fg(color)),
+            ]));
+        }
+        let block = Block::default().borders(Borders::TOP).title("merge train");
+        f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
@@ -1091,7 +1472,7 @@ impl App {
             "[↵]open"
         };
         let keys = format!(
-            " [n]ew [N]handoff {enter} [s]wap [S]napshot [r]ebase [d]escribe [x]remove [X]remove+drop [q]uit   {}",
+            " [n]ew [N]handoff {enter} [s]wap [S]napshot [r]ebase [d]escribe [a]ccept [A]abort [x]remove [X]remove+drop [q]uit   {}",
             self.status
         );
         f.render_widget(
@@ -1133,6 +1514,7 @@ mod tests {
             pending_rebase: None,
             pending_describe: None,
             pending_select: None,
+            merge_train: train::Train::default(),
             last_refresh: Instant::now(),
         }
     }
@@ -1262,6 +1644,93 @@ mod tests {
         app.describe_selected();
         assert_eq!(app.pending_describe, None, "must not arm without a prompt");
         assert!(app.status.contains("first prompt"), "status: {}", app.status);
+    }
+
+    // Build a selectable task with a workspace + pane + prompt (the accept happy-path
+    // prerequisites bar the jj checks, which need a real repo).
+    fn task_with_pane(app: &mut App, prompt: &str) -> TaskId {
+        let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+        t.id
+    }
+
+    #[test]
+    fn accept_before_first_prompt_is_blocked() {
+        // Like `d`/`r`: an accept may inject a describe prompt, which before the agent's own
+        // first prompt would be captured as the title — so `a` refuses until a prompt exists.
+        let mut app = test_app();
+        let _ = task_with_pane(&mut app, "");
+        app.accept_selected();
+        assert!(app.merge_train.is_empty(), "must not enqueue without a prompt");
+        assert!(app.status.contains("first prompt"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn accept_without_pane_is_blocked() {
+        // No live pane means the train can't drive the agent (describe/rebase prompts).
+        let mut app = test_app();
+        let t = app.store.create_task("do x", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.accept_selected();
+        assert!(app.merge_train.is_empty());
+        assert!(app.status.contains("no live pane"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn accept_toggles_a_queued_task_back_out() {
+        // Pressing `a` on a task already in the train removes it (no jj needed on this path).
+        let mut app = test_app();
+        let id = task_with_pane(&mut app, "do x");
+        app.merge_train.add(id);
+        assert!(app.merge_train.contains(id));
+
+        app.accept_selected();
+        assert!(!app.merge_train.contains(id), "second a dequeues it");
+        assert!(app.status.contains("removed from the merge train"));
+    }
+
+    #[test]
+    fn abort_train_clears_all_and_reports() {
+        let mut app = test_app();
+        app.abort_train();
+        assert_eq!(app.status, "no merge train to abort");
+
+        app.merge_train.add(TaskId(1));
+        app.merge_train.add(TaskId(2));
+        app.abort_train();
+        assert!(app.merge_train.is_empty());
+        assert!(app.status.contains("aborted"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn merge_train_panel_sizes_and_renders() {
+        let mut app = test_app();
+        assert_eq!(app.merge_train_height(), 0, "no panel when the train is empty");
+
+        let id = task_with_pane(&mut app, "Convert bridges to JSON");
+        app.merge_train.add(id);
+        if let Some(m) = app.merge_train.member_mut(id) {
+            m.stage = train::Stage::Rebasing;
+        }
+        app.merge_train.note = "paused — your @ has content".into();
+        // title/border + note + one member = 3 rows.
+        assert_eq!(app.merge_train_height(), 3);
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| app.render(f)).unwrap(); // must not panic with the panel present
     }
 
     #[test]
