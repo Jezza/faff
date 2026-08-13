@@ -132,6 +132,9 @@ struct App {
     /// prompt mid-turn is disruptive, and a description is premature until work settles),
     /// anything else cancels.
     pending_describe: Option<TaskId>,
+    /// Set to a freshly-created task's id (by `n`/`N`) so the next `refresh` lands the
+    /// selection on that new row instead of preserving the prior one. Consumed on use.
+    pending_select: Option<TaskId>,
 }
 
 impl App {
@@ -169,6 +172,7 @@ impl App {
             pending_swap: None,
             pending_rebase: None,
             pending_describe: None,
+            pending_select: None,
         };
         app.refresh();
         Ok(app)
@@ -296,6 +300,7 @@ impl App {
         match self.try_new_task(false) {
             Ok(id) => {
                 self.status = format!("new task #{id} — type your task in the pane");
+                self.pending_select = Some(id);
             }
             Err(e) => self.status = format!("new task failed: {e}"),
         }
@@ -310,6 +315,7 @@ impl App {
         match self.try_new_task(true) {
             Ok(id) => {
                 self.status = format!("handed off #{id} — type what to finish in the pane");
+                self.pending_select = Some(id);
             }
             Err(e) => self.status = format!("handoff failed: {e}"),
         }
@@ -719,7 +725,12 @@ impl App {
         self.task_order = graph_tasks;
         self.task_order.extend(self.detached.iter().copied());
 
-        self.selected = prev_selected
+        // A freshly-created task (armed by `n`/`N`) wins over identity preservation so the
+        // new row is highlighted; otherwise keep the prior selection.
+        self.selected = self
+            .pending_select
+            .take()
+            .or(prev_selected)
             .and_then(|id| self.task_order.iter().position(|x| *x == id))
             .unwrap_or_else(|| self.selected.min(self.task_order.len().saturating_sub(1)));
         self.last_refresh = Instant::now();
@@ -1121,6 +1132,7 @@ mod tests {
             pending_swap: None,
             pending_rebase: None,
             pending_describe: None,
+            pending_select: None,
             last_refresh: Instant::now(),
         }
     }
@@ -1250,6 +1262,49 @@ mod tests {
         app.describe_selected();
         assert_eq!(app.pending_describe, None, "must not arm without a prompt");
         assert!(app.status.contains("first prompt"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn new_task_selection_lands_on_new_row() {
+        // Hitting `n`/`N` arms `pending_select` with the fresh task's id; the refresh that
+        // follows must move the highlight onto that new row, not keep it on whatever was
+        // selected before.
+        let mut app = test_app();
+        let a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
+        app.refresh();
+        app.selected = app.task_order.iter().position(|x| *x == a.id).unwrap();
+
+        // A new task is created and armed, mirroring what `new_task`/`handoff_task` do
+        // just before calling refresh.
+        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
+        app.pending_select = Some(b.id);
+        app.refresh();
+
+        assert_eq!(
+            app.task_order.get(app.selected).copied(),
+            Some(b.id),
+            "hitting new highlights the newly added row"
+        );
+        assert_eq!(app.pending_select, None, "pending_select is consumed by refresh");
+    }
+
+    #[test]
+    fn refresh_without_pending_select_preserves_selection() {
+        // Absent a fresh-task arming, refresh keeps the prior selection by identity — the
+        // behavior `pending_select` must not disturb.
+        let mut app = test_app();
+        let _a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
+        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
+        app.refresh();
+        app.selected = app.task_order.iter().position(|x| *x == b.id).unwrap();
+
+        app.refresh();
+
+        assert_eq!(
+            app.task_order.get(app.selected).copied(),
+            Some(b.id),
+            "refresh keeps the prior selection by identity"
+        );
     }
 
     #[test]
