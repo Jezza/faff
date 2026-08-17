@@ -12,6 +12,13 @@ fn main() -> anyhow::Result<()> {
             socket,
             db,
         } => faff::cli::report_event(task, &event, &socket, &db),
+        // Best-effort like report-event: a hook must never fail the agent.
+        Command::SyncMemoryIndex { dir } => {
+            if let Err(e) = faff::memory::sync_index(&dir) {
+                eprintln!("sync-memory-index: {e:#}");
+            }
+            Ok(())
+        }
         Command::Tui { repo } => faff::tui::run(repo),
     }
 }
