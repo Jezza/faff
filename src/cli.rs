@@ -30,6 +30,13 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Internal: reconcile a memory dir's MEMORY.md index with the files on
+    /// disk (invoked by the injected SessionStart hook).
+    SyncMemoryIndex {
+        /// The Claude project memory directory to reconcile.
+        #[arg(long)]
+        dir: PathBuf,
+    },
     /// Internal: report a Claude Code hook event (invoked by injected hooks).
     ReportEvent {
         #[arg(long)]

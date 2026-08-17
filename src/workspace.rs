@@ -413,60 +413,79 @@ pub fn claude_projects_dir() -> PathBuf {
     base.join("projects")
 }
 
-/// Copy HEAD's memory snapshot into the new workspace's project key (spec §8).
-/// Best-effort: returns Ok(false) if HEAD has no memory yet. `head_cwd` is the
-/// directory Claude runs in for HEAD (assumed to be the repo root).
-pub fn seed_memory(claude_projects: &Path, head_cwd: &Path, ws_path: &Path) -> Result<bool> {
-    let src_key = config::encode_repo_path(head_cwd);
-    let dst_key = config::encode_repo_path(ws_path);
-    let src_mem = claude_projects.join(&src_key).join("memory");
-    if !src_mem.is_dir() {
-        return Ok(false);
-    }
-    let dst_mem = claude_projects.join(&dst_key).join("memory");
-    copy_dir_all(&src_mem, &dst_mem)?;
+/// Share HEAD's memory with the new workspace (spec §8): the workspace's
+/// project-key `memory/` dir becomes a symlink to HEAD's, so memories written in
+/// any workspace land directly in HEAD's pool and survive workspace disposal.
+/// HEAD's memory dir is created if missing (sharing works from day one). A real
+/// `memory/` dir left by the old copy behaviour is merged back into HEAD first
+/// (HEAD wins on name conflicts) — memories are never dropped. A legacy
+/// root-level `MEMORY.md` at HEAD's project key is symlinked the same way.
+pub fn seed_memory(claude_projects: &Path, head_cwd: &Path, ws_path: &Path) -> Result<()> {
+    let src_dir = claude_projects.join(config::encode_repo_path(head_cwd));
+    let dst_dir = claude_projects.join(config::encode_repo_path(ws_path));
+    let src_mem = src_dir.join("memory");
+    let dst_mem = dst_dir.join("memory");
+    fs::create_dir_all(&src_mem).with_context(|| format!("creating {}", src_mem.display()))?;
+    fs::create_dir_all(&dst_dir).with_context(|| format!("creating {}", dst_dir.display()))?;
 
-    // Copy the MEMORY.md index if it sits at the project-key root.
-    let src_index = claude_projects.join(&src_key).join("MEMORY.md");
-    if src_index.is_file() {
-        let dst_index = claude_projects.join(&dst_key).join("MEMORY.md");
-        if let Some(p) = dst_index.parent() {
-            fs::create_dir_all(p)?;
+    if let Ok(meta) = dst_mem.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            if fs::read_link(&dst_mem).ok().as_deref() == Some(&src_mem) {
+                return share_root_index(&src_dir, &dst_dir);
+            }
+            fs::remove_file(&dst_mem)?;
+        } else if meta.is_dir() {
+            // A real dir left by the old copy behaviour: move anything HEAD
+            // lacks back into HEAD (HEAD wins on conflicts), then drop it.
+            for entry in fs::read_dir(&dst_mem)? {
+                let entry = entry?;
+                let to = src_mem.join(entry.file_name());
+                if to.symlink_metadata().is_err() {
+                    let _ = fs::rename(entry.path(), &to);
+                }
+            }
+            fs::remove_dir_all(&dst_mem)?;
+        } else {
+            fs::remove_file(&dst_mem)?;
         }
-        fs::copy(&src_index, &dst_index)?;
     }
-    Ok(true)
+    std::os::unix::fs::symlink(&src_mem, &dst_mem)
+        .with_context(|| format!("linking {} -> {}", dst_mem.display(), src_mem.display()))?;
+    share_root_index(&src_dir, &dst_dir)
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else {
-            fs::copy(entry.path(), &to)?;
-        }
+/// Symlink a legacy root-level `MEMORY.md` (older Claude Code layout) if HEAD
+/// has one; the live layout keeps the index inside `memory/`, already shared.
+fn share_root_index(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    let src_index = src_dir.join("MEMORY.md");
+    if !src_index.is_file() {
+        return Ok(());
     }
+    let dst_index = dst_dir.join("MEMORY.md");
+    if dst_index.symlink_metadata().is_ok() {
+        fs::remove_file(&dst_index)?;
+    }
+    std::os::unix::fs::symlink(&src_index, &dst_index)
+        .with_context(|| format!("linking {}", dst_index.display()))?;
     Ok(())
 }
 
 /// Write the auto-injected Claude Code hooks into `<ws>/.claude/settings.local.json`.
 /// Each hook invokes the faff binary's `report-event`, which persists to `db` and
-/// nudges the TUI on `socket`.
+/// nudges the TUI on `socket`. SessionStart additionally runs `sync-memory-index`
+/// against `memory_dir` so the shared MEMORY.md index self-heals on every launch.
 pub fn write_hooks(
     ws_path: &Path,
     task_id: i64,
     faff_exe: &Path,
     socket: &Path,
     db: &Path,
+    memory_dir: &Path,
 ) -> Result<PathBuf> {
     let dir = ws_path.join(".claude");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("settings.local.json");
-    let settings = hook_settings(task_id, faff_exe, socket, db);
+    let settings = hook_settings(task_id, faff_exe, socket, db, memory_dir);
     fs::write(&path, serde_json::to_string_pretty(&settings)?)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
@@ -489,15 +508,29 @@ fn hook_cmd(task_id: i64, faff_exe: &Path, event: &str, socket: &Path, db: &Path
     )
 }
 
-fn hook_settings(task_id: i64, faff_exe: &Path, socket: &Path, db: &Path) -> Value {
+fn hook_settings(
+    task_id: i64,
+    faff_exe: &Path,
+    socket: &Path,
+    db: &Path,
+    memory_dir: &Path,
+) -> Value {
     let group = |event: &str| json!([{ "hooks": [{ "type": "command", "command": hook_cmd(task_id, faff_exe, event, socket, db) }] }]);
     let matched = |event: &str| json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": hook_cmd(task_id, faff_exe, event, socket, db) }] }]);
+    let session_start = json!([{ "hooks": [
+        { "type": "command", "command": hook_cmd(task_id, faff_exe, "session-start", socket, db) },
+        { "type": "command", "command": format!(
+            "{} sync-memory-index --dir {}",
+            shell_quote(faff_exe),
+            shell_quote(memory_dir),
+        ) },
+    ] }]);
     json!({
         "hooks": {
             "Stop": group("stop"),
             "Notification": group("notification"),
             "UserPromptSubmit": group("prompt"),
-            "SessionStart": group("session-start"),
+            "SessionStart": session_start,
             "PostToolUse": matched("post-tool"),
         }
     })
@@ -515,7 +548,8 @@ mod tests {
         let faff = Path::new("/opt/my apps/faff"); // note the space
         let sock = Path::new("/run/faf/7.sock");
         let db = Path::new("/data/faf/repo/faf.db");
-        let path = write_hooks(ws, 7, faff, sock, db).unwrap();
+        let mem = Path::new("/cc/projects/-data-faf-ws-0007-x/memory");
+        let path = write_hooks(ws, 7, faff, sock, db, mem).unwrap();
         assert!(path.ends_with(".claude/settings.local.json"));
 
         let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -546,32 +580,113 @@ mod tests {
         ] {
             assert!(v["hooks"].get(e).is_some(), "missing hook {e}");
         }
+        // SessionStart carries the report-event hook plus the index sync
+        let ss = &v["hooks"]["SessionStart"][0]["hooks"];
+        assert!(
+            ss[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--event session-start")
+        );
+        let sync = ss[1]["command"].as_str().unwrap();
+        assert!(sync.starts_with("'/opt/my apps/faff' sync-memory-index"));
+        assert!(sync.contains("--dir '/cc/projects/-data-faf-ws-0007-x/memory'"));
+    }
+
+    /// Head memory + legacy root index set up; returns (projects, head, ws).
+    fn memory_fixture(tmp: &Path) -> (PathBuf, &'static Path, &'static Path) {
+        let projects = tmp.join("projects");
+        let head = Path::new("/home/jezza/work/repo");
+        let ws = Path::new("/data/faf/-home-jezza-work-repo/ws/0001-x");
+        let src_mem = projects.join(config::encode_repo_path(head)).join("memory");
+        fs::create_dir_all(&src_mem).unwrap();
+        fs::write(src_mem.join("a.md"), "mem a").unwrap();
+        fs::write(src_mem.parent().unwrap().join("MEMORY.md"), "index").unwrap();
+        (projects, head, ws)
     }
 
     #[test]
-    fn seed_memory_copies_snapshot_and_index() {
+    fn seed_memory_symlinks_workspace_to_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (projects, head, ws) = memory_fixture(tmp.path());
+
+        seed_memory(&projects, head, ws).unwrap();
+
+        let src_mem = projects.join(config::encode_repo_path(head)).join("memory");
+        let dst = projects.join(config::encode_repo_path(ws));
+        let dst_mem = dst.join("memory");
+        assert!(dst_mem.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(dst_mem.join("a.md")).unwrap(), "mem a");
+        // memories written in the workspace land in HEAD's pool
+        fs::write(dst_mem.join("new.md"), "learned in ws").unwrap();
+        assert_eq!(
+            fs::read_to_string(src_mem.join("new.md")).unwrap(),
+            "learned in ws"
+        );
+        // legacy root-level index is shared, not copied
+        assert!(
+            dst.join("MEMORY.md")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(dst.join("MEMORY.md")).unwrap(), "index");
+    }
+
+    #[test]
+    fn seed_memory_creates_head_memory_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let projects = tmp.path().join("projects");
-        let head = Path::new("/home/jezza/work/repo");
-        let ws = Path::new("/data/faf/-home-jezza-work-repo/ws/0001-x");
+        let head = Path::new("/home/jezza/work/fresh");
+        let ws = Path::new("/data/faf/-home-jezza-work-fresh/ws/0001-x");
 
-        let src_key = config::encode_repo_path(head);
-        fs::create_dir_all(projects.join(&src_key).join("memory")).unwrap();
-        fs::write(projects.join(&src_key).join("memory").join("a.md"), "mem a").unwrap();
-        fs::write(projects.join(&src_key).join("MEMORY.md"), "index").unwrap();
+        seed_memory(&projects, head, ws).unwrap();
 
-        let copied = seed_memory(&projects, head, ws).unwrap();
-        assert!(copied);
-
-        let dst_key = config::encode_repo_path(ws);
+        let src_mem = projects.join(config::encode_repo_path(head)).join("memory");
+        assert!(src_mem.is_dir());
+        let dst_mem = projects.join(config::encode_repo_path(ws)).join("memory");
+        fs::write(dst_mem.join("first.md"), "flows back").unwrap();
         assert_eq!(
-            fs::read_to_string(projects.join(&dst_key).join("memory").join("a.md")).unwrap(),
-            "mem a"
+            fs::read_to_string(src_mem.join("first.md")).unwrap(),
+            "flows back"
         );
+    }
+
+    #[test]
+    fn seed_memory_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (projects, head, ws) = memory_fixture(tmp.path());
+
+        seed_memory(&projects, head, ws).unwrap();
+        seed_memory(&projects, head, ws).unwrap();
+
+        let dst_mem = projects.join(config::encode_repo_path(ws)).join("memory");
+        assert!(dst_mem.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(dst_mem.join("a.md")).unwrap(), "mem a");
+    }
+
+    #[test]
+    fn seed_memory_merges_legacy_copy_into_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (projects, head, ws) = memory_fixture(tmp.path());
+        // the old behaviour left a real copied dir at the workspace key, which
+        // has since diverged: one memory only it has, one stale duplicate
+        let dst_mem = projects.join(config::encode_repo_path(ws)).join("memory");
+        fs::create_dir_all(&dst_mem).unwrap();
+        fs::write(dst_mem.join("unique.md"), "only in ws").unwrap();
+        fs::write(dst_mem.join("a.md"), "stale copy").unwrap();
+
+        seed_memory(&projects, head, ws).unwrap();
+
+        let src_mem = projects.join(config::encode_repo_path(head)).join("memory");
         assert_eq!(
-            fs::read_to_string(projects.join(&dst_key).join("MEMORY.md")).unwrap(),
-            "index"
+            fs::read_to_string(src_mem.join("unique.md")).unwrap(),
+            "only in ws"
         );
+        // HEAD wins on conflicts
+        assert_eq!(fs::read_to_string(src_mem.join("a.md")).unwrap(), "mem a");
+        assert!(dst_mem.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     #[test]
@@ -612,15 +727,6 @@ mod tests {
             v["projects"]["/ws/0002-y"]["hasTrustDialogAccepted"],
             json!(true)
         );
-    }
-
-    #[test]
-    fn seed_memory_is_noop_without_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let projects = tmp.path().join("projects");
-        let copied =
-            seed_memory(&projects, Path::new("/no/such/repo"), Path::new("/no/ws")).unwrap();
-        assert!(!copied);
     }
 
     // --- Integration: create + teardown against a scratch repo ---

@@ -412,8 +412,19 @@ impl App {
         }
         // Best-effort: memory seed, hook injection, and pre-trust the workspace dir
         // so the agent doesn't hit the "trust this folder?" dialog on spawn.
-        let _ = workspace::seed_memory(&workspace::claude_projects_dir(), &self.repo, &ws.path);
-        let _ = workspace::write_hooks(&ws.path, id.0, &self.faff_exe, &self.socket, &self.db);
+        let claude_projects = workspace::claude_projects_dir();
+        let _ = workspace::seed_memory(&claude_projects, &self.repo, &ws.path);
+        let mem_dir = claude_projects
+            .join(config::encode_repo_path(&ws.path))
+            .join("memory");
+        let _ = workspace::write_hooks(
+            &ws.path,
+            id.0,
+            &self.faff_exe,
+            &self.socket,
+            &self.db,
+            &mem_dir,
+        );
         let _ = workspace::trust_workspace(&ws.path);
         Ok(())
     }
