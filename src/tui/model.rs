@@ -308,12 +308,40 @@ pub fn row_tasks(
 }
 
 /// Status icon + human label for the annotation line.
+///
+/// Every icon must be a single display column: agent rows pad `#id` to a common width so
+/// the glyphs stack into one straight column, and the renderer clips rows by counting
+/// chars. A wide glyph breaks both — the bell 🔔 (U+1F514) is East Asian Width `W`, so it
+/// pushed its row a column right and made the clip over-count. Colour, not pictorial
+/// detail, is what distinguishes the three (see `status_color` in the view).
 pub fn status_label(status: TaskStatus) -> (&'static str, &'static str) {
     match status {
         TaskStatus::Working => ("⚙", "working"),
-        TaskStatus::NeedsInput => ("🔔", "needs you"),
+        TaskStatus::NeedsInput => ("!", "needs you"),
         TaskStatus::Idle => ("✓", "review-ready"),
     }
+}
+
+/// Cut a rendered agent row — `#7  ! :: fix the tests` — into the text before the status
+/// glyph, the glyph itself, and the rest, so the view can tint the glyph alone.
+///
+/// Anchored on the FIRST ` :: `, with the glyph as the single char in front of it: a
+/// title carrying its own ` :: ` or its own `!` can't move the cut. Returns `None` for
+/// anything that isn't an agent row in that shape — a trunk description, or a row the
+/// renderer already clipped past the separator — and the caller then draws it untinted.
+pub fn split_status_icon(line: &str) -> Option<(&str, &str, &str)> {
+    const SEP: &str = " :: ";
+    let sep_at = line.find(SEP)?;
+    // The glyph is the char immediately before the separator, and `#id ` must precede it,
+    // so a bare " :: " at the start of a line is not a status field.
+    let icon = line[..sep_at].chars().next_back()?;
+    let icon_at = sep_at - icon.len_utf8();
+    // Exactly one glyph: the char before it is the space closing the `#id` field. Without
+    // this, `#7  working :: x` would hand back its trailing "g" as the status.
+    if line[..icon_at].chars().next_back()? != ' ' {
+        return None;
+    }
+    Some((&line[..icon_at], &line[icon_at..sep_at], &line[sep_at..]))
 }
 
 /// The working-copy (`@`) label: the revision's own description, or "(no description
@@ -335,7 +363,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
     let fork_point = current_fork_point(revs);
 
     // Widest task-id (in digits) across the tasks, so every `#id` field pads to a common
-    // width and the status emoji that follows lines up down the stacked agent rows.
+    // width and the status glyph that follows lines up down the stacked agent rows.
     let id_width = tasks
         .iter()
         .map(|t| t.id.0.to_string().len())
@@ -380,7 +408,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             // empty. Prefer the change's own jj description when set (it's live and
             // authoritative — the agent's own `jj describe`), falling back to the
             // prompt-derived label before the change has been described. Status is the
-            // emoji alone, inline before the title; the whole agent is one line, so the
+            // glyph alone, inline before the title; the whole agent is one line, so the
             // renderer folds it to a single `├─●` row anchored above its fork point.
             let g = if rev.conflict {
                 '×'
@@ -1000,10 +1028,10 @@ mod tests {
             "trunk stays one clean column; each agent folds to a single ├─○ row above its \
              base, and the current fork point (pk, newest non-empty ancestor of @) is a ◆"
         );
-        // Agent rows are `#id emoji :: title`. Ids pad to the widest (#15) so the emojis
-        // align: #7/#9 gain a trailing space.
+        // Agent rows are `#id glyph :: title`. Ids pad to the widest (#15) so the status
+        // glyphs align: #7/#9 gain a trailing space.
         assert!(rows[1].content.starts_with("#15 ⚙ :: "));
-        assert!(rows[3].content.starts_with("#7  🔔 :: "));
+        assert!(rows[3].content.starts_with("#7  ! :: "));
         assert!(rows[5].content.starts_with("#9  ✓ :: "));
         // Trunk rows are the user's own revisions, shown by description.
         assert_eq!(rows[2].content, "spawn: declare! child-class refs");
@@ -1021,7 +1049,7 @@ mod tests {
         let tasks = vec![task(1, "faf-task-1", TaskStatus::Working)];
         let m = build(&revs, &workspaces, &tasks);
         assert_eq!(m.nodes[0].glyph, '●');
-        // One line, status as the bare emoji before the `::` title separator.
+        // One line, status as the bare glyph before the `::` title separator.
         assert_eq!(m.nodes[0].lines.len(), 1);
         assert!(m.nodes[0].lines[0].contains("⚙"));
         assert!(m.nodes[0].lines[0].contains(" :: "));
@@ -1042,10 +1070,10 @@ mod tests {
     }
 
     #[test]
-    fn task_number_is_padded_so_status_emojis_align() {
+    fn task_number_is_padded_so_status_glyphs_align() {
         // Mixed-width task ids on stacked agent rows: the narrower number is right-padded
-        // to the widest id's width, so every status emoji begins at the same column.
-        // Without it, "#7 ⚙" and "#12 🔔" put their emojis one column apart.
+        // to the widest id's width, so every status glyph begins at the same column.
+        // Without it, "#7 ⚙" and "#12 !" put their glyphs one column apart.
         let revs = vec![
             rev("t7", &["p"], false, true, ""),
             rev("t12", &["p"], false, true, ""),
@@ -1069,12 +1097,13 @@ mod tests {
         let l7 = &m.nodes[0].lines[0];
         let l12 = &m.nodes[1].lines[0];
         assert_eq!(l7, "#7  ⚙ :: add oauth login");
-        assert_eq!(l12, "#12 🔔 :: add oauth login");
-        // The emoji begins at the same char column on both rows.
+        assert_eq!(l12, "#12 ! :: add oauth login");
+        // The glyph begins at the same char column on both rows — and since every status
+        // glyph is one column wide, the same *display* column too.
         assert_eq!(
             l7.chars().position(|c| c == '⚙'),
-            l12.chars().position(|c| c == '🔔'),
-            "status emojis must align across differing task-number widths"
+            l12.chars().position(|c| c == '!'),
+            "status glyphs must align across differing task-number widths"
         );
     }
 
@@ -1317,6 +1346,73 @@ mod tests {
         let m = build(&revs, &[], &[]);
         assert_eq!(m.fork_point, Some("c".to_string()));
         assert_eq!(m.nodes[1].glyph, '×', "conflict glyph survives");
+    }
+
+    #[test]
+    fn every_status_glyph_is_one_column_wide() {
+        // The graph pads `#id` to a common width so the status glyphs line up, and the
+        // renderer clips rows by counting chars. Both only hold while every glyph is a
+        // single display column — a wide (East Asian Width `W`) glyph like the old 🔔
+        // silently shifts its row one column right and makes the clip math over-count.
+        for status in [
+            TaskStatus::Working,
+            TaskStatus::NeedsInput,
+            TaskStatus::Idle,
+        ] {
+            let (icon, label) = status_label(status);
+            assert_eq!(
+                icon.chars().count(),
+                1,
+                "{label} glyph must be exactly one char"
+            );
+            let c = icon.chars().next().unwrap();
+            assert!(
+                !matches!(c as u32, 0x1F300..=0x1FAFF),
+                "{label} glyph {c:?} is an emoji-presentation codepoint — those render \
+                 two columns wide"
+            );
+        }
+    }
+
+    #[test]
+    fn split_status_icon_isolates_the_glyph() {
+        // The renderer tints the status glyph alone, so it needs the row cut into
+        // (before, icon, after) — the icon is the token just before the ` :: ` separator.
+        assert_eq!(
+            split_status_icon("#7  ! :: fix the flaky store tests"),
+            Some(("#7  ", "!", " :: fix the flaky store tests"))
+        );
+        // The combined HEAD node hangs its agent on an indented continuation line.
+        assert_eq!(
+            split_status_icon("↳ #12 ⚙ :: migrate the bridges"),
+            Some(("↳ #12 ", "⚙", " :: migrate the bridges"))
+        );
+    }
+
+    #[test]
+    fn split_status_icon_is_not_fooled_by_the_title() {
+        // Anchored on the FIRST ` :: `, so a title carrying its own separator — or its
+        // own copy of the glyph — can't move the cut.
+        assert_eq!(
+            split_status_icon("#3  ! :: parse a :: b, and mind the !"),
+            Some(("#3  ", "!", " :: parse a :: b, and mind the !"))
+        );
+    }
+
+    #[test]
+    fn split_status_icon_declines_rows_without_a_status_field() {
+        // Trunk rows (a plain description) and rows the renderer clipped before the
+        // separator have no glyph to tint — those must render exactly as they do today.
+        assert_eq!(split_status_icon("spawn: declare! child-class refs"), None);
+        assert_eq!(split_status_icon("#7  ! :"), None);
+        assert_eq!(split_status_icon(""), None);
+    }
+
+    #[test]
+    fn split_status_icon_rejects_a_multi_char_status_field() {
+        // Only a single glyph is a status field. `#7 working :: x` is not one, and
+        // tinting its last letter would be worse than leaving the row alone.
+        assert_eq!(split_status_icon("#7  working :: do a thing"), None);
     }
 
 

@@ -1432,6 +1432,8 @@ impl App {
         }
         for (i, row) in self.rows.iter().enumerate() {
             let row_task = self.task_of_node.get(i).copied().flatten();
+            let row_status =
+                row_task.and_then(|id| self.tasks.iter().find(|t| t.id == id).map(|t| t.status));
             let is_sel = selected.is_some() && row_task == selected;
             let base = if is_sel {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -1501,7 +1503,12 @@ impl App {
                     spans.push(Span::styled(rest, frame));
                     spans.push(Span::styled("] ", frame));
                     let avail = text_w.saturating_sub(gutter_w + id_w);
-                    spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
+                    push_row_content(
+                        &mut spans,
+                        truncate_first_line(&row.content, avail),
+                        base,
+                        row_status,
+                    );
                 }
                 // Link row (no content): gutter only.
                 None if row.content.is_empty() => {
@@ -1512,7 +1519,12 @@ impl App {
                     let pad = format!("{:<gutter_w$}{}", row.gutter, " ".repeat(id_col));
                     let avail = text_w.saturating_sub(pad.chars().count());
                     spans.push(Span::styled(pad, base));
-                    spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
+                    push_row_content(
+                        &mut spans,
+                        truncate_first_line(&row.content, avail),
+                        base,
+                        row_status,
+                    );
                 }
             }
             lines.push(Line::from(spans));
@@ -1549,10 +1561,22 @@ impl App {
                         style
                     };
                     let avail = text_w.saturating_sub(prefix.chars().count());
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, prefix_style),
-                        Span::styled(truncate_first_line(&rest, avail), style),
-                    ]));
+                    let text = truncate_first_line(&rest, avail);
+                    // Here the glyph trails the description rather than leading it, so
+                    // tint the tail — and only when the clip left it in place; a title
+                    // long enough to be cut takes the glyph with it, as it always has.
+                    let mut spans = vec![Span::styled(prefix, prefix_style)];
+                    match text.strip_suffix(icon) {
+                        Some(head) => {
+                            spans.push(Span::styled(head.to_string(), style));
+                            spans.push(Span::styled(
+                                icon.to_string(),
+                                status_style(style, t.status),
+                            ));
+                        }
+                        None => spans.push(Span::styled(text, style)),
+                    }
+                    lines.push(Line::from(spans));
                 }
             }
         }
@@ -1586,6 +1610,49 @@ impl App {
             Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
             area,
         );
+    }
+}
+
+/// Colour for a status glyph, layered onto the row's base style — which on the selected
+/// row carries REVERSED, so the tint lands on the cell background instead of the glyph,
+/// the same way the docked bracket's green does.
+///
+/// The glyphs are deliberately plain single-column marks (`⚙ ! ✓`), so colour is what
+/// tells the three modes apart at a glance: blue for the quiet steady state, bold magenta
+/// for the one that wants you — magenta means nothing else in faff, so it can't be
+/// misread as the cyan fork point or a green docked session — and green for done and
+/// waiting on your review.
+fn status_style(base: Style, status: TaskStatus) -> Style {
+    match status {
+        TaskStatus::Working => base.fg(Color::Blue),
+        TaskStatus::NeedsInput => base.fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        TaskStatus::Idle => base.fg(Color::Green),
+    }
+}
+
+/// Push an agent row's text with its status glyph tinted by the task's mode. A row with
+/// no task behind it — a trunk description — or one the clip cut before the ` :: `
+/// separator has no glyph to find, and goes in as the single plain span it always was.
+fn push_row_content(
+    spans: &mut Vec<Span<'static>>,
+    text: String,
+    base: Style,
+    status: Option<TaskStatus>,
+) {
+    // Own the three pieces before matching: the split borrows `text`, which the untinted
+    // arm needs to move into a span.
+    let split = status
+        .zip(model::split_status_icon(&text))
+        .map(|(s, (before, icon, after))| {
+            (s, before.to_string(), icon.to_string(), after.to_string())
+        });
+    match split {
+        Some((status, before, icon, after)) => {
+            spans.push(Span::styled(before, base));
+            spans.push(Span::styled(icon, status_style(base, status)));
+            spans.push(Span::styled(after, base));
+        }
+        None => spans.push(Span::styled(text, base)),
     }
 }
 
@@ -2298,6 +2365,126 @@ mod tests {
         };
         assert!(reversed(agent_row), "agent line is highlighted when selected");
         assert!(!reversed(head_row), "HEAD header row is not highlighted");
+    }
+
+    #[test]
+    fn agent_rows_tint_the_status_glyph_by_mode() {
+        // The status glyphs are plain one-column marks, so colour is what separates the
+        // three modes: blue working, bold magenta needs-you, green review-ready. Each must
+        // land on the glyph cell alone — the `#id` and the title stay uncoloured.
+        let mut app = test_app();
+        let mut ids = vec![];
+        for (prompt, status) in [
+            ("migrate", TaskStatus::Working),
+            ("oauth", TaskStatus::NeedsInput),
+            ("cleanup", TaskStatus::Idle),
+        ] {
+            let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
+            app.store.update_status(t.id, status).unwrap();
+            ids.push(t.id);
+        }
+        app.tasks = app.store.list_tasks().unwrap();
+        app.rows = vec![
+            graph::GraphRow {
+                gutter: "├─●".into(),
+                content: "#1 ⚙ :: migrate".into(),
+                node_index: Some(0),
+                change_id: Some("aaaaaaaa".into()),
+            },
+            graph::GraphRow {
+                gutter: "├─●".into(),
+                content: "#2 ! :: oauth".into(),
+                node_index: Some(1),
+                change_id: Some("bbbbbbbb".into()),
+            },
+            graph::GraphRow {
+                gutter: "├─●".into(),
+                content: "#3 ✓ :: cleanup".into(),
+                node_index: Some(2),
+                change_id: Some("cccccccc".into()),
+            },
+        ];
+        app.task_of_node = ids.iter().copied().map(Some).collect();
+        app.id_display = std::collections::HashMap::from([
+            (
+                "aaaaaaaa".to_string(),
+                ("aaaaaaaa".to_string(), String::new()),
+            ),
+            (
+                "bbbbbbbb".to_string(),
+                ("bbbbbbbb".to_string(), String::new()),
+            ),
+            (
+                "cccccccc".to_string(),
+                ("cccccccc".to_string(), String::new()),
+            ),
+        ]);
+
+        let (w, h) = (80usize, 8usize);
+        let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let find = |glyph: &str| -> (usize, usize) {
+            (0..w * h)
+                .find(|&i| buf.content[i].symbol() == glyph)
+                .map(|i| (i % w, i / w))
+                .unwrap_or_else(|| panic!("{glyph} rendered"))
+        };
+
+        let (gx, gy) = find("⚙");
+        assert_eq!(buf.content[gy * w + gx].fg, Color::Blue, "working is blue");
+        let (bx, by) = find("!");
+        let bang = &buf.content[by * w + bx];
+        assert_eq!(bang.fg, Color::Magenta, "needs-you is magenta");
+        assert!(bang.modifier.contains(Modifier::BOLD), "needs-you is bold");
+        let (cx, cy) = find("✓");
+        assert_eq!(buf.content[cy * w + cx].fg, Color::Green, "idle is green");
+
+        // The tint is the glyph alone: the char either side of it keeps the default fg,
+        // so a whole coloured row can never be mistaken for a status.
+        for (x, y) in [(gx, gy), (bx, by), (cx, cy)] {
+            assert_eq!(
+                buf.content[y * w + x - 1].fg,
+                Color::Reset,
+                "space before the glyph is untinted"
+            );
+            assert_eq!(
+                buf.content[y * w + x + 1].fg,
+                Color::Reset,
+                "space after the glyph is untinted"
+            );
+        }
+    }
+
+    #[test]
+    fn trunk_rows_are_never_tinted() {
+        // A plain description has no status field. Anchoring on ` :: ` must not invent one
+        // — the row renders exactly as it did before colour existed.
+        let mut app = test_app();
+        app.rows = vec![graph::GraphRow {
+            gutter: "◻".into(),
+            content: "spawn: declare! child-class refs".into(),
+            node_index: Some(0),
+            change_id: Some("aaaaaaaa".into()),
+        }];
+        app.task_of_node = vec![None];
+        app.id_display = std::collections::HashMap::from([(
+            "aaaaaaaa".to_string(),
+            ("aaaaaaaa".to_string(), String::new()),
+        )]);
+
+        let (w, h) = (80usize, 6usize);
+        let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer();
+        let bang = (0..w * h)
+            .find(|&i| buf.content[i].symbol() == "!")
+            .expect("the `!` in the description is rendered");
+        assert_eq!(
+            buf.content[bang].fg,
+            Color::Reset,
+            "a `!` inside a description is not a status glyph"
+        );
     }
 
     #[test]

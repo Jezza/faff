@@ -59,7 +59,7 @@ With task #7's session docked, faff on the left and the real `claude` pane on th
 revisions                                            │ ┃   from postcard to JSON
 @  [wvrsmsyk] (no description set)                   │ ┃
 ├─●  [kmkxwzqr] #7 ⚙ :: Convert bridges to JSON  ▶   │ ┃ ● Read src/bridge/http.rs
-├─●  [rzqlvksp] #8 🔔 :: Fix flaky store tests       │ ┃ ● Edit src/bridge/http.rs
+├─●  [rzqlvksp] #8 ! :: Fix flaky store tests        │ ┃ ● Edit src/bridge/http.rs
 ◻  [yuvnmxxo] initial code commit                    │ ┃ ● Bash cargo test -p bridge
 ◻  [ntlpqxos] import                                 │ ┃
 ── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
@@ -288,8 +288,10 @@ HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
   (or `(no description set)`)
 - `●` a faff agent's revision (hollow `○` when the revision is still empty), shown on one
   row as `#<id> <status> :: <title>` — the title is the change's jj description (falling back
-  to the first line of the prompt until it's described), and `<status>` is the emoji
-  `⚙` working / `🔔` needs you / `✓` review-ready
+  to the first line of the prompt until it's described), and `<status>` is a one-column
+  glyph, coloured by mode: blue `⚙` working / bold magenta `!` needs you / green `✓`
+  review-ready. Every glyph faff draws is a single column wide, so the `#<id>` padding
+  keeps the status column straight and label clipping counts characters honestly
 - `◻` ordinary history, or another workspace's working copy
 - `◆` the current fork point — drawn cyan — the revision new agents branch from
   (`heads(::@ ~ (empty() ~ merges()))`); when it coincides with your working copy the `@`
@@ -345,7 +347,7 @@ Hooks injected per workspace:
 |---|---|
 | `UserPromptSubmit` | status → working; first prompt captured |
 | `Stop` | status → idle |
-| `Notification` | needs input — but only if the agent was *working* (a permission prompt); a notification while already idle is Claude Code's ~60s "waiting for your input" notice and is ignored, so a finished agent isn't stuck showing 🔔 |
+| `Notification` | needs input — but only if the agent was *working* (a permission prompt); a notification while already idle is Claude Code's ~60s "waiting for your input" notice and is ignored, so a finished agent isn't stuck showing `!` |
 | `PostToolUse` | appends an activity row; clears a stale needs-input |
 | `SessionStart` | records the claude session id, overwriting the one faff minted at task creation |
 

@@ -28,7 +28,7 @@ pub fn apply_event(store: &Store, ev: &Event) -> Result<()> {
             // just means the agent is done. Tell them apart by state, not by message text:
             // only flip to NeedsInput from Working. From Idle (or anything else) the
             // notification is the idle-waiting kind and is ignored, so a finished agent
-            // isn't stuck showing 🔔 — and isn't wrongly dropped from the merge train.
+            // isn't stuck showing `!` — and isn't wrongly dropped from the merge train.
             if let Ok(t) = store.get_task(*task)
                 && t.status == TaskStatus::Working
             {
@@ -91,7 +91,7 @@ mod tests {
         );
 
         // Put it in NeedsInput (only reachable from Working — a permission prompt mid-turn),
-        // then a tool-activity event must clear that back to Working (the sticky-🔔 fix) and
+        // then a tool-activity event must clear that back to Working (the sticky needs-you fix) and
         // record the activity.
         apply_event(&store, &Event::Working { task: t.id }).unwrap();
         apply_event(&store, &Event::NeedsInput { task: t.id }).unwrap();
