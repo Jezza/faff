@@ -38,7 +38,7 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `n` | new task |
 | `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes |
 | `↑`/`↓` or `k`/`j` | move selection |
-| `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab |
+| `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab; on a task whose pane has died, bring the agent back (see [Reviving a lost agent](#reviving-a-lost-agent)) |
 | `s` | swap: trade your `@` with the selected agent's revision |
 | `S` | snapshot the selected agent's workspace |
 | `r` | refresh: tell the agent to rebase onto the latest fork point (freezes your WIP first) |
@@ -101,6 +101,12 @@ padded to 8 columns with the unique prefix highlighted.
    `faff report-event`.
 4. Sets `hasTrustDialogAccepted` for the workspace path in `~/.claude.json`.
 5. Spawns `claude` in a WezTerm pane at the workspace, docks it beside faff, focuses it.
+
+The task is born with a session id — a UUID minted in the same statement as the row and
+passed as `claude --session-id`, rather than learned afterwards from the agent's
+`SessionStart` hook. The id is therefore durable *before* the agent process exists, which
+is what makes the agent recoverable if its pane dies. The hook still overwrites the id
+afterwards, so faff tracks the conversation that is actually live.
 
 The task starts with no prompt. You type it into the pane. The `UserPromptSubmit` hook
 captures the first prompt only, and faff uses its first line as the task's display label in
@@ -240,6 +246,39 @@ The `~ ::@` guard still applies, so anything already integrated into your `@` is
 `X` only ever discards the task's own unintegrated line. (jj keeps its op log, so an `X` you
 regret is recoverable with `jj op undo`.)
 
+### Reviving a lost agent
+
+A pane can go away without the work going away: the agent exits, the tab gets closed, the
+WezTerm mux restarts, the machine reboots. The jj workspace and the task row survive all of
+that, so the agent can be put back. Each refresh flips such a task to idle and clears its
+dead pane; selecting it shows what `Enter` will do:
+
+| Footer | State | What `Enter` does |
+|---|---|---|
+| `[↵]revive` | pane gone, conversation on disk | `claude --resume <session-id>` — the agent comes back with its full history |
+| `[↵]start` | pane gone, nothing written yet | `claude --session-id <session-id>` — a blank agent in the same workspace |
+| `[↵]open` / `[↵]detach` | agent running | dock / detach as usual |
+
+The `[↵]start` case is the common one for a task created with `n` and never typed into:
+claude writes no transcript until the first message, so there is no conversation to
+restore — only a workspace waiting for an agent.
+
+Reviving is manual on purpose. A pane usually disappears because you closed it, and an
+automatic respawn on sight would be a fight rather than a feature.
+
+What comes back is the *conversation*, not the process. A turn that was in flight when the
+pane died is lost, and MCP servers and background tasks start over. The revision is
+untouched — the agent picks up the working copy exactly as it left it.
+
+Two constraints worth knowing, both from `claude` itself:
+
+- `--session-id` is create-only. Re-running it against an existing conversation fails with
+  `Session ID <uuid> is already in use`, which is why the resume path is a separate branch
+  rather than one idempotent command.
+- A resumed session adopts the directory it is launched in, not the one it was created in.
+  faff always relaunches at the task's own workspace, so the transcript stays under that
+  workspace's project key.
+
 ### The revision view
 
 The body is one graph, built from `jj log` over `ancestors(<all workspace heads> | @, 25)`.
@@ -308,10 +347,11 @@ Hooks injected per workspace:
 | `Stop` | status → idle |
 | `Notification` | needs input — but only if the agent was *working* (a permission prompt); a notification while already idle is Claude Code's ~60s "waiting for your input" notice and is ignored, so a finished agent isn't stuck showing 🔔 |
 | `PostToolUse` | appends an activity row; clears a stale needs-input |
-| `SessionStart` | records the claude session id |
+| `SessionStart` | records the claude session id, overwriting the one faff minted at task creation |
 
-Each refresh also reconciles: a task whose pane has died goes back to idle, and a task whose
-jj workspace has vanished is dropped.
+Each refresh also reconciles: a task whose pane has died goes back to idle (its agent can be
+brought back with `Enter` — see [Reviving a lost agent](#reviving-a-lost-agent)), and a task
+whose jj workspace has vanished is dropped.
 
 Per-repo state lives under `~/.local/share/faf/<encoded-repo-path>/`: `faf.db`, and
 `ws/<nnnn>-<slug>/` for the workspaces. The path encoding matches Claude Code's project key
@@ -333,3 +373,4 @@ scheme.
 | `cli` | argument parsing and the `report-event` subcommand |
 | `tui` | ratatui app: state, event loop, rendering, actions |
 | `tui::train` | the merge train: accepted-revision set, per-member stage, membership ops |
+| `tui::session` | pure session decisions: the `Enter` toggle, revivability, and the `claude` launch argv |

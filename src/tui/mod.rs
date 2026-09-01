@@ -123,6 +123,9 @@ struct App {
     socket: PathBuf,
     db: PathBuf,
     store: Store,
+    /// Root of Claude Code's per-project data (`~/.claude/projects`). Held rather than
+    /// looked up per call so tests can point it at a scratch dir.
+    claude_projects: PathBuf,
     events_rx: Receiver<events::Event>,
     faff_pane: Option<u64>,
 
@@ -182,6 +185,7 @@ impl App {
             socket,
             db,
             store,
+            claude_projects: workspace::claude_projects_dir(),
             events_rx,
             faff_pane,
             tasks: Vec::new(),
@@ -429,21 +433,63 @@ impl App {
         Ok(())
     }
 
-    /// Launch a `claude` pane in the task's workspace and title its tab. A task created
-    /// via `n` spawns bare so the user types the task live; the prompt is passed as the
-    /// initial message only if the task already has one. `--permission-mode` is passed
-    /// only for an explicit override — otherwise the user's own default (e.g.
+    /// Whether this task's conversation is already on disk, i.e. whether relaunching it
+    /// must resume rather than create. Keyed on the task's *workspace* path, because that
+    /// is the directory claude was launched in and thus the project key it wrote under.
+    fn transcript_exists(&self, t: &Task, session_id: &str) -> bool {
+        t.ws_path
+            .as_deref()
+            .is_some_and(|ws| workspace::session_exists(&self.claude_projects, ws, session_id))
+    }
+
+    /// The `claude` argv for (re)launching this task's pane: pin the minted id on a first
+    /// boot, resume the conversation on every boot after that.
+    fn task_argv(&self, t: &Task) -> Vec<String> {
+        let sid = t.session_id.as_deref();
+        let launch = match sid {
+            None => session::Launch::Bare,
+            Some(s) if self.transcript_exists(t, s) => session::Launch::Resume,
+            Some(_) => session::Launch::Fresh,
+        };
+        session::claude_argv(
+            sid.unwrap_or_default(),
+            launch,
+            &t.prompt,
+            t.autonomy.permission_mode(),
+        )
+    }
+
+    /// Whether Enter can put an agent back into this task. Broader than `task_resumable`:
+    /// a task whose pane died before its first prompt has no conversation to restore, but
+    /// its workspace is intact and a blank agent belongs in it. That is the commonest lost
+    /// instance in faff, because `n` deliberately leaves the agent waiting to be typed at.
+    fn task_revivable(&self, t: &Task) -> bool {
+        session::revivable(t.pane_id, t.ws_path.is_some())
+    }
+
+    /// A *lost instance*: the agent's pane is gone but its conversation survived, so
+    /// faff can bring it back. Distinct from a task that simply never started.
+    fn task_resumable(&self, t: &Task) -> bool {
+        let sid = t.session_id.as_deref();
+        session::resumable(
+            t.pane_id,
+            sid,
+            sid.is_some_and(|s| self.transcript_exists(t, s)),
+        )
+    }
+
+    /// Launch a `claude` pane in the task's workspace and title its tab. The argv comes
+    /// from `task_argv`, so this is also the relaunch path for a lost instance: a first
+    /// boot pins the task's minted session id, a later one resumes the conversation that
+    /// id names. A task created via `n` spawns with no prompt so the user types the task
+    /// live; the prompt is passed as the initial message only if the task already has one
+    /// (and never on a resume — the conversation already holds it). `--permission-mode` is
+    /// passed only for an explicit override — otherwise the user's own default (e.g.
     /// `permissions.defaultMode=auto`) is inherited.
     fn spawn_claude(&self, t: &Task) -> Result<u64> {
         let ws_path = t.ws_path.clone().context("task has no workspace")?;
-        let mut prog: Vec<&str> = vec!["claude"];
-        if let Some(mode) = t.autonomy.permission_mode() {
-            prog.push("--permission-mode");
-            prog.push(mode);
-        }
-        if !t.prompt.is_empty() {
-            prog.push(&t.prompt);
-        }
+        let argv = self.task_argv(t);
+        let prog: Vec<&str> = argv.iter().map(String::as_str).collect();
         let pane = wezterm::spawn(&ws_path, &prog)?;
         let _ = wezterm::set_tab_title(pane, &format!("#{}", t.id.0));
         // `wezterm cli spawn` activates the new tab, stealing focus from faff. Return
@@ -473,19 +519,55 @@ impl App {
         }
     }
 
+    /// Recreate a lost instance: relaunch `claude --resume` in the task's jj workspace,
+    /// which the pane's death never touched, and dock it focused so the user can carry
+    /// on typing. The conversation comes back; the *process* does not — a turn in flight
+    /// when the pane died is gone, and MCP/background state starts over.
+    ///
+    /// Deliberately manual rather than automatic in `reconcile_panes`: a pane usually
+    /// vanishes because the user closed it, and respawning that on sight would be a
+    /// fight, not a feature.
+    fn revive_task(&mut self, faff: u64, t: &Task) {
+        let restoring = self.task_resumable(t);
+        match self.spawn_claude(t) {
+            Ok(pane) => {
+                let _ = self.store.set_pane(t.id, Some(pane));
+                self.status = if restoring {
+                    format!("revived #{} — conversation restored", t.id)
+                } else {
+                    format!(
+                        "started #{} — fresh agent, no conversation to restore",
+                        t.id
+                    )
+                };
+                self.open_session(faff, pane, true);
+            }
+            Err(e) => self.status = format!("revive #{} failed: {e}", t.id),
+        }
+        self.refresh();
+    }
+
     fn toggle_session(&mut self) {
-        let selected_pane = self.selected_task().and_then(|t| t.pane_id);
+        let selected = self.selected_task();
+        let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
+        let revivable = selected.as_ref().is_some_and(|t| self.task_revivable(t));
         let Some(faff) = self.faff_pane else {
             self.status = "no WEZTERM_PANE; run faff inside WezTerm".to_string();
             return;
         };
-        match session::decide(self.open_pane, selected_pane) {
+        match session::decide(self.open_pane, selected_pane, revivable) {
             session::Toggle::Nothing => self.status = "no session for this task".to_string(),
             // Open and Retarget both route through open_session (which detaches any
             // currently-docked session first).
             session::Toggle::Open(p) | session::Toggle::Retarget { open: p, .. } => {
                 // Docking to view an existing agent keeps focus on faff.
                 self.open_session(faff, p, false)
+            }
+            // The pane died but the conversation did not: bring the agent back.
+            session::Toggle::Revive => {
+                if let Some(t) = selected {
+                    self.revive_task(faff, &t);
+                }
             }
             session::Toggle::Detach(p) => {
                 if wezterm::detach(p).is_ok() {
@@ -1478,13 +1560,24 @@ impl App {
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
-    fn render_footer(&self, f: &mut Frame, area: Rect) {
-        let selected_pane = self.selected_task().and_then(|t| t.pane_id);
-        let enter = if self.open_pane.is_some() && self.open_pane == selected_pane {
+    /// What Enter will do to the current selection — the only place a *lost* instance
+    /// announces that it can be brought back.
+    fn enter_hint(&self) -> &'static str {
+        let selected = self.selected_task();
+        let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
+        if self.open_pane.is_some() && self.open_pane == selected_pane {
             "[↵]detach"
+        } else if selected.as_ref().is_some_and(|t| self.task_resumable(t)) {
+            "[↵]revive"
+        } else if selected.as_ref().is_some_and(|t| self.task_revivable(t)) {
+            "[↵]start"
         } else {
             "[↵]open"
-        };
+        }
+    }
+
+    fn render_footer(&self, f: &mut Frame, area: Rect) {
+        let enter = self.enter_hint();
         let keys = format!(
             " [n]ew [N]handoff {enter} [s]wap [S]napshot [r]ebase [d]escribe [a]ccept [A]abort [x]remove [X]remove+drop [q]uit   {}",
             self.status
@@ -1510,6 +1603,7 @@ mod tests {
             socket: PathBuf::from("/tmp/faf.sock"),
             db: PathBuf::from("/tmp/faf.db"),
             store: Store::open_memory().unwrap(),
+            claude_projects: PathBuf::from("/nope/projects"),
             events_rx,
             faff_pane: Some(1),
             tasks: Vec::new(),
@@ -2356,5 +2450,180 @@ mod tests {
             change_id: "z".into(),
         }];
         assert!(app.orphaned_workspaces(&live).is_empty());
+    }
+
+    // ---- recreating lost instances ----
+
+    /// An app whose Claude project root is a scratch dir, so transcript presence
+    /// (the thing that decides fresh-vs-resume) is controllable in a test.
+    fn app_with_projects(dir: &std::path::Path) -> App {
+        let mut app = test_app();
+        app.claude_projects = dir.to_path_buf();
+        app
+    }
+
+    /// A task with a workspace but no pane — the shape faff is left with after an
+    /// agent's pane dies. Returns the task and its minted session id.
+    fn lost_task(app: &mut App, ws: &std::path::Path) -> (Task, String) {
+        lost_task_with(app, ws, "do the thing")
+    }
+
+    fn lost_task_with(app: &mut App, ws: &std::path::Path, prompt: &str) -> (Task, String) {
+        let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(t.id, "faf-task-1", ws, "c1", "f1")
+            .unwrap();
+        let t = app.store.get_task(t.id).unwrap();
+        let sid = t.session_id.clone().expect("minted at creation");
+        app.tasks = vec![t.clone()];
+        app.task_order = vec![t.id];
+        app.selected = 0;
+        (t, sid)
+    }
+
+    fn write_transcript(projects: &std::path::Path, ws: &std::path::Path, sid: &str) {
+        let dir = projects.join(config::encode_repo_path(ws));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn a_task_that_never_ran_launches_fresh_and_pins_its_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+
+        assert_eq!(
+            app.task_argv(&t),
+            vec!["claude", "--session-id", &sid, "do the thing"]
+        );
+    }
+
+    #[test]
+    fn a_task_with_a_transcript_relaunches_as_a_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+        write_transcript(tmp.path(), &ws, &sid);
+
+        // No prompt re-sent, and --session-id would be rejected as already in use.
+        assert_eq!(app.task_argv(&t), vec!["claude", "--resume", &sid]);
+    }
+
+    #[test]
+    fn a_task_is_only_resumable_once_it_has_a_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+
+        assert!(!app.task_resumable(&t), "nothing written yet");
+        write_transcript(tmp.path(), &ws, &sid);
+        assert!(app.task_resumable(&t), "pane gone, conversation on disk");
+    }
+
+    #[test]
+    fn a_running_agent_is_not_treated_as_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+        write_transcript(tmp.path(), &ws, &sid);
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        let t = app.store.get_task(t.id).unwrap();
+
+        assert!(!app.task_resumable(&t));
+    }
+
+    #[test]
+    fn enter_on_a_lost_task_routes_to_revive_instead_of_reporting_no_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+        write_transcript(tmp.path(), &ws, &sid);
+
+        assert_eq!(
+            session::decide(app.open_pane, t.pane_id, app.task_resumable(&t)),
+            session::Toggle::Revive
+        );
+    }
+
+    #[test]
+    fn a_legacy_task_without_a_minted_id_still_launches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, _) = lost_task(&mut app, &ws);
+        let legacy = Task {
+            session_id: None,
+            ..t
+        };
+
+        assert_eq!(app.task_argv(&legacy), vec!["claude", "do the thing"]);
+        assert!(!app.task_resumable(&legacy), "no id, nothing to resume");
+    }
+
+    #[test]
+    fn the_enter_hint_offers_revive_only_for_a_lost_task() {
+        // The footer is where a lost instance becomes discoverable: selecting the row
+        // has to say that Enter will bring it back, not just "open".
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task(&mut app, &ws);
+
+        assert_eq!(
+            app.enter_hint(),
+            "[↵]start",
+            "workspace intact, no conversation yet"
+        );
+
+        write_transcript(tmp.path(), &ws, &sid);
+        assert_eq!(
+            app.enter_hint(),
+            "[↵]revive",
+            "pane gone, conversation kept"
+        );
+
+        app.store.set_pane(t.id, Some(42)).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        assert_eq!(app.enter_hint(), "[↵]open", "alive again, just not docked");
+
+        app.open_pane = Some(42);
+        assert_eq!(app.enter_hint(), "[↵]detach");
+    }
+
+    #[test]
+    fn a_task_that_died_before_its_first_prompt_gets_a_fresh_agent() {
+        // `n` spawns an agent sitting at an empty prompt, and claude writes no transcript
+        // until the first message — so faff's commonest lost instance has a live
+        // workspace and nothing to resume. It still deserves an agent back.
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let mut app = app_with_projects(tmp.path());
+        let (t, sid) = lost_task_with(&mut app, &ws, "");
+
+        assert!(app.task_revivable(&t), "workspace is intact");
+        assert!(!app.task_resumable(&t), "nothing written to resume from");
+        assert_eq!(app.task_argv(&t), vec!["claude", "--session-id", &sid]);
+        assert_eq!(app.enter_hint(), "[↵]start");
+    }
+
+    #[test]
+    fn a_task_with_no_workspace_left_cannot_be_revived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = app_with_projects(tmp.path());
+        let t = app
+            .store
+            .create_task("orphan", 0, Autonomy::Inherit)
+            .unwrap();
+        app.tasks = vec![t.clone()];
+        app.task_order = vec![t.id];
+
+        assert!(!app.task_revivable(&t));
+        assert_eq!(app.enter_hint(), "[↵]open");
     }
 }

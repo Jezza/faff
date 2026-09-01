@@ -413,6 +413,21 @@ pub fn claude_projects_dir() -> PathBuf {
     base.join("projects")
 }
 
+/// Where Claude Code keeps the transcript for `session_id` when run in `ws_path`:
+/// `<projects>/<project-key>/<session-id>.jsonl`. The key is derived from the *launch*
+/// directory, so this is only the right file while the task keeps its workspace path.
+pub fn transcript_path(claude_projects: &Path, ws_path: &Path, session_id: &str) -> PathBuf {
+    claude_projects
+        .join(config::encode_repo_path(ws_path))
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// Whether `session_id` has a conversation on disk that `claude --resume` can rehydrate.
+/// False before the agent's first turn — `--session-id` is the right launch then.
+pub fn session_exists(claude_projects: &Path, ws_path: &Path, session_id: &str) -> bool {
+    transcript_path(claude_projects, ws_path, session_id).is_file()
+}
+
 /// Share HEAD's memory with the new workspace (spec §8): the workspace's
 /// project-key `memory/` dir becomes a symlink to HEAD's, so memories written in
 /// any workspace land directly in HEAD's pool and survive workspace disposal.
@@ -1511,5 +1526,79 @@ mod tests {
             "x after handoff keeps the handed-off work as history"
         );
         assert!(!ws_path.exists(), "workspace dir removed");
+    }
+
+    // ---- transcript lookup ----
+
+    #[test]
+    fn transcript_path_is_the_project_key_plus_session_jsonl() {
+        let p = transcript_path(
+            Path::new("/home/j/.claude/projects"),
+            Path::new("/ws/0007-add-auth"),
+            "95121771-ebba-4005-a1ea-b48b58f1116f",
+        );
+        assert_eq!(
+            p,
+            Path::new(
+                "/home/j/.claude/projects/-ws-0007-add-auth/95121771-ebba-4005-a1ea-b48b58f1116f.jsonl"
+            )
+        );
+    }
+
+    #[test]
+    fn session_exists_only_once_claude_has_written_the_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let ws = Path::new("/ws/0007-add-auth");
+        let sid = "95121771-ebba-4005-a1ea-b48b58f1116f";
+
+        // Before the agent has ever run there is nothing to resume.
+        assert!(!session_exists(projects, ws, sid));
+
+        let dir = projects.join(config::encode_repo_path(ws));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        assert!(session_exists(projects, ws, sid));
+    }
+
+    #[test]
+    fn session_exists_is_false_for_a_different_session_in_the_same_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let ws = Path::new("/ws/0007-add-auth");
+        let dir = projects.join(config::encode_repo_path(ws));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("aaaaaaaa-0000-4000-8000-000000000000.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        assert!(!session_exists(
+            projects,
+            ws,
+            "bbbbbbbb-0000-4000-8000-000000000000"
+        ));
+    }
+
+    #[test]
+    fn transcript_path_matches_a_real_claude_project_key() {
+        // Pinned against reality, not against `encode_repo_path`: a claude launched in
+        // the faff workspace below wrote its transcript to exactly this directory. If the
+        // encoding ever drifts from Claude Code's scheme, resume detection silently fails
+        // (every task looks like it has nothing to resume), so this is worth nailing down.
+        let ws = Path::new("/home/jezza/.local/share/faf/-home-jezza-projects-faff/ws/0044-task");
+        let p = transcript_path(
+            Path::new("/home/jezza/.claude/projects"),
+            ws,
+            "3627b3be-4b2c-44d6-bd3a-7b348b725b88",
+        );
+        assert_eq!(
+            p,
+            Path::new(
+                "/home/jezza/.claude/projects/\
+                 -home-jezza--local-share-faf--home-jezza-projects-faff-ws-0044-task/\
+                 3627b3be-4b2c-44d6-bd3a-7b348b725b88.jsonl"
+            )
+        );
     }
 }
