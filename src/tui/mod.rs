@@ -5,6 +5,7 @@
 
 mod input;
 mod model;
+mod notify;
 mod session;
 mod train;
 
@@ -19,7 +20,7 @@ use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
@@ -30,6 +31,10 @@ type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
 
 /// Fixed display width of the change-id column (jj pads its shortest id to 8).
 const ID_W: usize = 8;
+
+/// Most rows the notice line may occupy. A jj error can be long; three wrapped lines
+/// is enough to read one in full without letting chrome crowd out the graph.
+const NOTICE_MAX_LINES: u16 = 3;
 
 /// The prompt `d` injects into an agent's pane: it asks the agent to summarise the end
 /// result of its current revision as a short jj description. faff never runs `jj describe`
@@ -117,6 +122,17 @@ fn restore_terminal(term: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// Which overlay, if any, is drawn over the graph. Modal: while one is open the next
+/// key closes it and does nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Overlay {
+    None,
+    /// `!` — notice scrollback.
+    Log,
+    /// `?` — the full keymap.
+    Help,
+}
+
 struct App {
     repo: PathBuf,
     faff_exe: PathBuf,
@@ -144,7 +160,11 @@ struct App {
     open_pane: Option<u64>,
     /// change_id -> (unique prefix, padding rest) for the id column, from jj.
     id_display: std::collections::HashMap<String, (String, String)>,
-    status: String,
+    /// Levelled notification log. The most recent note is shown on the notice line;
+    /// `!` opens the scrollback. Replaces the old untyped `status: String`.
+    notices: notify::Notices,
+    /// The open overlay, if any. See [`Overlay`].
+    overlay: Overlay,
     should_quit: bool,
     last_refresh: Instant,
     /// Set when an event arrived; coalesces bursts into a throttled refresh.
@@ -166,6 +186,177 @@ struct App {
     /// The merge train: revisions marked with `a` to be drained into your workspace one at
     /// a time. Advanced each refresh tick by `tick_merge_train`. See `tui::train`.
     merge_train: train::Train,
+}
+
+/// Toolbar groups. Order and membership are fixed: keys never move between widths, so
+/// muscle memory holds when faff is docked and the labels shrink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grp {
+    New,
+    Open,
+    Rev,
+    Train,
+    Del,
+    App,
+}
+
+impl Grp {
+    /// Prefix shown in the compact form. The app group has none — `q ? !` reads fine bare.
+    fn label(self) -> &'static str {
+        match self {
+            Grp::New => "new",
+            Grp::Open => "open",
+            Grp::Rev => "rev",
+            Grp::Train => "train",
+            Grp::Del => "del",
+            Grp::App => "",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Grp::New => Color::Green,
+            Grp::Open => Color::Blue,
+            Grp::Rev => Color::Cyan,
+            Grp::Train => Color::Magenta,
+            Grp::Del => Color::Red,
+            Grp::App => Color::DarkGray,
+        }
+    }
+}
+
+struct Hint {
+    key: &'static str,
+    /// Label used in the verbose form and in the `?` overlay.
+    verbose: &'static str,
+    grp: Grp,
+}
+
+/// Every binding the toolbar advertises, in display order. `↵`'s label is overridden at
+/// render time by [`App::enter_hint`] (open / detach / revive / start). Keep in sync
+/// with `input::map_key` — the test
+/// `every_action_key_appears_in_the_toolbar_data` enforces it.
+const HINTS: &[Hint] = &[
+    Hint {
+        key: "n",
+        verbose: "new",
+        grp: Grp::New,
+    },
+    Hint {
+        key: "N",
+        verbose: "handoff",
+        grp: Grp::New,
+    },
+    Hint {
+        key: "↵",
+        verbose: "open",
+        grp: Grp::Open,
+    },
+    Hint {
+        key: "s",
+        verbose: "swap",
+        grp: Grp::Rev,
+    },
+    Hint {
+        key: "S",
+        verbose: "snap",
+        grp: Grp::Rev,
+    },
+    Hint {
+        key: "r",
+        verbose: "rebase",
+        grp: Grp::Rev,
+    },
+    Hint {
+        key: "R",
+        verbose: "onto",
+        grp: Grp::Rev,
+    },
+    Hint {
+        key: "d",
+        verbose: "desc",
+        grp: Grp::Rev,
+    },
+    Hint {
+        key: "a",
+        verbose: "accept",
+        grp: Grp::Train,
+    },
+    Hint {
+        key: "A",
+        verbose: "abort",
+        grp: Grp::Train,
+    },
+    Hint {
+        key: "x",
+        verbose: "rm",
+        grp: Grp::Del,
+    },
+    Hint {
+        key: "X",
+        verbose: "drop",
+        grp: Grp::Del,
+    },
+    Hint {
+        key: "q",
+        verbose: "quit",
+        grp: Grp::App,
+    },
+    Hint {
+        key: "?",
+        verbose: "keys",
+        grp: Grp::App,
+    },
+    Hint {
+        key: "!",
+        verbose: "log",
+        grp: Grp::App,
+    },
+];
+
+/// Cheap, render-time facts about the selected row, used only to dim unavailable keys.
+///
+/// Deliberately an approximation of the real guards: `a`'s emptiness check
+/// (`jj::any_revision`) and its clear-`@` check shell out to jj, and render must stay
+/// pure and cheap. The authoritative guards live in the action functions, where they
+/// produce the Warn notices. Dimming is a hint, not enforcement — `a` can render
+/// undimmed and still refuse.
+struct Caps {
+    has_ws: bool,
+    has_pane: bool,
+    has_prompt: bool,
+    train: bool,
+    /// A pane-less row Enter can still act on: the workspace outlived the agent, so `↵`
+    /// starts or revives one in it rather than reporting "no session".
+    revivable: bool,
+}
+
+/// Clip a line to `width` columns, replacing the final column with `…` so it reads as
+/// cut rather than as a complete row. Used only below ~56 columns, where even the
+/// compact key row overflows.
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width || width == 0 {
+        return line;
+    }
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for span in line.spans {
+        let w = span.content.chars().count();
+        if used + w <= budget {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        let take = budget - used;
+        if take > 0 {
+            let cut: String = span.content.chars().take(take).collect();
+            out.push(Span::styled(cut, span.style));
+        }
+        break;
+    }
+    out.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+    Line::from(out)
 }
 
 impl App {
@@ -197,7 +388,8 @@ impl App {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            status: "ready".to_string(),
+            notices: notify::Notices::default(),
+            overlay: Overlay::None,
             should_quit: false,
             last_refresh: Instant::now(),
             pending_refresh: false,
@@ -207,6 +399,9 @@ impl App {
             pending_select: None,
             merge_train: train::Train::default(),
         };
+        app.notices.info("ready");
+        // The opening "ready" is not news; don't start the session with a badge.
+        app.notices.mark_seen();
         app.refresh();
         Ok(app)
     }
@@ -252,13 +447,20 @@ impl App {
 
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         let action = input::map_key(key);
+        // An open overlay is modal: the next key dismisses it and nothing else. Safe to
+        // check before the `pending_*` blocks because the two cannot coexist — while a
+        // confirmation is armed, `!`/`?` are swallowed as "any other key cancels".
+        if self.overlay != Overlay::None {
+            self.overlay = Overlay::None;
+            return;
+        }
         // A pending swap-confirmation swallows the next key: `s` confirms, anything
         // else cancels (so a live agent's files are only yanked on a deliberate re-press).
         if let Some(id) = self.pending_swap.take() {
             if action == Action::Swap {
                 self.perform_swap(id);
             } else {
-                self.status = "swap cancelled".to_string();
+                self.notices.info("swap cancelled");
             }
             return;
         }
@@ -266,12 +468,12 @@ impl App {
         // `R`) confirms, anything else cancels (a redirect prompt into a live agent is
         // only sent on a deliberate re-press).
         if let Some((id, freeze)) = self.pending_rebase.take() {
-            let confirmed = (freeze && action == Action::Rebase)
-                || (!freeze && action == Action::RebaseParent);
+            let confirmed =
+                (freeze && action == Action::Rebase) || (!freeze && action == Action::RebaseParent);
             if confirmed {
                 self.perform_rebase(id, freeze);
             } else {
-                self.status = "rebase cancelled".to_string();
+                self.notices.info("rebase cancelled");
             }
             return;
         }
@@ -282,7 +484,7 @@ impl App {
             if action == Action::Describe {
                 self.perform_describe(id);
             } else {
-                self.status = "describe cancelled".to_string();
+                self.notices.info("describe cancelled");
             }
             return;
         }
@@ -302,6 +504,11 @@ impl App {
             Action::Describe => self.describe_selected(),
             Action::Accept => self.accept_selected(),
             Action::AbortTrain => self.abort_train(),
+            Action::ShowLog => {
+                self.overlay = Overlay::Log;
+                self.notices.mark_seen();
+            }
+            Action::Help => self.overlay = Overlay::Help,
             Action::None => {}
         }
     }
@@ -337,10 +544,11 @@ impl App {
     fn new_task(&mut self) {
         match self.try_new_task(false) {
             Ok(id) => {
-                self.status = format!("new task #{id} — type your task in the pane");
+                self.notices
+                    .ok(format!("new task #{id} — type your task in the pane"));
                 self.pending_select = Some(id);
             }
-            Err(e) => self.status = format!("new task failed: {e}"),
+            Err(e) => self.notices.err(format!("new task failed: {e}")),
         }
         self.refresh();
     }
@@ -352,10 +560,12 @@ impl App {
     fn handoff_task(&mut self) {
         match self.try_new_task(true) {
             Ok(id) => {
-                self.status = format!("handed off #{id} — type what to finish in the pane");
+                self.notices.ok(format!(
+                    "handed off #{id} — type what to finish in the pane"
+                ));
                 self.pending_select = Some(id);
             }
-            Err(e) => self.status = format!("handoff failed: {e}"),
+            Err(e) => self.notices.err(format!("handoff failed: {e}")),
         }
         self.refresh();
     }
@@ -532,17 +742,18 @@ impl App {
         match self.spawn_claude(t) {
             Ok(pane) => {
                 let _ = self.store.set_pane(t.id, Some(pane));
-                self.status = if restoring {
-                    format!("revived #{} — conversation restored", t.id)
+                if restoring {
+                    self.notices
+                        .ok(format!("revived #{} — conversation restored", t.id));
                 } else {
-                    format!(
+                    self.notices.ok(format!(
                         "started #{} — fresh agent, no conversation to restore",
                         t.id
-                    )
-                };
+                    ));
+                }
                 self.open_session(faff, pane, true);
             }
-            Err(e) => self.status = format!("revive #{} failed: {e}", t.id),
+            Err(e) => self.notices.err(format!("revive #{} failed: {e}", t.id)),
         }
         self.refresh();
     }
@@ -552,11 +763,12 @@ impl App {
         let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
         let revivable = selected.as_ref().is_some_and(|t| self.task_revivable(t));
         let Some(faff) = self.faff_pane else {
-            self.status = "no WEZTERM_PANE; run faff inside WezTerm".to_string();
+            self.notices
+                .warn("no WEZTERM_PANE; run faff inside WezTerm");
             return;
         };
         match session::decide(self.open_pane, selected_pane, revivable) {
-            session::Toggle::Nothing => self.status = "no session for this task".to_string(),
+            session::Toggle::Nothing => self.notices.warn("no session for this task"),
             // Open and Retarget both route through open_session (which detaches any
             // currently-docked session first).
             session::Toggle::Open(p) | session::Toggle::Retarget { open: p, .. } => {
@@ -591,11 +803,12 @@ impl App {
         };
         let id = t.id;
         self.remove_task(id, discard_revision);
-        self.status = if discard_revision {
+        let msg = if discard_revision {
             format!("removed #{} and discarded its revision", id.0)
         } else {
             format!("removed #{}", id.0)
         };
+        self.notices.ok(msg);
         self.refresh();
     }
 
@@ -634,15 +847,15 @@ impl App {
             return;
         };
         if t.ws_name.is_none() || t.ws_path.is_none() {
-            self.status = "no workspace to swap for this task".to_string();
+            self.notices.warn("no workspace to swap for this task");
             return;
         }
         if t.status == TaskStatus::Working {
             self.pending_swap = Some(t.id);
-            self.status = format!(
+            self.notices.prompt(format!(
                 "#{} is working — press s to confirm swap, any other key cancels",
                 t.id.0
-            );
+            ));
             return;
         }
         self.perform_swap(t.id);
@@ -654,16 +867,16 @@ impl App {
             return;
         };
         let (Some(name), Some(path)) = (t.ws_name.clone(), t.ws_path.clone()) else {
-            self.status = "no workspace to swap for this task".to_string();
+            self.notices.warn("no workspace to swap for this task");
             return;
         };
         match workspace::swap(&self.repo, &name, &path) {
             Ok(new_rev) => {
                 // Keep the recorded revision honest (the graph rebuilds from jj anyway).
                 let _ = self.store.set_ws_change_id(id, &new_rev);
-                self.status = format!("swapped @ ⇄ #{}", id.0);
+                self.notices.ok(format!("swapped @ ⇄ #{}", id.0));
             }
-            Err(e) => self.status = format!("swap failed: {e}"),
+            Err(e) => self.notices.err(format!("swap failed: {e}")),
         }
         self.refresh();
     }
@@ -675,12 +888,12 @@ impl App {
             return;
         };
         let Some(path) = t.ws_path.clone() else {
-            self.status = "no workspace to snapshot for this task".to_string();
+            self.notices.warn("no workspace to snapshot for this task");
             return;
         };
         match workspace::snapshot(&path) {
-            Ok(()) => self.status = format!("snapshotted #{}", t.id.0),
-            Err(e) => self.status = format!("snapshot failed: {e}"),
+            Ok(()) => self.notices.ok(format!("snapshotted #{}", t.id.0)),
+            Err(e) => self.notices.err(format!("snapshot failed: {e}")),
         }
         self.refresh();
     }
@@ -696,27 +909,29 @@ impl App {
             return;
         };
         if t.ws_name.is_none() {
-            self.status = "no workspace to rebase for this task".to_string();
+            self.notices.warn("no workspace to rebase for this task");
             return;
         }
         if t.pane_id.is_none() {
-            self.status = "no live pane to send the rebase prompt to".to_string();
+            self.notices
+                .warn("no live pane to send the rebase prompt to");
             return;
         }
         // The UserPromptSubmit hook captures the *first* prompt as the task title. Before
         // the user has sent one, an injected rebase prompt would become that title — so
         // hold off until the task has a real prompt of its own.
         if t.prompt.is_empty() {
-            self.status = "send the task its first prompt before rebasing".to_string();
+            self.notices
+                .warn("send the task its first prompt before rebasing");
             return;
         }
         if t.status == TaskStatus::Working {
             self.pending_rebase = Some((t.id, freeze));
             let key = if freeze { "r" } else { "R" };
-            self.status = format!(
+            self.notices.prompt(format!(
                 "#{} is working — press {key} to confirm rebase, any other key cancels",
                 t.id.0
-            );
+            ));
             return;
         }
         self.perform_rebase(t.id, freeze);
@@ -729,19 +944,22 @@ impl App {
             return;
         };
         let (Some(name), Some(pane)) = (t.ws_name.clone(), t.pane_id) else {
-            self.status = "no workspace/pane to rebase for this task".to_string();
+            self.notices
+                .warn("no workspace/pane to rebase for this task");
             return;
         };
         match workspace::refresh(&self.repo, &name, freeze) {
             Ok(workspace::Refresh::AlreadyFresh) => {
-                self.status = format!("#{} is already on the latest base", id.0);
+                self.notices
+                    .warn(format!("#{} is already on the latest base", id.0));
             }
-            Ok(workspace::Refresh::Rebase { prompt, .. }) => match wezterm::send_text(pane, &prompt)
-            {
-                Ok(()) => self.status = format!("sent rebase to #{}", id.0),
-                Err(e) => self.status = format!("rebase send failed: {e}"),
-            },
-            Err(e) => self.status = format!("rebase failed: {e}"),
+            Ok(workspace::Refresh::Rebase { prompt, .. }) => {
+                match wezterm::send_text(pane, &prompt) {
+                    Ok(()) => self.notices.ok(format!("sent rebase to #{}", id.0)),
+                    Err(e) => self.notices.err(format!("rebase send failed: {e}")),
+                }
+            }
+            Err(e) => self.notices.err(format!("rebase failed: {e}")),
         }
         self.refresh();
     }
@@ -757,26 +975,28 @@ impl App {
             return;
         };
         if t.ws_name.is_none() {
-            self.status = "no workspace to describe for this task".to_string();
+            self.notices.warn("no workspace to describe for this task");
             return;
         }
         if t.pane_id.is_none() {
-            self.status = "no live pane to send the describe prompt to".to_string();
+            self.notices
+                .warn("no live pane to send the describe prompt to");
             return;
         }
         // Like rebase: the first prompt is captured as the task title, so an injected
         // describe prompt sent before the user's own first prompt would become that title.
         // Hold off until the task has a real prompt (and thus some work to describe).
         if t.prompt.is_empty() {
-            self.status = "send the task its first prompt before describing".to_string();
+            self.notices
+                .warn("send the task its first prompt before describing");
             return;
         }
         if t.status == TaskStatus::Working {
             self.pending_describe = Some(t.id);
-            self.status = format!(
+            self.notices.prompt(format!(
                 "#{} is working — press d to confirm describe, any other key cancels",
                 t.id.0
-            );
+            ));
             return;
         }
         self.perform_describe(t.id);
@@ -788,12 +1008,12 @@ impl App {
             return;
         };
         let Some(pane) = t.pane_id else {
-            self.status = "no pane to describe for this task".to_string();
+            self.notices.warn("no pane to describe for this task");
             return;
         };
         match wezterm::send_text(pane, DESCRIBE_PROMPT) {
-            Ok(()) => self.status = format!("sent describe to #{}", id.0),
-            Err(e) => self.status = format!("describe send failed: {e}"),
+            Ok(()) => self.notices.ok(format!("sent describe to #{}", id.0)),
+            Err(e) => self.notices.err(format!("describe send failed: {e}")),
         }
         self.refresh();
     }
@@ -812,53 +1032,63 @@ impl App {
         // Already queued → toggle it back out.
         if self.merge_train.contains(t.id) {
             self.merge_train.remove(t.id);
-            self.status = format!("#{} removed from the merge train", t.id.0);
+            self.notices
+                .ok(format!("#{} removed from the merge train", t.id.0));
             return;
         }
         let Some(name) = t.ws_name.clone() else {
-            self.status = "no workspace to accept for this task".to_string();
+            self.notices.warn("no workspace to accept for this task");
             return;
         };
         if t.pane_id.is_none() {
-            self.status = format!("no live pane to drive #{} through the merge train", t.id.0);
+            self.notices.warn(format!(
+                "no live pane to drive #{} through the merge train",
+                t.id.0
+            ));
             return;
         }
         if t.prompt.is_empty() {
-            self.status = "send the task its first prompt before accepting".to_string();
+            self.notices
+                .warn("send the task its first prompt before accepting");
             return;
         }
         // Nothing to merge if the agent's revision is empty.
         if !jj::any_revision(&self.repo, &format!("{name}@ ~ empty()")).unwrap_or(false) {
-            self.status = format!("#{} has no content to merge", t.id.0);
+            self.notices
+                .warn(format!("#{} has no content to merge", t.id.0));
             return;
         }
         // Starting a train needs a clear `@` to land the first revision onto.
         if self.merge_train.is_empty() && !self.at_is_clear() {
-            self.status =
-                "your @ has content — commit or hand it off before accepting".to_string();
+            self.notices
+                .warn("your @ has content — commit or hand it off before accepting");
             return;
         }
         self.merge_train.add(t.id);
-        self.status = format!("#{} accepted into the merge train", t.id.0);
+        self.notices
+            .ok(format!("#{} accepted into the merge train", t.id.0));
     }
 
     /// `A`: abort the merge train — dequeue everything still pending. Revisions already
     /// taken over stay merged; nothing is rolled back.
     fn abort_train(&mut self) {
         if self.merge_train.is_empty() {
-            self.status = "no merge train to abort".to_string();
+            self.notices.warn("no merge train to abort");
             return;
         }
         let n = self.merge_train.len();
         self.merge_train.clear();
-        self.status = format!("merge train aborted — {n} dequeued");
+        self.notices
+            .ok(format!("merge train aborted — {n} dequeued"));
     }
 
     /// Whether your `@` is an empty, description-less commit — the landing spot the train
     /// needs. On a jj error it reports "not clear" (never merge onto an unknown `@`).
     fn at_is_clear(&self) -> bool {
         let empty = !jj::any_revision(&self.repo, "@ ~ empty()").unwrap_or(true);
-        let described = !jj::description(&self.repo, "@").unwrap_or_default().is_empty();
+        let described = !jj::description(&self.repo, "@")
+            .unwrap_or_default()
+            .is_empty();
         empty && !described
     }
 
@@ -919,12 +1149,16 @@ impl App {
             // can't merge — drop it (leaving it as an ordinary task to handle by hand).
             if stable && conflict {
                 self.merge_train.remove(id);
-                self.status = format!("#{} has conflicts — dropped from the merge train", id.0);
+                self.notices.warn(format!(
+                    "#{} has conflicts — dropped from the merge train",
+                    id.0
+                ));
                 continue;
             }
             if stable && empty {
                 self.merge_train.remove(id);
-                self.status = format!("#{} has no content to merge — dropped", id.0);
+                self.notices
+                    .warn(format!("#{} has no content to merge — dropped", id.0));
                 continue;
             }
             let on_tip =
@@ -1020,7 +1254,8 @@ impl App {
             }
         }
         // (b) Ask off-tip settled members to rebase onto the tip (the ready-first fan-out).
-        let mut off_tip: Vec<&MergeFacts> = facts.iter().filter(|f| f.stable && !f.on_tip).collect();
+        let mut off_tip: Vec<&MergeFacts> =
+            facts.iter().filter(|f| f.stable && !f.on_tip).collect();
         off_tip.sort_by_key(|f| f.seq);
         for f in off_tip {
             if sent >= MAX_MERGE_INJECTIONS_PER_TICK {
@@ -1049,7 +1284,12 @@ impl App {
         prompt: String,
         now: Instant,
     ) {
-        let Some(pane) = self.tasks.iter().find(|t| t.id == id).and_then(|t| t.pane_id) else {
+        let Some(pane) = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.pane_id)
+        else {
             return;
         };
         let _ = wezterm::send_text(pane, &prompt);
@@ -1072,9 +1312,10 @@ impl App {
         match workspace::take_over(&self.repo, &name, &path) {
             Ok(_head) => {
                 self.remove_task(id, false); // also drops it from the train
-                self.status = format!("merged #{} into your workspace", id.0);
+                self.notices
+                    .ok(format!("merged #{} into your workspace", id.0));
             }
-            Err(e) => self.status = format!("merge of #{} failed: {e}", id.0),
+            Err(e) => self.notices.err(format!("merge of #{} failed: {e}", id.0)),
         }
         self.refresh();
     }
@@ -1126,7 +1367,7 @@ impl App {
                     self.id_display = id_display;
                     self.fork_point = fork_point;
                 }
-                Err(e) => self.status = format!("jj error: {e}"),
+                Err(e) => self.notices.err(format!("jj error: {e}")),
             }
         }
 
@@ -1293,13 +1534,15 @@ impl App {
 
     fn render(&self, f: &mut Frame) {
         let train_h = self.merge_train_height();
+        let notice_h = self.notice_height(f.area().width);
         let mut constraints = vec![
-            Constraint::Length(1), // header
-            Constraint::Min(1),    // revision graph
-            Constraint::Length(1), // hint bar
+            Constraint::Length(1),        // header
+            Constraint::Min(1),           // revision graph
+            Constraint::Length(notice_h), // notice line
+            Constraint::Length(1),        // key row
         ];
         if train_h > 0 {
-            constraints.push(Constraint::Length(train_h)); // merge-train panel below the hints
+            constraints.push(Constraint::Length(train_h)); // merge-train panel below the keys
         }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1307,9 +1550,13 @@ impl App {
             .split(f.area());
         self.render_header(f, chunks[0]);
         self.render_body(f, chunks[1]);
-        self.render_footer(f, chunks[2]);
+        if self.overlay != Overlay::None {
+            self.render_overlay(f, chunks[1]);
+        }
+        self.render_notice(f, chunks[2]);
+        self.render_keys(f, chunks[3]);
         if train_h > 0 {
-            self.render_merge_train(f, chunks[3]);
+            self.render_merge_train(f, chunks[4]);
         }
     }
 
@@ -1465,10 +1712,8 @@ impl App {
                                 ch.to_string(),
                                 base.fg(color).add_modifier(Modifier::BOLD),
                             ));
-                            spans.push(Span::styled(
-                                gutter[at + ch.len_utf8()..].to_string(),
-                                base,
-                            ));
+                            spans
+                                .push(Span::styled(gutter[at + ch.len_utf8()..].to_string(), base));
                         }
                         None => spans.push(Span::styled(gutter, base)),
                     }
@@ -1584,32 +1829,268 @@ impl App {
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
-    /// What Enter will do to the current selection — the only place a *lost* instance
+    /// Rows the current notice needs, clamped to [`NOTICE_MAX_LINES`]. At least 1 even
+    /// with no notice, so the graph does not jitter when the first one arrives.
+    fn notice_height(&self, width: u16) -> u16 {
+        let Some(n) = self.notices.latest() else {
+            return 1;
+        };
+        let avail = usize::from(width.saturating_sub(3)).max(1);
+        (notify::wrap_words(&n.text, avail).len() as u16).clamp(1, NOTICE_MAX_LINES)
+    }
+
+    /// The current notice, coloured by level and wrapped. Sticky: it stays until the
+    /// next notice replaces it.
+    fn render_notice(&self, f: &mut Frame, area: Rect) {
+        let Some(n) = self.notices.latest() else {
+            return;
+        };
+        let avail = usize::from(area.width.saturating_sub(3)).max(1);
+        let wrapped = notify::wrap_words(&n.text, avail);
+        let clipped = wrapped.len() > NOTICE_MAX_LINES as usize;
+        let style = Style::default().fg(n.level.color());
+        let last = NOTICE_MAX_LINES as usize - 1;
+        let lines: Vec<Line> = wrapped
+            .iter()
+            .take(NOTICE_MAX_LINES as usize)
+            .enumerate()
+            .map(|(i, w)| {
+                // Anything past the cap is still in the `!` log; mark the cut.
+                let text = if clipped && i == last {
+                    format!("{w}…")
+                } else {
+                    w.clone()
+                };
+                if i == 0 {
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {} ", n.level.glyph()),
+                            style.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(text, style),
+                    ])
+                } else {
+                    // Continuation lines indent clear of the glyph column.
+                    Line::from(Span::styled(format!("   {text}"), style))
+                }
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    fn caps(&self) -> Caps {
+        let t = self.selected_task();
+        Caps {
+            has_ws: t.as_ref().is_some_and(|t| t.ws_path.is_some()),
+            has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
+            has_prompt: t.as_ref().is_some_and(|t| !t.prompt.is_empty()),
+            train: !self.merge_train.is_empty(),
+            revivable: t.as_ref().is_some_and(|t| self.task_revivable(t)),
+        }
+    }
+
+    /// Whether `key` is usable on the selected row. See [`Caps`] on why this is an
+    /// approximation.
+    fn hint_available(key: &str, c: &Caps) -> bool {
+        match key {
+            // A lost instance has no pane, but Enter still has something to do with it.
+            "↵" => c.has_pane || c.revivable,
+            "s" | "S" => c.has_ws,
+            "r" | "R" | "d" | "a" => c.has_ws && c.has_pane && c.has_prompt,
+            "A" => c.train,
+            _ => true,
+        }
+    }
+
+    /// The `↵` label for the current selection — the only place a *lost* instance
     /// announces that it can be brought back.
     fn enter_hint(&self) -> &'static str {
         let selected = self.selected_task();
         let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
         if self.open_pane.is_some() && self.open_pane == selected_pane {
-            "[↵]detach"
+            "detach"
         } else if selected.as_ref().is_some_and(|t| self.task_resumable(t)) {
-            "[↵]revive"
+            "revive"
         } else if selected.as_ref().is_some_and(|t| self.task_revivable(t)) {
-            "[↵]start"
+            "start"
         } else {
-            "[↵]open"
+            "open"
         }
     }
 
-    fn render_footer(&self, f: &mut Frame, area: Rect) {
+    /// Build the key row. `verbose` picks `n new  N handoff …`; otherwise the compact
+    /// `new nN │ open ↵ │ …`. Both come from [`HINTS`], so their widths are derived and
+    /// the two forms cannot drift apart.
+    fn keys_line(&self, verbose: bool) -> Line<'static> {
+        let caps = self.caps();
         let enter = self.enter_hint();
-        let keys = format!(
-            " [n]ew [N]handoff {enter} [s]wap [S]napshot [r]ebase [d]escribe [a]ccept [A]abort [x]remove [X]remove+drop [q]uit   {}",
-            self.status
-        );
-        f.render_widget(
-            Paragraph::new(keys).style(Style::default().fg(Color::DarkGray)),
-            area,
-        );
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut cur: Option<Grp> = None;
+        // The `!` key doubles as the unseen-notice badge, coloured by the worst unseen
+        // level so a red `!3` is visible without opening anything.
+        let unseen = self.notices.unseen();
+        let badge = self.notices.max_unseen_level().map(|l| l.color());
+        for h in HINTS {
+            let label = if h.key == "↵" { enter } else { h.verbose };
+            if cur != Some(h.grp) {
+                if cur.is_some() {
+                    spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.push(Span::raw(" "));
+                }
+                if !verbose && !h.grp.label().is_empty() {
+                    spans.push(Span::styled(
+                        format!("{} ", h.grp.label()),
+                        Style::default().fg(h.grp.color()),
+                    ));
+                }
+                cur = Some(h.grp);
+            } else if verbose {
+                spans.push(Span::raw("  "));
+            } else if h.grp == Grp::App {
+                // The app group's keys are unrelated to each other, unlike the `nN`/`xX`
+                // pairs, and the badge would otherwise jam into `?` as `q?!3`.
+                spans.push(Span::raw(" "));
+            }
+            let key_text = if h.key == "!" && unseen > 0 {
+                format!("!{unseen}")
+            } else {
+                h.key.to_string()
+            };
+            let badge_color = if h.key == "!" && unseen > 0 {
+                badge
+            } else {
+                None
+            };
+            // Unavailable keys stay in place and dim, so nothing ever shifts sideways.
+            let mut style = Style::default().fg(badge_color.unwrap_or(h.grp.color()));
+            if !Self::hint_available(h.key, &caps) {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            if verbose {
+                spans.push(Span::styled(
+                    format!("{key_text} "),
+                    style.add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(label.to_string(), style));
+            } else {
+                spans.push(Span::styled(key_text, style));
+            }
+        }
+        Line::from(spans)
+    }
+
+    /// Draw the open overlay over the graph area. `Clear` wipes the graph underneath so
+    /// the two do not interleave.
+    fn render_overlay(&self, f: &mut Frame, area: Rect) {
+        let avail = usize::from(area.width.saturating_sub(4)).max(1);
+        let (title, lines) = match self.overlay {
+            Overlay::Log => ("notices  ·  any key closes", self.log_lines(avail)),
+            Overlay::Help => ("keys  ·  any key closes", self.help_lines()),
+            Overlay::None => return,
+        };
+        f.render_widget(Clear, area);
+        let block = Block::default().borders(Borders::ALL).title(title);
+        let para = Paragraph::new(lines).block(block);
+        // The log wraps itself (it needs the line count); the keymap's group rows are
+        // built whole, so let Paragraph fold them rather than clip a binding off the
+        // edge in a narrow pane.
+        let para = match self.overlay {
+            Overlay::Help => para.wrap(Wrap { trim: false }),
+            _ => para,
+        };
+        f.render_widget(para, area);
+    }
+
+    /// Notice scrollback, newest first: `HH:MM:SS ✓ text`, wrapped under the glyph.
+    fn log_lines(&self, avail: usize) -> Vec<Line<'static>> {
+        if self.notices.latest().is_none() {
+            return vec![Line::from(Span::styled(
+                " nothing reported yet",
+                Style::default().fg(Color::DarkGray),
+            ))];
+        }
+        // "HH:MM:SS " + glyph + " " — continuation lines indent past it.
+        let indent = 11usize;
+        let text_w = avail.saturating_sub(indent).max(1);
+        let mut lines = Vec::new();
+        for n in self.notices.iter() {
+            let style = Style::default().fg(n.level.color());
+            for (i, w) in notify::wrap_words(&n.text, text_w).into_iter().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            n.at.format("%H:%M:%S ").to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{} ", n.level.glyph()),
+                            style.add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(w, style),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("{:indent$}{w}", "", indent = indent),
+                        style,
+                    )));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Every binding, including the ones the toolbar has no room for. Laid out one row
+    /// per toolbar group so the whole keymap fits a short pane without scrolling — a
+    /// reference that can be clipped is worse than none.
+    fn help_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!(" {:<8}", "move"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("↑/↓ j/k ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("select", Style::default().fg(Color::DarkGray)),
+        ])];
+        let mut cur: Option<Grp> = None;
+        for h in HINTS {
+            if cur != Some(h.grp) {
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {:<8}", h.grp.label()),
+                    Style::default().fg(h.grp.color()),
+                )]));
+                cur = Some(h.grp);
+            }
+            let row = lines.last_mut().expect("a group row was pushed");
+            row.spans.push(Span::styled(
+                format!("{} ", h.key),
+                Style::default()
+                    .fg(h.grp.color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+            row.spans.push(Span::styled(
+                format!("{:<9}", h.verbose),
+                Style::default().fg(h.grp.color()),
+            ));
+        }
+        lines
+    }
+
+    /// Render the key row at whichever verbosity fits, truncating if even the compact
+    /// form overflows.
+    fn render_keys(&self, f: &mut Frame, area: Rect) {
+        let verbose = self.keys_line(true);
+        let line = if verbose.width() as u16 <= area.width {
+            verbose
+        } else {
+            let compact = self.keys_line(false);
+            if compact.width() as u16 <= area.width {
+                compact
+            } else {
+                truncate_line(compact, area.width as usize)
+            }
+        };
+        f.render_widget(Paragraph::new(line), area);
     }
 }
 
@@ -1682,7 +2163,8 @@ mod tests {
             selected: 0,
             open_pane: None,
             id_display: std::collections::HashMap::new(),
-            status: "ready".into(),
+            notices: notify::Notices::default(),
+            overlay: Overlay::None,
             should_quit: false,
             pending_refresh: false,
             pending_swap: None,
@@ -1692,6 +2174,287 @@ mod tests {
             merge_train: train::Train::default(),
             last_refresh: Instant::now(),
         }
+    }
+
+    /// The rendered buffer as newline-joined rows, for substring assertions.
+    fn buffer_text(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        buf.content
+            .chunks(w)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        term
+    }
+
+    #[test]
+    fn notice_is_visible_in_a_narrow_docked_pane() {
+        // The reported bug: docked beside a Claude pane faff gets ~60 columns, and the
+        // notice used to start at column 118. This fails against the pre-Task-3 layout.
+        let mut app = test_app();
+        app.notices.ok("snapshotted #7");
+        let term = draw(&mut app, 60, 12);
+        assert!(
+            buffer_text(&term).contains("snapshotted #7"),
+            "the notice must be on screen at 60 columns:\n{}",
+            buffer_text(&term)
+        );
+    }
+
+    #[test]
+    fn notice_carries_its_level_glyph() {
+        let mut app = test_app();
+        app.notices.err("snapshot failed: boom");
+        let term = draw(&mut app, 60, 12);
+        let text = buffer_text(&term);
+        assert!(text.contains("✗ snapshot failed: boom"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_long_error_wraps_instead_of_being_clipped() {
+        let mut app = test_app();
+        app.notices
+            .err("snapshot failed: jj util snapshot: No such file or directory (os error 2)");
+        let term = draw(&mut app, 60, 14);
+        let text = buffer_text(&term);
+        assert!(text.contains("No such file"), "first line present:\n{text}");
+        assert!(
+            text.contains("(os error 2)"),
+            "the tail must wrap onto a second line rather than being clipped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn notice_height_is_one_for_a_short_note() {
+        let mut app = test_app();
+        app.notices.ok("snapshotted #7");
+        assert_eq!(app.notice_height(60), 1);
+    }
+
+    #[test]
+    fn notice_height_is_capped_at_three_lines() {
+        let mut app = test_app();
+        app.notices.err("word ".repeat(200));
+        assert_eq!(
+            app.notice_height(40),
+            NOTICE_MAX_LINES,
+            "an enormous error must not eat the graph"
+        );
+    }
+
+    #[test]
+    fn notice_line_is_reserved_even_with_no_notice() {
+        // Nothing has been pushed: the row still exists, so the graph does not jitter
+        // by one line the first time a notice appears.
+        let app = test_app();
+        assert_eq!(app.notice_height(60), 1);
+    }
+
+    #[test]
+    fn verbose_key_row_is_used_when_it_fits() {
+        let mut app = test_app();
+        let w = app.keys_line(true).width() as u16;
+        let term = draw(&mut app, w, 12);
+        assert!(
+            buffer_text(&term).contains("N handoff"),
+            "verbose labels shown"
+        );
+    }
+
+    #[test]
+    fn compact_key_row_is_used_when_verbose_does_not_fit() {
+        let mut app = test_app();
+        let w = app.keys_line(true).width() as u16 - 1;
+        let term = draw(&mut app, w, 12);
+        let text = buffer_text(&term);
+        assert!(
+            !text.contains("N handoff"),
+            "verbose labels dropped:\n{text}"
+        );
+        assert!(text.contains("rev sSrRd"), "compact group shown:\n{text}");
+    }
+
+    #[test]
+    fn compact_key_row_fits_a_docked_pane() {
+        let app = test_app();
+        assert!(
+            app.keys_line(false).width() <= 60,
+            "compact form must fit 60 columns, got {}",
+            app.keys_line(false).width()
+        );
+    }
+
+    #[test]
+    fn every_action_key_appears_in_the_toolbar_data() {
+        // Guards against adding a binding to input.rs that never surfaces in the UI —
+        // exactly how `R` went undocumented.
+        for key in [
+            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "q",
+        ] {
+            assert!(
+                HINTS.iter().any(|h| h.key == key),
+                "key {key} is bound in input.rs but missing from HINTS"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_label_flips_between_open_and_detach() {
+        // `docked_node_app` sets up the graph rows but not the selection (its other
+        // callers read `task_of_node`), and the ↵ label keys off the *selected* task.
+        let select = |app: &mut App, id: TaskId| {
+            app.task_order = vec![id];
+            app.selected = 0;
+        };
+        let (mut app, id) = docked_node_app(true);
+        select(&mut app, id);
+        let w = app.keys_line(true).width() as u16;
+        assert!(buffer_text(&draw(&mut app, w, 12)).contains("↵ detach"));
+        let (mut app, id) = docked_node_app(false);
+        select(&mut app, id);
+        let w = app.keys_line(true).width() as u16;
+        assert!(buffer_text(&draw(&mut app, w, 12)).contains("↵ open"));
+    }
+
+    #[test]
+    fn keys_are_dimmed_when_unavailable_for_the_selected_row() {
+        // A task with no workspace: `s`/`S` are dimmed, `n` is not.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+        let c = app.caps();
+        assert!(!c.has_ws, "fixture has no workspace");
+        assert!(!App::hint_available("s", &c), "swap needs a workspace");
+        assert!(!App::hint_available("S", &c), "snapshot needs a workspace");
+        assert!(App::hint_available("n", &c), "new task is always available");
+        assert!(
+            !App::hint_available("A", &c),
+            "abort needs a non-empty train"
+        );
+    }
+
+    #[test]
+    fn dimming_renders_as_a_dim_modifier_not_a_missing_key() {
+        let mut app = test_app();
+        let w = app.keys_line(true).width() as u16;
+        let term = draw(&mut app, w, 12);
+        // The key is still on screen — dimming must never shift positions.
+        assert!(buffer_text(&term).contains("s swap"));
+    }
+
+    #[test]
+    fn bang_opens_the_log_and_any_key_closes_it() {
+        let mut app = test_app();
+        app.notices.ok("snapshotted #7");
+        app.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(app.overlay, Overlay::Log);
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.overlay, Overlay::None, "any key closes the overlay");
+    }
+
+    #[test]
+    fn opening_the_log_clears_the_unseen_badge() {
+        let mut app = test_app();
+        app.notices.err("boom");
+        assert_eq!(app.notices.unseen(), 1);
+        app.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(app.notices.unseen(), 0);
+    }
+
+    #[test]
+    fn a_key_pressed_while_the_overlay_is_open_does_not_also_act() {
+        // `q` must close the overlay, not quit faff.
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('!')));
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(
+            !app.should_quit,
+            "q closed the overlay rather than quitting"
+        );
+    }
+
+    #[test]
+    fn log_overlay_lists_notices_newest_first() {
+        let mut app = test_app();
+        app.notices.ok("swapped @ ⇄ #7");
+        app.notices.err("snapshot failed: boom");
+        app.overlay = Overlay::Log;
+        let text = buffer_text(&draw(&mut app, 70, 16));
+        let failed = text.find("snapshot failed").expect("error listed");
+        let swapped = text.find("swapped").expect("success listed");
+        assert!(failed < swapped, "newest first:\n{text}");
+    }
+
+    #[test]
+    fn help_overlay_lists_bindings_the_toolbar_omits() {
+        let mut app = test_app();
+        app.overlay = Overlay::Help;
+        let text = buffer_text(&draw(&mut app, 70, 20));
+        assert!(text.contains("j"), "j/k navigation documented:\n{text}");
+        assert!(text.contains("onto"), "R documented:\n{text}");
+    }
+
+    #[test]
+    fn unseen_badge_shows_the_count_in_the_key_row() {
+        let mut app = test_app();
+        app.notices.err("boom");
+        app.notices.err("boom again");
+        let w = app.keys_line(true).width() as u16;
+        let text = buffer_text(&draw(&mut app, w, 12));
+        assert!(text.contains("!2"), "badge shows the unseen count:\n{text}");
+    }
+
+    #[test]
+    fn badge_disappears_once_the_log_is_read() {
+        let mut app = test_app();
+        app.notices.err("boom");
+        app.handle_key(key(KeyCode::Char('!')));
+        app.overlay = Overlay::None;
+        let w = app.keys_line(true).width() as u16;
+        let text = buffer_text(&draw(&mut app, w, 12));
+        assert!(!text.contains("!1"), "badge cleared:\n{text}");
+    }
+
+    #[test]
+    fn an_armed_confirmation_still_swallows_the_bang_key() {
+        // Pre-existing contract: while a swap is armed, any non-`s` key cancels. `!`
+        // must cancel, not open the log over a live confirmation.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.store
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
+            .unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.selected = 0;
+
+        app.swap_selected();
+        assert_eq!(app.pending_swap, Some(t.id));
+        app.handle_key(key(KeyCode::Char('!')));
+        assert_eq!(app.overlay, Overlay::None, "the log did not open");
+        assert_eq!(app.pending_swap, None, "the confirmation was cancelled");
+    }
+
+    /// The current notice as `(level, text)` — the shape the migrated assertions want.
+    fn latest(app: &App) -> (notify::Level, String) {
+        let n = app.notices.latest().expect("a notice was pushed");
+        (n.level, n.text.clone())
     }
 
     use ratatui::crossterm::event::KeyCode;
@@ -1711,7 +2474,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.update_status(t.id, TaskStatus::Working).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
@@ -1719,12 +2488,21 @@ mod tests {
         app.selected = 0;
 
         app.swap_selected();
-        assert_eq!(app.pending_swap, Some(t.id), "first s arms the confirmation");
-        assert!(app.status.contains("press s to confirm"));
+        assert_eq!(
+            app.pending_swap,
+            Some(t.id),
+            "first s arms the confirmation"
+        );
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Prompt);
+        assert!(text.contains("press s to confirm"));
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.pending_swap, None, "a non-s key cancels");
-        assert_eq!(app.status, "swap cancelled");
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Info, "swap cancelled".to_string())
+        );
     }
 
     #[test]
@@ -1734,7 +2512,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.store.update_status(t.id, TaskStatus::Working).unwrap();
@@ -1748,11 +2532,16 @@ mod tests {
             Some((t.id, true)),
             "first r arms the confirmation"
         );
-        assert!(app.status.contains("press r to confirm"));
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Prompt);
+        assert!(text.contains("press r to confirm"));
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.pending_rebase, None, "a non-r key cancels");
-        assert_eq!(app.status, "rebase cancelled");
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Info, "rebase cancelled".to_string())
+        );
     }
 
     #[test]
@@ -1762,7 +2551,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
@@ -1771,7 +2566,9 @@ mod tests {
 
         app.rebase_selected(true);
         assert_eq!(app.pending_rebase, None, "must not arm without a prompt");
-        assert!(app.status.contains("first prompt"), "status: {}", app.status);
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
+        assert!(text.contains("first prompt"), "notice: {text}");
     }
 
     #[test]
@@ -1781,7 +2578,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.store.update_status(t.id, TaskStatus::Working).unwrap();
@@ -1795,11 +2598,16 @@ mod tests {
             Some(t.id),
             "first d arms the confirmation"
         );
-        assert!(app.status.contains("press d to confirm"));
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Prompt);
+        assert!(text.contains("press d to confirm"));
 
         app.handle_key(key(KeyCode::Char('j')));
         assert_eq!(app.pending_describe, None, "a non-d key cancels");
-        assert_eq!(app.status, "describe cancelled");
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Info, "describe cancelled".to_string())
+        );
     }
 
     #[test]
@@ -1809,7 +2617,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
@@ -1818,7 +2632,9 @@ mod tests {
 
         app.describe_selected();
         assert_eq!(app.pending_describe, None, "must not arm without a prompt");
-        assert!(app.status.contains("first prompt"), "status: {}", app.status);
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
+        assert!(text.contains("first prompt"), "notice: {text}");
     }
 
     // Build a selectable task with a workspace + pane + prompt (the accept happy-path
@@ -1826,7 +2642,13 @@ mod tests {
     fn task_with_pane(app: &mut App, prompt: &str) -> TaskId {
         let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
@@ -1842,8 +2664,13 @@ mod tests {
         let mut app = test_app();
         let _ = task_with_pane(&mut app, "");
         app.accept_selected();
-        assert!(app.merge_train.is_empty(), "must not enqueue without a prompt");
-        assert!(app.status.contains("first prompt"), "status: {}", app.status);
+        assert!(
+            app.merge_train.is_empty(),
+            "must not enqueue without a prompt"
+        );
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
+        assert!(text.contains("first prompt"), "notice: {text}");
     }
 
     #[test]
@@ -1852,7 +2679,13 @@ mod tests {
         let mut app = test_app();
         let t = app.store.create_task("do x", 0, Autonomy::Inherit).unwrap();
         app.store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         app.tasks = app.store.list_tasks().unwrap();
         app.task_order = vec![t.id];
@@ -1860,7 +2693,9 @@ mod tests {
 
         app.accept_selected();
         assert!(app.merge_train.is_empty());
-        assert!(app.status.contains("no live pane"), "status: {}", app.status);
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
+        assert!(text.contains("no live pane"), "notice: {text}");
     }
 
     #[test]
@@ -1873,26 +2708,37 @@ mod tests {
 
         app.accept_selected();
         assert!(!app.merge_train.contains(id), "second a dequeues it");
-        assert!(app.status.contains("removed from the merge train"));
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Success);
+        assert!(text.contains("removed from the merge train"));
     }
 
     #[test]
     fn abort_train_clears_all_and_reports() {
         let mut app = test_app();
         app.abort_train();
-        assert_eq!(app.status, "no merge train to abort");
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Warn, "no merge train to abort".to_string())
+        );
 
         app.merge_train.add(TaskId(1));
         app.merge_train.add(TaskId(2));
         app.abort_train();
         assert!(app.merge_train.is_empty());
-        assert!(app.status.contains("aborted"), "status: {}", app.status);
+        let (level, text) = latest(&app);
+        assert_eq!(level, notify::Level::Success);
+        assert!(text.contains("aborted"), "notice: {text}");
     }
 
     #[test]
     fn merge_train_panel_sizes_and_renders() {
         let mut app = test_app();
-        assert_eq!(app.merge_train_height(), 0, "no panel when the train is empty");
+        assert_eq!(
+            app.merge_train_height(),
+            0,
+            "no panel when the train is empty"
+        );
 
         let id = task_with_pane(&mut app, "Convert bridges to JSON");
         app.merge_train.add(id);
@@ -1929,7 +2775,10 @@ mod tests {
             Some(b.id),
             "hitting new highlights the newly added row"
         );
-        assert_eq!(app.pending_select, None, "pending_select is consumed by refresh");
+        assert_eq!(
+            app.pending_select, None,
+            "pending_select is consumed by refresh"
+        );
     }
 
     #[test]
@@ -1952,7 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn header_and_footer_render_without_panicking() {
+    fn header_notice_and_keys_render_without_panicking() {
         let mut app = test_app();
         app.tasks = vec![
             app.store
@@ -2075,8 +2924,14 @@ mod tests {
         ];
         app.task_of_node = vec![None, None];
         app.id_display = std::collections::HashMap::from([
-            ("wcwcwcwc".to_string(), ("wcwcwcwc".to_string(), String::new())),
-            ("basebase".to_string(), ("basebase".to_string(), String::new())),
+            (
+                "wcwcwcwc".to_string(),
+                ("wcwcwcwc".to_string(), String::new()),
+            ),
+            (
+                "basebase".to_string(),
+                ("basebase".to_string(), String::new()),
+            ),
         ]);
         app.fork_point = Some("basebase".to_string());
 
@@ -2159,9 +3014,18 @@ mod tests {
         ];
         app.task_of_node = vec![None, None, None];
         app.id_display = std::collections::HashMap::from([
-            ("aaaaaaaa".to_string(), ("aaaaaaaa".to_string(), String::new())),
-            ("bbbbbbbb".to_string(), ("bbbbbbbb".to_string(), String::new())),
-            ("cccccccc".to_string(), ("cccccccc".to_string(), String::new())),
+            (
+                "aaaaaaaa".to_string(),
+                ("aaaaaaaa".to_string(), String::new()),
+            ),
+            (
+                "bbbbbbbb".to_string(),
+                ("bbbbbbbb".to_string(), String::new()),
+            ),
+            (
+                "cccccccc".to_string(),
+                ("cccccccc".to_string(), String::new()),
+            ),
         ]);
 
         let width = 80usize;
@@ -2186,7 +3050,11 @@ mod tests {
             }
             bracket_xs.push(open);
         }
-        assert_eq!(bracket_xs.len(), 3, "three graph rows carry an id column: {bracket_xs:?}");
+        assert_eq!(
+            bracket_xs.len(),
+            3,
+            "three graph rows carry an id column: {bracket_xs:?}"
+        );
         assert!(
             bracket_xs.iter().all(|x| *x == bracket_xs[0]),
             "id columns aligned: {bracket_xs:?}"
@@ -2235,7 +3103,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buf = term.backend().buffer();
-        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+        let row_text =
+            |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
 
         // The graph node row, found by its revision id — not the header bar above it,
         // which keeps its own `▶ #id` status chip.
@@ -2276,7 +3145,8 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buf = term.backend().buffer();
-        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+        let row_text =
+            |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
         let gy = (0..h)
             .find(|&y| row_text(y).contains("abcd1234"))
             .expect("graph node row rendered");
@@ -2333,9 +3203,8 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buf = term.backend().buffer();
-        let row_text = |y: usize| -> String {
-            (0..w).map(|x| buf.content[y * w + x].symbol()).collect()
-        };
+        let row_text =
+            |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
         let head_row = (0..h)
             .find(|&y| row_text(y).contains("(no description set)"))
             .expect("HEAD header row rendered");
@@ -2360,10 +3229,12 @@ mod tests {
             );
         }
         // The agent line is the selected/highlighted one (reverse video), not HEAD.
-        let reversed = |y: usize| {
-            (0..w).any(|x| buf.content[y * w + x].modifier.contains(Modifier::REVERSED))
-        };
-        assert!(reversed(agent_row), "agent line is highlighted when selected");
+        let reversed =
+            |y: usize| (0..w).any(|x| buf.content[y * w + x].modifier.contains(Modifier::REVERSED));
+        assert!(
+            reversed(agent_row),
+            "agent line is highlighted when selected"
+        );
         assert!(!reversed(head_row), "HEAD header row is not highlighted");
     }
 
@@ -2493,7 +3364,10 @@ mod tests {
         // session is docked the `#N` id is greened instead — still a left-anchored
         // indicator that a truncated description can never push off screen.
         let mut app = test_app();
-        let t = app.store.create_task("cleanup", 0, Autonomy::Inherit).unwrap();
+        let t = app
+            .store
+            .create_task("cleanup", 0, Autonomy::Inherit)
+            .unwrap();
         app.store.set_pane(t.id, Some(88)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
         app.open_pane = Some(88); // docked, but this task has no graph node
@@ -2507,19 +3381,26 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let buf = term.backend().buffer();
-        let row_text = |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
+        let row_text =
+            |y: usize| -> String { (0..w).map(|x| buf.content[y * w + x].symbol()).collect() };
 
         // The detached row, by its `· #` bullet — not the header's `▶ #id` chip.
         let dy = (0..h)
             .find(|&y| row_text(y).contains("· #"))
             .expect("detached row rendered");
-        assert!(!row_text(dy).contains('▶'), "no trailing marker on detached row");
+        assert!(
+            !row_text(dy).contains('▶'),
+            "no trailing marker on detached row"
+        );
         let x = (0..w)
             .find(|&x| buf.content[dy * w + x].symbol() == "#")
             .expect("# on detached row");
         let cell = &buf.content[dy * w + x];
         assert_eq!(cell.fg, Color::Green, "docked detached #id is green");
-        assert!(cell.modifier.contains(Modifier::BOLD), "docked detached #id is bold");
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "docked detached #id is bold"
+        );
         assert!(
             !cell.modifier.contains(Modifier::REVERSED),
             "docked detached #id is a green glyph, not a reversed green cell"
@@ -2612,11 +3493,20 @@ mod tests {
         let ghost = format!("faf-task-{}", t.id.0 + 1000);
         let live = vec![
             // The default workspace is never faff-owned — must be left alone.
-            jj::Workspace { name: "default".into(), change_id: "x".into() },
+            jj::Workspace {
+                name: "default".into(),
+                change_id: "x".into(),
+            },
             // Tracked by task `t` — must be kept.
-            jj::Workspace { name: tracked.clone(), change_id: "y".into() },
+            jj::Workspace {
+                name: tracked.clone(),
+                change_id: "y".into(),
+            },
             // A faff workspace with no DB row — a ghost to forget.
-            jj::Workspace { name: ghost.clone(), change_id: "z".into() },
+            jj::Workspace {
+                name: ghost.clone(),
+                change_id: "z".into(),
+            },
         ];
 
         assert_eq!(app.orphaned_workspaces(&live), vec![ghost]);
@@ -2630,7 +3520,10 @@ mod tests {
         // must NOT forget the in-flight workspace. Keying on row existence (not `ws_name`)
         // is what makes the reaper safe here.
         let app = test_app();
-        let t = app.store.create_task("mid-create", 0, Autonomy::Inherit).unwrap();
+        let t = app
+            .store
+            .create_task("mid-create", 0, Autonomy::Inherit)
+            .unwrap();
         // ws_name deliberately left unset, mirroring the window inside prepare_workspace.
         let live = vec![jj::Workspace {
             name: format!("faf-task-{}", t.id.0),
@@ -2755,7 +3648,7 @@ mod tests {
 
     #[test]
     fn the_enter_hint_offers_revive_only_for_a_lost_task() {
-        // The footer is where a lost instance becomes discoverable: selecting the row
+        // The toolbar is where a lost instance becomes discoverable: selecting the row
         // has to say that Enter will bring it back, not just "open".
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path().join("ws");
@@ -2764,23 +3657,19 @@ mod tests {
 
         assert_eq!(
             app.enter_hint(),
-            "[↵]start",
+            "start",
             "workspace intact, no conversation yet"
         );
 
         write_transcript(tmp.path(), &ws, &sid);
-        assert_eq!(
-            app.enter_hint(),
-            "[↵]revive",
-            "pane gone, conversation kept"
-        );
+        assert_eq!(app.enter_hint(), "revive", "pane gone, conversation kept");
 
         app.store.set_pane(t.id, Some(42)).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
-        assert_eq!(app.enter_hint(), "[↵]open", "alive again, just not docked");
+        assert_eq!(app.enter_hint(), "open", "alive again, just not docked");
 
         app.open_pane = Some(42);
-        assert_eq!(app.enter_hint(), "[↵]detach");
+        assert_eq!(app.enter_hint(), "detach");
     }
 
     #[test]
@@ -2796,7 +3685,7 @@ mod tests {
         assert!(app.task_revivable(&t), "workspace is intact");
         assert!(!app.task_resumable(&t), "nothing written to resume from");
         assert_eq!(app.task_argv(&t), vec!["claude", "--session-id", &sid]);
-        assert_eq!(app.enter_hint(), "[↵]start");
+        assert_eq!(app.enter_hint(), "start");
     }
 
     #[test]
@@ -2811,6 +3700,41 @@ mod tests {
         app.task_order = vec![t.id];
 
         assert!(!app.task_revivable(&t));
-        assert_eq!(app.enter_hint(), "[↵]open");
+        assert_eq!(app.enter_hint(), "open");
+    }
+    #[test]
+    fn help_overlay_shows_every_binding_even_in_a_narrow_pane() {
+        // The keymap is the authoritative reference; it must never silently clip one.
+        let mut app = test_app();
+        app.overlay = Overlay::Help;
+        let text = buffer_text(&draw(&mut app, 46, 20));
+        for verbose in HINTS.iter().map(|h| h.verbose) {
+            assert!(
+                text.contains(verbose),
+                "`{verbose}` clipped at 46 cols:\n{text}"
+            );
+        }
+    }
+    #[test]
+    fn renders_with_an_active_merge_train() {
+        // The notice line added a layout row, pushing the merge-train panel from
+        // chunks[3] to chunks[4]. An off-by-one here is an index panic at runtime.
+        let mut app = test_app();
+        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        app.merge_train.add(t.id);
+        app.notices.ok("snapshotted #7");
+        assert!(!app.merge_train.is_empty(), "fixture has a queued member");
+        assert!(app.merge_train_height() > 0, "the panel is drawn");
+        let text = buffer_text(&draw(&mut app, 62, 14));
+        assert!(
+            text.contains("merge train"),
+            "train panel rendered:\n{text}"
+        );
+        assert!(
+            text.contains("snapshotted #7"),
+            "notice still visible:\n{text}"
+        );
     }
 }

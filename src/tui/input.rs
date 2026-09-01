@@ -36,6 +36,12 @@ pub enum Action {
     /// finished revisions faff drains into your workspace one at a time (`jj new` per
     /// revision, rebasing the rest onto the growing tip). See `tui::train`.
     Accept,
+    /// `!`: open the notice log — scrollback of everything faff has reported, including
+    /// the merge-train notices that fire with no keypress behind them.
+    ShowLog,
+    /// `?`: open the keymap overlay — every binding with its full description, including
+    /// `j`/`k`, which the toolbar has no room for.
+    Help,
     /// `A` (Shift+a): abort the merge train — dequeue everything still pending. Revisions
     /// already taken over stay; nothing is rolled back.
     AbortTrain,
@@ -60,6 +66,8 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('d') => Action::Describe,
         KeyCode::Char('a') => Action::Accept,
         KeyCode::Char('A') => Action::AbortTrain,
+        KeyCode::Char('!') => Action::ShowLog,
+        KeyCode::Char('?') => Action::Help,
         _ => Action::None,
     }
 }
@@ -97,6 +105,8 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('d'))), Action::Describe);
         assert_eq!(map_key(k(KeyCode::Char('a'))), Action::Accept);
         assert_eq!(map_key(k(KeyCode::Char('A'))), Action::AbortTrain);
+        assert_eq!(map_key(k(KeyCode::Char('!'))), Action::ShowLog);
+        assert_eq!(map_key(k(KeyCode::Char('?'))), Action::Help);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }

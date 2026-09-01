@@ -55,20 +55,21 @@ One session is docked at a time. Docking another detaches the current one.
 With task #7's session docked, faff on the left and the real `claude` pane on the right:
 
 ```
- faff · faff · 1 working · ▶ #7                        ┃ ⏺ Convert the HTTP and MQTT bridges
-revisions                                            │ ┃   from postcard to JSON
-@  [wvrsmsyk] (no description set)                   │ ┃
-├─●  [kmkxwzqr] #7 ⚙ :: Convert bridges to JSON  ▶   │ ┃ ● Read src/bridge/http.rs
-├─●  [rzqlvksp] #8 ! :: Fix flaky store tests        │ ┃ ● Edit src/bridge/http.rs
-◻  [yuvnmxxo] initial code commit                    │ ┃ ● Bash cargo test -p bridge
-◻  [ntlpqxos] import                                 │ ┃
-── detached (integrated / no node) ──                │ ┃ ✻ Thinking…
-· #5 Add OAuth login ✓                               │ ┃
-                                                       ┃ >
- [n]ew [N]handoff [↵]detach [s]wap [S]napshot [r]ebase [d]escribe [a]ccept [A]abort [x]remove [X]remove+drop [q]uit   ready ┃
+ faff · faff · 1 working · ▶ #7                            ┃ ⏺ Convert the HTTP and MQTT bridges
+revisions                                                │ ┃   from postcard to JSON
+@  [wvrsmsyk] (no description set)                       │ ┃
+├─●  [kmkxwzqr] #7 ⚙ :: Convert bridges to JSON  ▶       │ ┃ ● Read src/bridge/http.rs
+├─●  [rzqlvksp] #8 ! :: Fix flaky store tests            │ ┃ ● Edit src/bridge/http.rs
+◻  [yuvnmxxo] initial code commit                        │ ┃ ● Bash cargo test -p bridge
+◻  [ntlpqxos] import                                     │ ┃
+── detached (integrated / no node) ──                    │ ┃ ✻ Thinking…
+· #5 Add OAuth login ✓                                   │ ┃
+                                                         │ ┃ >
+ · ready                                                   ┃
+ new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ q ? !   ┃
 ```
 
-When the merge train is non-empty a panel appears below the hint bar, one row per queued
+When the merge train is non-empty a panel appears below the toolbar, one row per queued
 revision with its current stage:
 
 ```
@@ -228,7 +229,7 @@ workspace has vanished — each left as an ordinary task for you to handle by ha
 rest carry on. The train is in-memory: quit mid-drain and the revisions already taken over
 persist in jj, but the pending set is forgotten.
 
-The panel below the hint bar shows each member and its stage — `rebasing`, `describing`,
+The panel below the toolbar shows each member and its stage — `rebasing`, `describing`,
 `ready`, `merging`, or `resolving conflict` — updated every refresh.
 
 ### Removing a task
@@ -253,13 +254,13 @@ WezTerm mux restarts, the machine reboots. The jj workspace and the task row sur
 that, so the agent can be put back. Each refresh flips such a task to idle and clears its
 dead pane; selecting it shows what `Enter` will do:
 
-| Footer | State | What `Enter` does |
+| Toolbar | State | What `Enter` does |
 |---|---|---|
-| `[↵]revive` | pane gone, conversation on disk | `claude --resume <session-id>` — the agent comes back with its full history |
-| `[↵]start` | pane gone, nothing written yet | `claude --session-id <session-id>` — a blank agent in the same workspace |
-| `[↵]open` / `[↵]detach` | agent running | dock / detach as usual |
+| `↵ revive` | pane gone, conversation on disk | `claude --resume <session-id>` — the agent comes back with its full history |
+| `↵ start` | pane gone, nothing written yet | `claude --session-id <session-id>` — a blank agent in the same workspace |
+| `↵ open` / `↵ detach` | agent running | dock / detach as usual |
 
-The `[↵]start` case is the common one for a task created with `n` and never typed into:
+The `↵ start` case is the common one for a task created with `n` and never typed into:
 claude writes no transcript until the first message, so there is no conversation to
 restore — only a workspace waiting for an agent.
 
@@ -330,6 +331,43 @@ re-fit as docking or detaching a session resizes faff.
 A task whose change no longer has a node of its own, which is the usual result of
 integrating it, moves to a "detached" list under the graph. It stays selectable and
 removable there.
+
+### Notices and the toolbar
+
+The line above the toolbar is the notice line. It shows the most recent thing faff has
+to say and stays there until the next notice replaces it — no timer, so a result can't
+scroll away while you're reading the agent pane. Each notice carries a level:
+
+| | | |
+| --- | --- | --- |
+| `✓` green | success | `snapshotted #7`, `swapped @ ⇄ #7` |
+| `✗` red | attempted and failed | `snapshot failed: <jj's error>` |
+| `!` yellow | refused, nothing attempted | `no workspace to snapshot for this task` |
+| `?` cyan | an armed confirmation | `#7 is working — press s to confirm swap` |
+| `·` grey | neutral | `swap cancelled` |
+
+The yellow/red distinction matters: yellow is a key that didn't apply to the selected
+row, red is jj or WezTerm actually failing. A long error wraps over up to three lines;
+anything past that is in the log.
+
+`!` opens the notice log — the last 100 notices, newest first, timestamped. Merge-train
+notices (`#7 has conflicts — dropped`, `merged #7 into your workspace`) fire with no
+keypress behind them, so the log is where you catch up on what happened while you were
+in the agent pane. The `!` in the toolbar carries an unseen count (`!3`) coloured by the
+worst unseen level. Any key closes the log.
+
+`?` opens the full keymap, including `j`/`k` and `R`.
+
+The toolbar groups keys by what they do, and colours each group: **new** (`n` `N`),
+**open** (`↵`), **rev** (`s` `S` `r` `R` `d`), **train** (`a` `A`), **del** (`x` `X`),
+then `q` `?` `!`. Keys that don't apply to the selected row are dimmed rather than
+hidden, so nothing ever moves. When faff is docked beside a session and the pane is too
+narrow for the full labels, the toolbar drops to its compact form — same groups, same
+order, just the letters:
+
+```
+ new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ q ? !
+```
 
 ## How state moves
 
