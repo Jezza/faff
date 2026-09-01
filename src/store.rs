@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
@@ -88,19 +89,28 @@ impl Store {
     }
 
     /// Insert a new task (awaiting its first prompt) and return it fully populated.
+    ///
+    /// The task is born with a `session_id`: faff mints the agent's conversation id here,
+    /// in the same statement as the row, rather than learning it later from the agent's
+    /// `SessionStart` hook. That ordering is what makes recovery possible — the id is
+    /// durable before the `claude` process exists, so a pane that dies during startup
+    /// (or a faff restart that loses the pane) still leaves something to resume. The hook
+    /// still overwrites it afterwards, keeping faff pointed at the *live* conversation.
     pub fn create_task(&self, prompt: &str, priority: i64, autonomy: Autonomy) -> Result<Task> {
         let created = now_ms();
         let id = self.next_task_id()?;
+        let session_id = Uuid::new_v4().to_string();
         self.conn.execute(
-            "INSERT INTO tasks (id, prompt, status, priority, autonomy, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO tasks (id, prompt, status, priority, autonomy, created_at, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
                 prompt,
                 TaskStatus::NeedsInput.as_str(),
                 priority,
                 autonomy.as_str(),
-                created
+                created,
+                session_id
             ],
         )?;
         self.get_task(TaskId(id))
@@ -470,5 +480,50 @@ mod tests {
         }
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.list_tasks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn every_task_is_born_with_a_unique_uuid_session_id() {
+        // The id must exist *before* the agent process does: that is what makes a task
+        // whose pane died before its SessionStart hook fired still recoverable.
+        let s = store();
+        let a = s.create_task("a", 0, Autonomy::Inherit).unwrap();
+        let b = s.create_task("b", 0, Autonomy::Inherit).unwrap();
+        let sa = a.session_id.expect("task created without a session id");
+        let sb = b.session_id.expect("task created without a session id");
+
+        // `claude --session-id` rejects anything that is not a valid UUID.
+        assert_eq!(sa.len(), 36, "not a UUID: {sa}");
+        assert_eq!(
+            sa.chars().filter(|c| *c == '-').count(),
+            4,
+            "not a UUID: {sa}"
+        );
+        assert!(
+            sa.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "not a UUID: {sa}"
+        );
+        assert_ne!(sa, sb, "two tasks must not share a conversation");
+    }
+
+    #[test]
+    fn the_minted_session_id_survives_a_reload() {
+        let s = store();
+        let t = s.create_task("a", 0, Autonomy::Inherit).unwrap();
+        assert_eq!(s.get_task(t.id).unwrap().session_id, t.session_id);
+    }
+
+    #[test]
+    fn session_start_hook_overrides_the_minted_id() {
+        // faff seeds the id; the hook corrects it. If the user clears the conversation
+        // mid-flight, the live id is the resumable one, so the hook must win.
+        let s = store();
+        let t = s.create_task("a", 0, Autonomy::Inherit).unwrap();
+        s.set_session(t.id, "deadbeef-0000-4000-8000-000000000000")
+            .unwrap();
+        assert_eq!(
+            s.get_task(t.id).unwrap().session_id.as_deref(),
+            Some("deadbeef-0000-4000-8000-000000000000")
+        );
     }
 }
