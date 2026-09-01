@@ -1330,10 +1330,10 @@ impl App {
             .max()
             .unwrap_or(0)
             + 2;
-        // Which node rows carry the docked (focused) session, so their revision brackets
+        // Which node rows carry the docked (focused) session, so their revision id
         // can be greened. A combined HEAD+agent node hangs its task on a continuation line
         // below the bracketed HEAD row, so attribute each row to the nearest node row at
-        // or above it — the one whose brackets are shown.
+        // or above it — the one whose id is shown.
         let mut node_is_docked = vec![false; self.rows.len()];
         if let Some(open_id) = open {
             let mut last_node: Option<usize> = None;
@@ -1394,27 +1394,30 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| (cid.chars().take(ID_W).collect(), String::new()));
                     let id_w = 1 + prefix.chars().count() + rest.chars().count() + 2;
-                    // The docked (focused) session shows through its revision brackets:
-                    // green + bold when docked, else the muted dark-gray frame. A fixed
-                    // left-column indicator survives description truncation that a trailing
-                    // marker would not. The docked style starts from `Style::default()`,
-                    // NOT `base`: on the highlighted row `base` carries REVERSED, which
-                    // would swap fg/bg and paint the cell background green instead of the
-                    // bracket glyphs.
-                    let bracket = if node_is_docked[i] {
+                    // The docked (focused) session shows through its revision id: the
+                    // brackets *and* the id's non-unique remainder go green + bold, else
+                    // both stay the muted dark-gray frame. Two thin bracket glyphs alone
+                    // are easy to miss; the remainder gives the green some width. The
+                    // unique prefix keeps its cyan either way — green and blue inside one
+                    // id would read as noise. A fixed left-column indicator survives
+                    // description truncation that a trailing marker would not. The docked
+                    // style starts from `Style::default()`, NOT `base`: on the highlighted
+                    // row `base` carries REVERSED, which would swap fg/bg and paint the
+                    // cell background green instead of the glyphs.
+                    let frame = if node_is_docked[i] {
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         base.fg(Color::DarkGray)
                     };
-                    spans.push(Span::styled("[", bracket));
+                    spans.push(Span::styled("[", frame));
                     spans.push(Span::styled(
                         prefix,
                         base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
                     ));
-                    spans.push(Span::styled(rest, base.fg(Color::DarkGray)));
-                    spans.push(Span::styled("] ", bracket));
+                    spans.push(Span::styled(rest, frame));
+                    spans.push(Span::styled("] ", frame));
                     let avail = text_w.saturating_sub(gutter_w + id_w);
                     spans.push(Span::styled(truncate_first_line(&row.content, avail), base));
                 }
@@ -2043,16 +2046,27 @@ mod tests {
             change_id: Some("abcd1234".into()),
         }];
         app.task_of_node = vec![Some(t.id)];
+        // `ab` is the unique prefix; `cd1234` the rest of the id after it.
+        app.id_display = std::collections::HashMap::from([(
+            "abcd1234".to_string(),
+            ("ab".to_string(), "cd1234".to_string()),
+        )]);
         (app, t.id)
     }
 
+    // The id column renders `[` + unique prefix + rest + `] `, so relative to the `[`
+    // the rest starts two cells past where a prefix-less walk would put it.
+    fn id_col_x(x0: usize, dx: usize) -> usize {
+        if dx == 0 { x0 } else { x0 + dx + 2 }
+    }
+
     #[test]
-    fn focused_session_greens_its_revision_brackets() {
+    fn focused_session_greens_its_whole_revision_id() {
         let (mut app, tid) = docked_node_app(true);
         // The docked node is also the highlighted (selected) row — the common case (you
         // select a task, then dock it). A naive green foreground on the REVERSED selection
-        // style would swap fg/bg and paint the cell background green, not the bracket
-        // glyphs; the brackets must stay green *glyphs*.
+        // style would swap fg/bg and paint the cell background green, not the id glyphs;
+        // the id must stay green *glyphs*.
         app.task_order = vec![tid];
         app.selected = 0;
 
@@ -2070,25 +2084,32 @@ mod tests {
         // The docked session shows through its brackets, not a trailing marker that
         // would crowd the description off a narrow pane.
         assert!(!row_text(gy).contains('▶'), "no trailing marker on node row");
-        for needle in ["[", "]"] {
-            let x = (0..w)
-                .find(|&x| buf.content[gy * w + x].symbol() == needle)
-                .expect("bracket on node row");
-            let cell = &buf.content[gy * w + x];
-            assert_eq!(cell.fg, Color::Green, "docked bracket {needle} is green");
+        // The brackets *and* the id's non-unique remainder are green — two thin bracket
+        // glyphs on their own are too easy to miss.
+        let x0 = row_text(gy).find('[').expect("bracket on node row");
+        for (dx, needle) in "[cd1234]".chars().enumerate() {
+            let cell = &buf.content[gy * w + id_col_x(x0, dx)];
+            assert_eq!(cell.symbol(), needle.to_string(), "id column at +{dx}");
+            assert_eq!(cell.fg, Color::Green, "docked id char {needle:?} is green");
             assert!(
                 cell.modifier.contains(Modifier::BOLD),
-                "docked bracket {needle} is bold"
+                "docked id char {needle:?} is bold"
             );
             assert!(
                 !cell.modifier.contains(Modifier::REVERSED),
-                "docked bracket {needle} is a green glyph, not a reversed green cell"
+                "docked id char {needle:?} is a green glyph, not a reversed green cell"
             );
+        }
+        // The unique prefix stays cyan: green and blue inside one id would read as noise.
+        for (dx, needle) in "ab".chars().enumerate() {
+            let cell = &buf.content[gy * w + x0 + 1 + dx];
+            assert_eq!(cell.symbol(), needle.to_string(), "unique prefix at +{dx}");
+            assert_eq!(cell.fg, Color::Cyan, "unique prefix char {needle:?} stays cyan");
         }
     }
 
     #[test]
-    fn undocked_node_keeps_gray_brackets() {
+    fn undocked_node_keeps_a_gray_revision_id() {
         let (app, _tid) = docked_node_app(false);
         let (w, h) = (90usize, 10usize);
         let mut term = Terminal::new(TestBackend::new(w as u16, h as u16)).unwrap();
@@ -2098,23 +2119,23 @@ mod tests {
         let gy = (0..h)
             .find(|&y| row_text(y).contains("abcd1234"))
             .expect("graph node row rendered");
-        for needle in ["[", "]"] {
-            let x = (0..w)
-                .find(|&x| buf.content[gy * w + x].symbol() == needle)
-                .expect("bracket on node row");
+        let x0 = row_text(gy).find('[').expect("bracket on node row");
+        for (dx, needle) in "[cd1234]".chars().enumerate() {
+            let cell = &buf.content[gy * w + id_col_x(x0, dx)];
+            assert_eq!(cell.symbol(), needle.to_string(), "id column at +{dx}");
             assert_eq!(
-                buf.content[gy * w + x].fg,
+                cell.fg,
                 Color::DarkGray,
-                "undocked bracket {needle} stays gray"
+                "undocked id char {needle:?} stays gray"
             );
         }
     }
 
     #[test]
-    fn combined_node_greens_head_brackets_not_the_agent_line() {
+    fn combined_node_greens_the_head_id_not_the_agent_line() {
         // HEAD parked on the agent's revision: the `@` commit row is the HEAD header
         // (its description) and the agent hangs beneath. row_tasks hangs the task on the
-        // agent line, so the docked indicator is the HEAD row's green brackets above it —
+        // agent line, so the docked indicator is the HEAD row's green id above it —
         // never a trailing marker on the agent line.
         let mut app = test_app();
         let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
@@ -2164,8 +2185,8 @@ mod tests {
         // brackets. (The header bar keeps its own `▶ #id` status chip.)
         assert!(!row_text(head_row).contains('▶'), "no marker on the HEAD row");
         assert!(!row_text(agent_row).contains('▶'), "no marker on the agent line");
-        // HEAD's revision brackets are greened (bold), since its parked agent is docked.
-        // The agent line itself carries no brackets to colour.
+        // HEAD's revision id is greened (bold), since its parked agent is docked.
+        // The agent line itself carries no id column to colour.
         for needle in ["[", "]"] {
             let x = (0..w)
                 .find(|&x| buf.content[head_row * w + x].symbol() == needle)
