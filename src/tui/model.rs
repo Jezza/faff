@@ -41,7 +41,7 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
 }
 
 /// Order revisions for the flat lane layout: the trunk — what the leftmost lane draws —
-/// stays in child→parent order, and every *liftable* fork is moved to sit directly above the
+/// stays in child→parent order, and every *fork* off it is moved to sit directly above the
 /// trunk revision it forked from. Each agent then renders as a one-row `├─●` stub anchored
 /// to its fork point, and no lane is ever held open across an unrelated node.
 ///
@@ -49,21 +49,24 @@ pub fn pin_current_wc_first(revs: &mut [RevInfo]) {
 /// the revset is bounded, so that chain can dead-end on a parent that wasn't loaded, and the
 /// lane it held is then taken over by the next line in the log (see the walk below).
 ///
-/// A **liftable** fork is a single-commit tip whose first parent is a trunk node — i.e. a
-/// faff agent. Those get lifted. A multi-commit side branch (its interior nodes fork off
-/// each other, not the trunk) is left in its jj position and renders as its own lane; it no
-/// longer disables the agents' anchoring. An earlier all-or-nothing rule bailed the *whole*
-/// reorder to the conservative pin the moment any revision forked off a non-trunk node,
-/// which stranded genuine agents high above their fork points whenever a side branch was in
-/// the window (the "item super high up compared to the fork point" bug).
+/// A **fork** is a revision off the trunk whose first parent is a trunk node, and what moves
+/// is the fork *plus the whole branch hanging off it* — everything reachable through
+/// first-parent edges, i.e. everything riding its lane. A faff agent is the one-node case; a
+/// multi-commit side branch is the same thing, longer, and is lifted intact. Lifting the
+/// branch as a unit is what keeps it contiguous: jj orders by recency, so left in its jj
+/// position a branch gets an unrelated trunk revision slotted between its base and the agent
+/// forked off that base, which holds the branch's lane open across that trunk row and shoves
+/// the agents anchored there out into a third column (`├─│─○`).
 ///
-/// Agents sharing a fork point are ordered by task id, newest (highest) first — a stable
-/// order that doesn't shuffle as agents become active, unlike jj log's recency order.
-/// `workspaces`/`tasks` supply the change_id→task-id mapping this needs.
+/// Forks sharing a base — and siblings inside a branch — are ordered by task id, newest
+/// (highest) first: a stable order that doesn't shuffle as agents become active, unlike jj
+/// log's recency order. `workspaces`/`tasks` supply the change_id→task-id mapping this needs.
 ///
 /// Degrades cleanly: with nothing liftable this is exactly [`pin_current_wc_first`]; with
-/// every non-trunk rev a liftable fork it is the fully flat fork-anchored layout. Returns
-/// the input untouched when there is no working copy in the set.
+/// every non-trunk rev on a branch off the trunk it is the fully flat fork-anchored layout. A
+/// branch that cannot be lifted without stranding a revision above one of its own parents
+/// keeps its jj position, which is always topologically safe. Returns the input untouched
+/// when there is no working copy in the set.
 pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks: &[Task]) {
     let Some(head_id) = revs
         .iter()
@@ -121,58 +124,113 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     }
     drop(by_id);
 
-    // Change ids that are some revision's FIRST parent — i.e. have a child riding their
-    // lane. A liftable fork must be a tip (nothing rides its lane), so moving it to sit
-    // above its fork point never strands a descendant above an emptied lane.
-    let has_child: std::collections::HashSet<&str> = revs
-        .iter()
-        .filter_map(|r| r.parents.first().map(String::as_str))
-        .collect();
-
-    // Liftable: a single-commit fork straight off a trunk node, and a tip. These are the
-    // faff agents. A side-branch base (has a child) or interior (first parent off-trunk) is
-    // NOT liftable — it keeps its jj position so a multi-commit side branch stays an intact
-    // lane rather than blocking the agents from anchoring.
-    let liftable = |r: &RevInfo| -> bool {
-        !on_trunk.contains(&r.change_id)
-            && !has_child.contains(r.change_id.as_str())
-            && r.parents.first().is_some_and(|p| on_trunk.contains(p))
-    };
-
-    // Bucket the liftable forks under their fork-base trunk node.
-    let mut children: std::collections::HashMap<String, Vec<usize>> =
-        std::collections::HashMap::new();
+    // First-parent children of every revision, each list in the order forks stack above a
+    // shared base: newest task id first, change_id breaking ties. That is a *stable* order —
+    // an agent no longer jumps position when it becomes active, as it did under jj log's
+    // recency order — and it is total and deterministic, with a rev carrying no faff task (a
+    // stray workspace) sorting last. Doubles as the branch tree: a branch is exactly what is
+    // reachable through these edges, since a first-parent child rides its parent's lane.
+    let mut kids: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, r) in revs.iter().enumerate() {
-        if liftable(r) {
-            let base = r.parents.first().cloned().unwrap(); // liftable ⇒ Some, and in trunk
-            children.entry(base).or_default().push(i);
+        if let Some(p) = r.parents.first() {
+            kids.entry(p.as_str()).or_default().push(i);
         }
     }
-
-    // Order each fork-point bucket by task id — newest (highest) first — so the list is
-    // stable: an agent no longer jumps position when it becomes active (jj log's recency
-    // order did that). change_id breaks ties, keeping the order total and deterministic;
-    // a bucketed rev with no faff task (a stray workspace) sorts last.
-    for kids in children.values_mut() {
-        kids.sort_by(|&a, &b| {
+    for v in kids.values_mut() {
+        v.sort_by(|&a, &b| {
             let (ka, kb) = (task_id_of(&revs[a].change_id), task_id_of(&revs[b].change_id));
             kb.cmp(&ka)
                 .then_with(|| revs[a].change_id.cmp(&revs[b].change_id))
         });
     }
 
-    // Walk the pinned order, dropping the lifted forks and re-inserting each bucket just
-    // above its fork-base trunk node (bucket keys are always trunk nodes, present here, so
-    // nothing is dropped). Trunk stays in child→parent order — it is a linear first-parent
-    // chain, so any topological order (jj's, which the pin preserves) already lists it so.
-    let lifted: std::collections::HashSet<usize> = children.values().flatten().copied().collect();
+    // Pinned position of each revision. Restricted to the trunk this is an ancestry order —
+    // the trunk is a first-parent chain, so any topological order (jj's, which the pin
+    // preserves) lists it child→parent, and a larger index means "further down". The lift
+    // check below compares against it.
+    let pinned: std::collections::HashMap<&str, usize> = revs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.change_id.as_str(), i))
+        .collect();
+
+    // Lift the whole **branch**, not just its tip: a fork off the trunk *plus everything
+    // hanging off it*. A faff agent is the one-node case; a multi-commit side branch is the
+    // same thing, longer. Leaving the longer ones in their jj position was the bug — jj
+    // orders by recency, so it slots an unrelated trunk revision between a branch base and
+    // the agent forked off that base. The branch's lane was then held open across the trunk
+    // row in between, and the agents anchored on that row got shoved out past it into a
+    // third column (`├─│─○`), crossing a lane that has nothing to do with them.
+    //
+    // Returns the branch in child→parent order, or `None` when lifting it would strand a
+    // revision above one of its own parents: every parent must sit inside the branch, on the
+    // trunk at-or-below the base being lifted onto, or outside the loaded window (those are
+    // dropped). A branch failing that keeps its jj position — jj's order is topological, so
+    // it is always safe to fall back to, just not always tidy. (This is the cross-merge case:
+    // a branch that merges a trunk revision *above* its own base can't sit above that base.)
+    let branch = |root: usize| -> Option<Vec<usize>> {
+        let base_pos = *pinned.get(revs[root].parents.first()?.as_str())?;
+        // Depth-first through the first-parent edges, visiting siblings in reverse order, so
+        // reversing the result puts every revision above its own first parent (child→parent)
+        // with siblings back in fork order.
+        let mut out: Vec<usize> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if out.contains(&n) {
+                continue; // cycle guard — never on a DAG
+            }
+            out.push(n);
+            for &c in kids.get(revs[n].change_id.as_str()).into_iter().flatten() {
+                if !on_trunk.contains(&revs[c].change_id) {
+                    stack.push(c);
+                }
+            }
+        }
+        out.reverse();
+        for &n in &out {
+            for p in &revs[n].parents {
+                let stays_below = match pinned.get(p.as_str()) {
+                    None => true, // outside the window — dropped, nothing to strand
+                    Some(&pp) => {
+                        out.iter().any(|&m| revs[m].change_id == *p)
+                            || (on_trunk.contains(p) && pp >= base_pos)
+                    }
+                };
+                if !stays_below {
+                    return None;
+                }
+            }
+        }
+        Some(out)
+    };
+
+    // Collect the liftable branches, keyed by the fork they start at. A fork's first parent
+    // is on the trunk, so no fork is ever inside another branch — every branch is disjoint.
+    let mut branches: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut lifted: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, r) in revs.iter().enumerate() {
+        let forks_trunk = !on_trunk.contains(&r.change_id)
+            && r.parents.first().is_some_and(|p| on_trunk.contains(p));
+        if forks_trunk && let Some(b) = branch(i) {
+            lifted.extend(b.iter().copied());
+            branches.insert(i, b);
+        }
+    }
+
+    // Walk the pinned order, dropping the lifted branches and re-inserting each just above
+    // the trunk revision it forks from — that base is a trunk revision, always present here,
+    // so nothing is dropped. Reading `kids` of a trunk node gives its forks already in stack
+    // order (its trunk child is in there too, and simply isn't a branch).
     let mut order: Vec<usize> = Vec::with_capacity(revs.len());
     for (i, r) in revs.iter().enumerate() {
         if lifted.contains(&i) {
             continue;
         }
-        if let Some(kids) = children.get(&r.change_id) {
-            order.extend(kids.iter().copied());
+        for &root in kids.get(r.change_id.as_str()).into_iter().flatten() {
+            if let Some(b) = branches.get(&root) {
+                order.extend(b.iter().copied());
+            }
         }
         order.push(i);
     }
@@ -581,6 +639,86 @@ mod tests {
              belongs to that lane); #15 and #9 fold side by side above their shared base"
         );
     }
+
+
+    #[test]
+    fn a_side_branch_carrying_an_agent_is_lifted_whole_not_split_by_a_trunk_revision() {
+        // Regression, from a real screenshot (change ids are the reported ones, abbreviated):
+        //
+        //     │ ╭─○  [uwpmoxsy] #175 ⚙ :: …        ← agent, lane opened for its base
+        //     ├─│─○  [ymtvxlyn] #176 ✓ :: …        ← shoved out to a THIRD column
+        //     ◆ │    [wkovrsru] Black Duck Security: …
+        //     ├─◻    [sqntutps] Label CLI and gateway nodes in listings
+        //
+        // `sqntutps` is a side branch off the trunk revision `xxzzqsrp`, and agent #175 forks
+        // off `sqntutps` — not off the trunk. Under the old rule only single-commit tips
+        // forking straight off the trunk were lifted, so BOTH kept their jj position: #175 is
+        // a fresh working copy, so jj's *recency* order floated it above the trunk revision
+        // `wkovrsru`, while its own base `sqntutps` (older) stayed below. The branch was split
+        // across `wkovrsru`, its lane held open across that row, and #176 — which forks off
+        // `wkovrsru` and should just fold onto it — was pushed past that lane to `├─│─○`.
+        //
+        // Lifting the branch whole puts `sqntutps` and #175 back together below `wkovrsru`,
+        // so #176 folds to a plain `├─○` and nothing crosses an unrelated lane.
+        let mut revs = vec![
+            rev("onnosvup", &["rkrrupqn"], false, false, "benchmarks: warehouse benchmark"),
+            rev("ymtvxlyn", &["wkovrsru"], false, true, ""), // #176, floats (recency order)
+            rev("pnoounou", &["wkovrsru"], true, true, ""),  // @
+            rev("rkrrupqn", &["oztsompu"], false, false, "test-framework: rack orchestration"),
+            rev("oztsompu", &["poqnvpzq"], false, false, "telemetry: file export"),
+            rev("poqnvpzq", &["wotounsx"], false, false, "cell-mailbox: explicit settlement"),
+            rev("wotounsx", &["urzuyvvl"], false, false, "sorg-execution: cache send targets"),
+            rev("urzuyvvl", &["owpmrpwq"], false, false, "db-client: deterministic locate"),
+            rev("owpmrpwq", &["wkovrsru"], false, false, "db: write-batched tx_apply"),
+            rev("uwpmoxsy", &["sqntutps"], false, true, ""), // #175, floats above wkovrsru
+            rev("wkovrsru", &["xxzzqsrp"], false, false, "Black Duck Security: Committed workflow"),
+            rev("sqntutps", &["xxzzqsrp"], false, false, "Label CLI and gateway nodes in listings"),
+            rev("xxzzqsrp", &["xunlwwqm"], false, false, "Provide the esp-common facade"),
+            rev("xunlwwqm", &[], false, false, "Describe the four undocumented steps"),
+        ];
+        let workspaces: Vec<Workspace> =
+            [("174", "onnosvup"), ("175", "uwpmoxsy"), ("176", "ymtvxlyn")]
+                .iter()
+                .map(|(id, cid)| Workspace {
+                    name: format!("faf-task-{id}"),
+                    change_id: (*cid).into(),
+                })
+                .collect();
+        let tasks = vec![
+            task(174, "faf-task-174", TaskStatus::Working),
+            task(175, "faf-task-175", TaskStatus::Working),
+            task(176, "faf-task-176", TaskStatus::Idle),
+        ];
+
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "pnoounou", "onnosvup", "rkrrupqn", "oztsompu", "poqnvpzq", "wotounsx",
+                "urzuyvvl", "owpmrpwq", "ymtvxlyn", "wkovrsru", "uwpmoxsy", "sqntutps",
+                "xxzzqsrp", "xunlwwqm",
+            ],
+            "the sqntutps branch (base + agent #175) moves as one, to just above the trunk \
+             revision xxzzqsrp it forks from — below wkovrsru, not straddling it"
+        );
+
+        let m = build(&revs, &workspaces, &tasks);
+        let gutters: Vec<String> = crate::graph::render(&m.nodes)
+            .iter()
+            .map(|r| r.gutter.clone())
+            .collect();
+        assert_eq!(
+            gutters,
+            vec![
+                "@", "│ ╭─●", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "├─◻", "├─○", "◆", "│ ╭─○",
+                "├─◻", "◻", "◻",
+            ],
+            "#176 folds onto the trunk as ├─○ and the ◆ fork point is a clean single lane; \
+             #175 sits directly above its own base, which folds back at xxzzqsrp"
+        );
+    }
+
 
     fn rev(id: &str, parents: &[&str], cwc: bool, empty: bool, desc: &str) -> RevInfo {
         RevInfo {
