@@ -3,6 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// The prompt `d` injects into an agent's pane: it asks the agent to summarise the end
+/// result of its current revision as a short jj description. faff never runs `jj describe`
+/// itself — the agent, which holds the live working copy, does. The scheduler never
+/// captures it as a task's first prompt, so `d` works before the user has prompted.
+pub const DESCRIBE_PROMPT: &str = "Set a short description of what this revision accomplishes. \
+     Run: jj describe -m \"<summary>\" where <summary> is a 4-7 word description of the end result.";
+
 /// Stable identifier for a task (also the SQLite rowid). Serialises as a bare integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]

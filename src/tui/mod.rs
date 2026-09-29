@@ -9,7 +9,7 @@ mod notify;
 mod session;
 mod train;
 
-use crate::domain::{Autonomy, Task, TaskId, TaskStatus, truncate_first_line};
+use crate::domain::{Autonomy, DESCRIBE_PROMPT, Task, TaskId, TaskStatus, truncate_first_line};
 use crate::graph::{self, GraphRow};
 use crate::store::Store;
 use crate::{config, events, jj, wezterm, workspace};
@@ -35,12 +35,6 @@ const ID_W: usize = 8;
 /// Most rows the notice line may occupy. A jj error can be long; three wrapped lines
 /// is enough to read one in full without letting chrome crowd out the graph.
 const NOTICE_MAX_LINES: u16 = 3;
-
-/// The prompt `d` injects into an agent's pane: it asks the agent to summarise the end
-/// result of its current revision as a short jj description. faff never runs `jj describe`
-/// itself — the agent, which holds the live working copy, does.
-const DESCRIBE_PROMPT: &str = "Set a short description of what this revision accomplishes. \
-     Run: jj describe -m \"<summary>\" where <summary> is a 4-7 word description of the end result.";
 
 /// Cap on prompt injections a single merge-train tick will make. `wezterm::send_text` blocks
 /// the event loop (~150ms each), so a large fan-out of rebase prompts is spread over ticks
@@ -324,7 +318,6 @@ const HINTS: &[Hint] = &[
 struct Caps {
     has_ws: bool,
     has_pane: bool,
-    has_prompt: bool,
     train: bool,
     /// A pane-less row Enter can still act on: the workspace outlived the agent, so `↵`
     /// starts or revives one in it rather than reporting "no session".
@@ -917,14 +910,6 @@ impl App {
                 .warn("no live pane to send the rebase prompt to");
             return;
         }
-        // The UserPromptSubmit hook captures the *first* prompt as the task title. Before
-        // the user has sent one, an injected rebase prompt would become that title — so
-        // hold off until the task has a real prompt of its own.
-        if t.prompt.is_empty() {
-            self.notices
-                .warn("send the task its first prompt before rebasing");
-            return;
-        }
         if t.status == TaskStatus::Working {
             self.pending_rebase = Some((t.id, freeze));
             let key = if freeze { "r" } else { "R" };
@@ -983,14 +968,6 @@ impl App {
                 .warn("no live pane to send the describe prompt to");
             return;
         }
-        // Like rebase: the first prompt is captured as the task title, so an injected
-        // describe prompt sent before the user's own first prompt would become that title.
-        // Hold off until the task has a real prompt (and thus some work to describe).
-        if t.prompt.is_empty() {
-            self.notices
-                .warn("send the task its first prompt before describing");
-            return;
-        }
         if t.status == TaskStatus::Working {
             self.pending_describe = Some(t.id);
             self.notices.prompt(format!(
@@ -1021,9 +998,7 @@ impl App {
     // ---- merge train (`a` / `A`) ----
 
     /// `a`: toggle the selected agent's revision into/out of the merge train. Rejects a task
-    /// with nothing to merge or no live pane, refuses before the agent's own first prompt
-    /// (the train may inject a describe prompt, which would otherwise be captured as the
-    /// title — same guard as `d`/`r`), and refuses to *start* a train while your own `@`
+    /// with nothing to merge or no live pane, and refuses to *start* a train while your own `@`
     /// still holds work: the train lands revisions onto an empty, description-less `@`.
     fn accept_selected(&mut self) {
         let Some(t) = self.selected_task() else {
@@ -1045,11 +1020,6 @@ impl App {
                 "no live pane to drive #{} through the merge train",
                 t.id.0
             ));
-            return;
-        }
-        if t.prompt.is_empty() {
-            self.notices
-                .warn("send the task its first prompt before accepting");
             return;
         }
         // Nothing to merge if the agent's revision is empty.
@@ -1883,7 +1853,6 @@ impl App {
         Caps {
             has_ws: t.as_ref().is_some_and(|t| t.ws_path.is_some()),
             has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
-            has_prompt: t.as_ref().is_some_and(|t| !t.prompt.is_empty()),
             train: !self.merge_train.is_empty(),
             revivable: t.as_ref().is_some_and(|t| self.task_revivable(t)),
         }
@@ -1896,7 +1865,7 @@ impl App {
             // A lost instance has no pane, but Enter still has something to do with it.
             "↵" => c.has_pane || c.revivable,
             "s" | "S" => c.has_ws,
-            "r" | "R" | "d" | "a" => c.has_ws && c.has_pane && c.has_prompt,
+            "r" | "R" | "d" | "a" => c.has_ws && c.has_pane,
             "A" => c.train,
             _ => true,
         }
@@ -2545,9 +2514,8 @@ mod tests {
     }
 
     #[test]
-    fn rebase_before_first_prompt_is_blocked() {
-        // Before the task has a prompt of its own, an injected rebase prompt would be
-        // captured as the task's title — so `r`/`R` refuses until a real prompt exists.
+    fn rebase_before_first_prompt_is_allowed() {
+        // `r`/`R` needs no prompt of its own: on a working agent it arms the confirmation.
         let mut app = test_app();
         let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
         app.store
@@ -2560,15 +2528,13 @@ mod tests {
             )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
         app.task_order = vec![t.id];
         app.selected = 0;
 
         app.rebase_selected(true);
-        assert_eq!(app.pending_rebase, None, "must not arm without a prompt");
-        let (level, text) = latest(&app);
-        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
-        assert!(text.contains("first prompt"), "notice: {text}");
+        assert_eq!(app.pending_rebase, Some((t.id, true)), "arms without a prompt");
     }
 
     #[test]
@@ -2611,9 +2577,9 @@ mod tests {
     }
 
     #[test]
-    fn describe_before_first_prompt_is_blocked() {
-        // Before the task has a prompt of its own, an injected describe prompt would be
-        // captured as the task's title — so `d` refuses until a real prompt exists.
+    fn describe_before_first_prompt_is_allowed() {
+        // The scheduler never captures the describe prompt as the task's title, so `d`
+        // needs no prompt of its own: on a working agent it arms the confirmation.
         let mut app = test_app();
         let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
         app.store
@@ -2626,15 +2592,13 @@ mod tests {
             )
             .unwrap();
         app.store.set_pane(t.id, Some(42)).unwrap();
+        app.store.update_status(t.id, TaskStatus::Working).unwrap();
         app.tasks = app.store.list_tasks().unwrap();
         app.task_order = vec![t.id];
         app.selected = 0;
 
         app.describe_selected();
-        assert_eq!(app.pending_describe, None, "must not arm without a prompt");
-        let (level, text) = latest(&app);
-        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
-        assert!(text.contains("first prompt"), "notice: {text}");
+        assert_eq!(app.pending_describe, Some(t.id), "arms without a prompt");
     }
 
     // Build a selectable task with a workspace + pane + prompt (the accept happy-path
@@ -2655,22 +2619,6 @@ mod tests {
         app.task_order = vec![t.id];
         app.selected = 0;
         t.id
-    }
-
-    #[test]
-    fn accept_before_first_prompt_is_blocked() {
-        // Like `d`/`r`: an accept may inject a describe prompt, which before the agent's own
-        // first prompt would be captured as the title — so `a` refuses until a prompt exists.
-        let mut app = test_app();
-        let _ = task_with_pane(&mut app, "");
-        app.accept_selected();
-        assert!(
-            app.merge_train.is_empty(),
-            "must not enqueue without a prompt"
-        );
-        let (level, text) = latest(&app);
-        assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
-        assert!(text.contains("first prompt"), "notice: {text}");
     }
 
     #[test]

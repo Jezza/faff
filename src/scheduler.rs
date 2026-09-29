@@ -1,7 +1,7 @@
 //! Applying hook events to the store. See spec §7. `apply_event` performs the status
 //! transitions and appends to the activity feed.
 
-use crate::domain::TaskStatus;
+use crate::domain::{DESCRIBE_PROMPT, TaskStatus};
 use crate::events::Event;
 use crate::store::Store;
 use anyhow::Result;
@@ -11,10 +11,12 @@ pub fn apply_event(store: &Store, ev: &Event) -> Result<()> {
     match ev {
         Event::Prompt { task, text } => {
             // First user prompt of a task created empty (via `n`) becomes its prompt,
-            // which the TUI seeds the jj description from. Only the first one is captured.
+            // which the TUI seeds the jj description from. Only the first one is captured,
+            // and never faff's own injected describe prompt (`d` works before any prompt).
             if let Ok(t) = store.get_task(*task)
                 && t.prompt.trim().is_empty()
                 && !text.trim().is_empty()
+                && text.trim() != DESCRIBE_PROMPT
             {
                 store.set_prompt(*task, text)?;
             }
@@ -156,6 +158,38 @@ mod tests {
             &Event::Prompt {
                 task: t.id,
                 text: "also do something else".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.get_task(t.id).unwrap().prompt,
+            "migrate cell_serde to codec"
+        );
+    }
+
+    #[test]
+    fn injected_describe_prompt_is_not_captured() {
+        // `d` may be sent before the user's first prompt; it must not become the title.
+        let store = Store::open_memory().unwrap();
+        let t = store.create_task("", 0, Autonomy::Inherit).unwrap();
+        apply_event(
+            &store,
+            &Event::Prompt {
+                task: t.id,
+                text: DESCRIBE_PROMPT.into(),
+            },
+        )
+        .unwrap();
+        let got = store.get_task(t.id).unwrap();
+        assert_eq!(got.prompt, "");
+        assert_eq!(got.status, TaskStatus::Working);
+
+        // The user's real first prompt is still captured afterwards.
+        apply_event(
+            &store,
+            &Event::Prompt {
+                task: t.id,
+                text: "migrate cell_serde to codec".into(),
             },
         )
         .unwrap();
