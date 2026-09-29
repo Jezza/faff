@@ -343,6 +343,11 @@ with a `╭` corner (nothing above belongs to the new lane) rather than taking i
 Row labels are clipped to the current pane width — and only when they overflow — so they
 re-fit as docking or detaching a session resizes faff.
 
+When the graph is taller than the pane, it stays pinned to the top until the selection
+would fall below the cut, then scrolls just far enough to show the selected task with two
+rows of context beneath it. A dim `↑ N more` / `↓ N more` on the first/last row says how
+much is hidden.
+
 A task whose change no longer has a node of its own, which is the usual result of
 integrating it, moves to a "detached" list under the graph. It stays selectable and
 removable there.

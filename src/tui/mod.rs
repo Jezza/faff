@@ -352,6 +352,56 @@ fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(out)
 }
 
+/// Rows kept visible below the selection when the graph scrolls to reach it, so the
+/// selected task isn't jammed against the bottom marker.
+const SCROLL_CONTEXT: usize = 2;
+
+/// Which slice of the graph's lines fits in the pane. `skip` lines are hidden above,
+/// then `body` lines are shown. `up`/`down` say whether a `↑ N more` / `↓ N more`
+/// marker takes the pane's first/last row; hidden counts are `skip` and
+/// `total - skip - body`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Viewport {
+    skip: usize,
+    body: usize,
+    up: bool,
+    down: bool,
+}
+
+/// Fit `total` lines into `height` rows, keeping `sel` (the selected task's first..=last
+/// line) on screen. Stateless — derived from the selection alone on every frame — so a
+/// refresh or resize can't leave a stale offset behind: the graph stays pinned to the top
+/// until the selection would fall below the cut, then scrolls just far enough to show it
+/// plus [`SCROLL_CONTEXT`] rows beneath.
+fn graph_viewport(total: usize, height: usize, sel: Option<(usize, usize)>) -> Viewport {
+    if total <= height {
+        return Viewport { skip: 0, body: total, up: false, down: false };
+    }
+    // Too short for markers to leave room for anything: show a bare window.
+    if height < 3 {
+        let skip = sel.map_or(0, |(a, _)| a.min(total - height));
+        return Viewport { skip, body: height, up: false, down: false };
+    }
+    let end = sel.map_or(0, |(_, b)| (b + 1 + SCROLL_CONTEXT).min(total));
+    // Pinned to the top: everything up to `end` fits above the `↓` marker.
+    if end < height {
+        return Viewport { skip: 0, body: height - 1, up: false, down: true };
+    }
+    let first = sel.map_or(0, |(a, _)| a);
+    if end == total {
+        // Scrolled to the very bottom: only the `↑` marker.
+        let body = height - 1;
+        let skip = (total - body).min(first).max(1);
+        let down = skip + body < total;
+        let body = if down { body - 1 } else { body };
+        return Viewport { skip, body, up: true, down };
+    }
+    // Both markers. A selection taller than the body shows its top.
+    let body = height - 2;
+    let skip = (end - body).min(first).max(1);
+    Viewport { skip, body, up: true, down: true }
+}
+
 impl App {
     fn new(repo: PathBuf) -> Result<App> {
         let db = config::db_path(&repo)?;
@@ -1647,6 +1697,11 @@ impl App {
                 }
             }
         }
+        // The selected task's first..=last line, so the viewport can keep it on screen.
+        let mut sel_lines: Option<(usize, usize)> = None;
+        let mark = |sel: &mut Option<(usize, usize)>, at: usize| {
+            *sel = Some(sel.map_or((at, at), |(a, _)| (a, at)));
+        };
         for (i, row) in self.rows.iter().enumerate() {
             let row_task = self.task_of_node.get(i).copied().flatten();
             let row_status =
@@ -1742,6 +1797,9 @@ impl App {
                     );
                 }
             }
+            if is_sel {
+                mark(&mut sel_lines, lines.len());
+            }
             lines.push(Line::from(spans));
         }
         // Detached tasks (workspace inlined into HEAD, or a stale row) have no
@@ -1791,12 +1849,34 @@ impl App {
                         }
                         None => spans.push(Span::styled(text, style)),
                     }
+                    if selected == Some(*id) {
+                        mark(&mut sel_lines, lines.len());
+                    }
                     lines.push(Line::from(spans));
                 }
             }
         }
         let block = Block::default().borders(Borders::RIGHT).title("revisions");
-        f.render_widget(Paragraph::new(lines).block(block), area);
+        // The graph can outgrow the pane (every workspace's ancestors, plus the detached
+        // list), so show the slice around the selection and mark what's hidden.
+        let height = block.inner(area).height as usize;
+        let total = lines.len();
+        let vp = graph_viewport(total, height, sel_lines);
+        let more = |glyph: char, n: usize| {
+            Line::from(Span::styled(
+                format!("{glyph} {n} more"),
+                Style::default().fg(Color::DarkGray),
+            ))
+        };
+        let mut shown: Vec<Line> = Vec::with_capacity(height);
+        if vp.up {
+            shown.push(more('↑', vp.skip));
+        }
+        shown.extend(lines.into_iter().skip(vp.skip).take(vp.body));
+        if vp.down {
+            shown.push(more('↓', total - vp.skip - vp.body));
+        }
+        f.render_widget(Paragraph::new(shown).block(block), area);
     }
 
     /// Rows the current notice needs, clamped to [`NOTICE_MAX_LINES`]. At least 1 even
@@ -3684,5 +3764,100 @@ mod tests {
             text.contains("snapshotted #7"),
             "notice still visible:\n{text}"
         );
+    }
+
+    #[test]
+    fn viewport_shows_everything_that_fits() {
+        assert_eq!(
+            graph_viewport(5, 10, Some((4, 4))),
+            Viewport { skip: 0, body: 5, up: false, down: false }
+        );
+    }
+
+    #[test]
+    fn viewport_stays_pinned_to_the_top_while_the_selection_is_visible() {
+        // 30 lines into 10 rows: the last row is the `↓` marker, and a selection on line 6
+        // (+2 context rows) still fits above it.
+        assert_eq!(
+            graph_viewport(30, 10, Some((6, 6))),
+            Viewport { skip: 0, body: 9, up: false, down: true }
+        );
+        assert_eq!(
+            graph_viewport(30, 10, None),
+            Viewport { skip: 0, body: 9, up: false, down: true }
+        );
+    }
+
+    #[test]
+    fn viewport_scrolls_just_far_enough_to_show_a_selection_below_the_cut() {
+        // Line 15 selected: show through line 17 (two context rows) with markers top and
+        // bottom, so the body is 8 rows ending at 17.
+        let vp = graph_viewport(30, 10, Some((15, 15)));
+        assert_eq!(vp, Viewport { skip: 10, body: 8, up: true, down: true });
+        assert!((vp.skip..vp.skip + vp.body).contains(&15));
+    }
+
+    #[test]
+    fn viewport_at_the_bottom_drops_the_down_marker() {
+        assert_eq!(
+            graph_viewport(30, 10, Some((29, 29))),
+            Viewport { skip: 21, body: 9, up: true, down: false }
+        );
+    }
+
+    #[test]
+    fn viewport_shows_the_top_of_a_selection_taller_than_the_pane() {
+        let vp = graph_viewport(30, 5, Some((10, 20)));
+        assert_eq!(vp.skip, 10);
+        assert!(vp.up && vp.down);
+    }
+
+    #[test]
+    fn a_selected_task_below_the_cut_is_scrolled_into_view() {
+        // 40 history rows then one agent: far taller than the pane. The agent must be on
+        // screen, with a marker saying how much history scrolled off the top.
+        let mut app = test_app();
+        let t = app.store.create_task("deep", 0, Autonomy::Inherit).unwrap();
+        app.tasks = app.store.list_tasks().unwrap();
+        app.task_order = vec![t.id];
+        let mut rows: Vec<GraphRow> = (0..40)
+            .map(|i| GraphRow {
+                gutter: "◻".into(),
+                content: format!("history {i}"),
+                node_index: Some(i),
+                change_id: Some(format!("h{i:07}")),
+            })
+            .collect();
+        rows.push(GraphRow {
+            gutter: "├─●".into(),
+            content: format!("#{} :: the deep agent", t.id.0),
+            node_index: Some(40),
+            change_id: Some("agentaaa".into()),
+        });
+        app.task_of_node = (0..40).map(|_| None).chain([Some(t.id)]).collect();
+        app.rows = rows;
+
+        let text = buffer_text(&draw(&mut app, 70, 16));
+        assert!(text.contains("the deep agent"), "selection visible:\n{text}");
+        assert!(text.contains("↑ ") && text.contains(" more"), "up marker:\n{text}");
+        assert!(!text.contains("history 0 "), "top scrolled off:\n{text}");
+        assert!(!text.contains("↓ "), "nothing hidden below:\n{text}");
+    }
+
+    #[test]
+    fn an_unselected_overflow_marks_what_is_hidden_below() {
+        let mut app = test_app();
+        app.rows = (0..40)
+            .map(|i| GraphRow {
+                gutter: "◻".into(),
+                content: format!("history {i}"),
+                node_index: Some(i),
+                change_id: Some(format!("h{i:07}")),
+            })
+            .collect();
+        app.task_of_node = vec![None; 40];
+        let text = buffer_text(&draw(&mut app, 70, 16));
+        assert!(text.contains("history 0"), "pinned to the top:\n{text}");
+        assert!(text.contains("↓ ") && text.contains(" more"), "down marker:\n{text}");
     }
 }
