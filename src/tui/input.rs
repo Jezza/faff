@@ -45,6 +45,9 @@ pub enum Action {
     /// `A` (Shift+a): abort the merge train — dequeue everything still pending. Revisions
     /// already taken over stay; nothing is rolled back.
     AbortTrain,
+    /// Tab: switch the body between the agent view (the curated revision graph) and the
+    /// log view (every loaded revision, nothing collapsed or lifted).
+    ToggleView,
     None,
 }
 
@@ -68,6 +71,7 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('A') => Action::AbortTrain,
         KeyCode::Char('!') => Action::ShowLog,
         KeyCode::Char('?') => Action::Help,
+        KeyCode::Tab => Action::ToggleView,
         _ => Action::None,
     }
 }
@@ -107,6 +111,7 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('A'))), Action::AbortTrain);
         assert_eq!(map_key(k(KeyCode::Char('!'))), Action::ShowLog);
         assert_eq!(map_key(k(KeyCode::Char('?'))), Action::Help);
+        assert_eq!(map_key(k(KeyCode::Tab)), Action::ToggleView);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
     }
 }

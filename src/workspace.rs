@@ -60,6 +60,14 @@ pub fn resolve_fork_point(repo: &Path, freeze: bool) -> Result<String> {
 
 pub fn create(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
     let fork_point = resolve_fork_point(repo, true)?;
+    create_at(repo, name, path, &fork_point)
+}
+
+/// Create an agent workspace whose `@` is a fresh empty child of `base`, which becomes the
+/// task's fork point. `create` is this on the computed fork point; the log view's `n`
+/// passes whichever revision is selected. Never touches your `@`.
+pub fn create_at(repo: &Path, name: &str, path: &Path, base: &str) -> Result<WorkspaceInfo> {
+    let fork_point = jj::resolve_change_id(repo, base).context("resolving the base revision")?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -137,6 +145,44 @@ pub fn handoff(repo: &Path, name: &str, path: &Path) -> Result<WorkspaceInfo> {
     jj::edit_in(path, &w).context("moving the agent onto your revision")?;
     // Your workspace retreats last: a fresh empty commit on the pre-changes fork point.
     jj::new_at(repo, &fork_point).context("jj new (retreating your @)")?;
+
+    Ok(WorkspaceInfo {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        change_id: w,
+        fork_point,
+    })
+}
+
+/// The log view's `N`: an agent workspace that edits revision `rev` directly, like
+/// [`handoff`] but for any revision. On your own `@` it *is* `handoff` (your `@` retreats);
+/// anywhere else your `@` is left alone. Refuses a revision another workspace already sits
+/// on — two working copies on one commit go stale under each other — and an immutable one,
+/// which `jj edit` would refuse anyway, but only after the workspace had been added.
+pub fn continue_at(repo: &Path, name: &str, path: &Path, rev: &str) -> Result<WorkspaceInfo> {
+    let w = jj::resolve_change_id(repo, rev).context("resolving the revision")?;
+    if jj::resolve_change_id(repo, "@").context("resolving @")? == w {
+        return handoff(repo, name, path);
+    }
+    if let Some(owner) = jj::workspace_list(repo)?
+        .into_iter()
+        .find(|ws| ws.change_id == w)
+    {
+        bail!("{w} is already {}'s working copy", owner.name);
+    }
+    if jj::any_revision(repo, &format!("{w} & immutable()"))? {
+        bail!("{w} is immutable");
+    }
+    let fork_point = jj::resolve_change_id(repo, &jj::fork_point_revset(&format!("{w}-")))
+        .context("no fork point below the revision")?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace root {}", parent.display()))?;
+    }
+    // Created as an empty child of `w`, then moved onto `w` itself (as in `handoff`).
+    jj::workspace_add(repo, name, &w, path).context("jj workspace add")?;
+    jj::edit_in(path, &w).context("moving the agent onto the revision")?;
 
     Ok(WorkspaceInfo {
         name: name.to_string(),
@@ -1549,6 +1595,126 @@ mod tests {
             jj::any_revision(&repo, &format!("{w} ~ empty()")).unwrap(),
             "W is kept and non-empty"
         );
+    }
+
+    fn ws_head(repo: &Path, name: &str) -> String {
+        jj::workspace_list(repo)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.name == name)
+            .expect("workspace exists")
+            .change_id
+    }
+
+    #[test]
+    fn integration_create_at_forks_from_the_given_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path()); // @ empty on top of "base"
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        fs::write(repo.join("later.txt"), "later").unwrap();
+        jj(&repo, &cfg, &["commit", "-m", "later"]);
+        let head_before = jj::resolve_change_id(&repo, "@").unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = create_at(&repo, "faf-task-1", &ws_path, &base).unwrap();
+
+        assert_eq!(
+            info.fork_point, base,
+            "the task forks from the chosen revision"
+        );
+        let agent = ws_head(&repo, "faf-task-1");
+        assert_eq!(info.change_id, agent);
+        assert_eq!(
+            jj::resolve_change_id(&repo, &format!("{agent}-")).unwrap(),
+            base,
+            "the agent's @ is an empty child of the chosen revision"
+        );
+        assert!(!ws_path.join("later.txt").exists(), "nothing from above it");
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            head_before,
+            "your @ is untouched"
+        );
+    }
+
+    #[test]
+    fn integration_continue_at_edits_the_revision_and_leaves_you_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        fs::write(repo.join("x.txt"), "x").unwrap();
+        jj(&repo, &cfg, &["commit", "-m", "X"]);
+        let x = jj::resolve_change_id(&repo, "@-").unwrap();
+        let head_before = jj::resolve_change_id(&repo, "@").unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = continue_at(&repo, "faf-task-1", &ws_path, &x).unwrap();
+
+        assert_eq!(info.change_id, x, "the agent adopts the revision itself");
+        assert_eq!(ws_head(&repo, "faf-task-1"), x, "its @ is X, not a child");
+        assert!(ws_path.join("x.txt").exists());
+        assert_eq!(
+            info.fork_point, base,
+            "fork point is the content line below X"
+        );
+        assert_eq!(
+            jj::resolve_change_id(&repo, "@").unwrap(),
+            head_before,
+            "your @ stays where it was"
+        );
+    }
+
+    #[test]
+    fn integration_continue_at_your_own_working_copy_is_a_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        fs::write(repo.join("wip.txt"), "wip").unwrap();
+        let w = jj::resolve_change_id(&repo, "@").unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let info = continue_at(&repo, "faf-task-1", &ws_path, &w).unwrap();
+
+        assert_eq!(info.change_id, w);
+        let user_at = jj::resolve_change_id(&repo, "@").unwrap();
+        assert_ne!(user_at, w, "your @ retreated, as `N` does");
+        assert_eq!(
+            jj::resolve_change_id(&repo, &format!("{user_at}-")).unwrap(),
+            base
+        );
+    }
+
+    #[test]
+    fn integration_continue_at_refuses_another_workspaces_working_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let other = create(&repo, "faf-task-1", &tmp.path().join("ws/1")).unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0002-task");
+        let err = continue_at(&repo, "faf-task-2", &ws_path, &other.change_id).unwrap_err();
+        assert!(
+            err.to_string().contains("faf-task-1"),
+            "names the owner: {err}"
+        );
+        assert!(!ws_path.exists());
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|w| w.name == "faf-task-2")
+        );
+    }
+
+    #[test]
+    fn integration_continue_at_refuses_an_immutable_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _cfg) = scratch_repo(tmp.path());
+        let root = jj::resolve_change_id(&repo, "root()").unwrap();
+
+        let ws_path = tmp.path().join("ws").join("0001-task");
+        let err = continue_at(&repo, "faf-task-1", &ws_path, &root).unwrap_err();
+        assert!(err.to_string().contains("immutable"), "{err}");
+        assert!(!ws_path.exists());
     }
 
     #[test]

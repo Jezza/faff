@@ -300,6 +300,18 @@ pub fn any_revision(repo: &Path, revset: &str) -> Result<bool> {
     Ok(out.lines().any(|l| !l.trim().is_empty()))
 }
 
+/// `jj diff --git -r <rev>`: the revision's changes against its parents. Snapshots first
+/// (an ordinary `run_jj`), so a working copy's unrecorded edits are included.
+pub fn diff_git(repo: &Path, rev: &str) -> Result<String> {
+    run_jj(repo, &["diff", "--git", "-r", rev])
+}
+
+/// `jj describe -r <rev> -m <message>`, replacing any existing description.
+pub fn describe(repo: &Path, rev: &str, message: &str) -> Result<()> {
+    run_jj(repo, &["describe", "-r", rev, "-m", message])?;
+    Ok(())
+}
+
 /// First line of the description of the revision `revset` resolves to (empty string
 /// when it has none, or when nothing matches).
 pub fn description(repo: &Path, revset: &str) -> Result<String> {
@@ -560,6 +572,43 @@ mod tests {
         // Setting a description makes `description` read back its first line.
         jj_setup(&repo, &cfg, &["describe", "-r", "@", "-m", "a described change"]);
         assert_eq!(description(&repo, "@").unwrap(), "a described change");
+    }
+
+    #[test]
+    fn integration_diff_git_and_describe_a_revision_below_the_working_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+        let init = Command::new("jj")
+            .args(["git", "init"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success(), "jj git init failed");
+        jj_setup(
+            &repo,
+            &cfg,
+            &["config", "set", "--repo", "user.name", "Test"],
+        );
+        jj_setup(
+            &repo,
+            &cfg,
+            &["config", "set", "--repo", "user.email", "test@x.io"],
+        );
+        // Unsnapshotted edits in @: `diff_git` must still see them.
+        std::fs::write(repo.join("x.txt"), "hello\n").unwrap();
+        assert!(diff_git(&repo, "@").unwrap().contains("+hello"));
+        jj_setup(&repo, &cfg, &["new"]);
+        assert_eq!(
+            diff_git(&repo, "@").unwrap().trim(),
+            "",
+            "a fresh @ has no diff"
+        );
+
+        describe(&repo, "@-", "Add the x file").unwrap();
+        assert_eq!(description(&repo, "@-").unwrap(), "Add the x file");
     }
 
     #[test]

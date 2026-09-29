@@ -8,7 +8,7 @@
 //! can never observe a task half-way through being created or removed.
 
 use super::notify::Level;
-use super::{model, session, train};
+use super::{describe, model, session, train};
 use crate::domain::{Autonomy, DESCRIBE_PROMPT, Task, TaskId, TaskStatus};
 use crate::graph::{self, GraphRow};
 use crate::store::Store;
@@ -51,12 +51,25 @@ struct MergeFacts {
     seq: u64,
 }
 
+/// Where `n`/`N` start a new task's workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// `n` in the agent view: an empty child of the current fork point.
+    ForkPoint,
+    /// `N` in the agent view: take over your `@`, which retreats to the fork point.
+    Handoff,
+    /// `n` in the log view: an empty child of this revision.
+    At(String),
+    /// `N` in the log view: edit this revision itself (a hand-off when it's your `@`).
+    Continue(String),
+}
+
 /// An action requested by the UI. Task ids come from the UI's latest [`View`]; the engine
 /// looks each one up afresh and quietly drops a command whose task has since vanished.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    /// `n` (`handoff == false`) / `N` (`handoff == true`).
-    New { handoff: bool },
+    /// `n` / `N`.
+    New(Base),
     /// `↵` on the given selection: open, detach, retarget, or revive.
     Toggle(Option<TaskId>),
     /// `x` / `X`.
@@ -69,6 +82,15 @@ pub enum Cmd {
     Rebase { id: TaskId, freeze: bool },
     /// `d`, already confirmed if the agent was working.
     Describe(TaskId),
+    /// `d` in the log view on a revision no agent sits on: describe it with a headless
+    /// claude, off the engine thread.
+    DescribeRev(String),
+    /// A [`Cmd::DescribeRev`]'s claude finished, with the description or why it failed.
+    /// Queued by the engine for itself, so like [`Cmd::Nudge`] it gets no [`Msg::Done`].
+    Described {
+        rev: String,
+        result: std::result::Result<String, String>,
+    },
     /// `a`: toggle into / out of the merge train.
     Accept(TaskId),
     /// `A`.
@@ -94,6 +116,12 @@ pub struct View {
     pub rows: Vec<GraphRow>,
     /// Parallel to `rows`: which task (if any) each row represents.
     pub task_of_node: Vec<Option<TaskId>>,
+    /// The log view's rows and their tasks, parallel like `rows`/`task_of_node`: every
+    /// loaded revision in jj's order, nothing collapsed or lifted.
+    pub log_rows: Vec<GraphRow>,
+    pub log_task_of: Vec<Option<TaskId>>,
+    /// Your working copy's change id, where the log view's selection starts.
+    pub working_copy: Option<String>,
     /// The current fork point (`heads(::@ ~ empty())`) — the revision new agents branch
     /// from. Its glyph (`◆`, or `@` when it coincides) is tinted cyan in the graph.
     pub fork_point: Option<String>,
@@ -113,6 +141,8 @@ pub struct View {
     pub resumable: HashSet<TaskId>,
     /// A freshly created task (`n`/`N`) the UI should move its selection onto.
     pub select: Option<TaskId>,
+    /// Revisions (change ids) a headless claude is describing, so their rows can spin.
+    pub describing: HashSet<String>,
 }
 
 /// The engine's notice sink: the same `ok`/`warn`/… surface as `notify::Notices`, but each
@@ -160,6 +190,9 @@ pub struct Engine {
     tasks: Vec<Task>,
     rows: Vec<GraphRow>,
     task_of_node: Vec<Option<TaskId>>,
+    log_rows: Vec<GraphRow>,
+    log_task_of: Vec<Option<TaskId>>,
+    working_copy: Option<String>,
     fork_point: Option<String>,
     task_order: Vec<TaskId>,
     detached: Vec<TaskId>,
@@ -172,6 +205,12 @@ pub struct Engine {
     /// The merge train: revisions marked with `a` to be drained into your workspace one at
     /// a time. Advanced each refresh tick by `tick_merge_train`. See `tui::train`.
     merge_train: train::Train,
+    /// Revisions with a headless describe in flight (see `describe_rev`).
+    describing: HashSet<String>,
+    /// Turns a diff into a description. [`describe::ask_claude`], except in tests.
+    describer: fn(&str) -> Result<String>,
+    /// The engine's own command queue, for background work to report back on.
+    wake: Sender<Cmd>,
 }
 
 impl Engine {
@@ -183,6 +222,7 @@ impl Engine {
         let store = Store::open(&db)?;
         let socket = events::socket_path(&repo);
         let events_rx = events::spawn_listener(&socket)?;
+        let wake = nudge.clone();
         // Finish deleting any workspace dirs a previous run renamed aside but exited
         // before clearing.
         if let Ok(root) = config::workspace_root(&repo) {
@@ -209,6 +249,7 @@ impl Engine {
             workspace::claude_projects_dir(),
             faff_pane,
             tx,
+            wake,
         ))
     }
 
@@ -222,6 +263,7 @@ impl Engine {
         claude_projects: PathBuf,
         faff_pane: Option<u64>,
         tx: Sender<Msg>,
+        wake: Sender<Cmd>,
     ) -> Engine {
         Engine {
             repo,
@@ -235,6 +277,9 @@ impl Engine {
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
+            log_rows: Vec::new(),
+            log_task_of: Vec::new(),
+            working_copy: None,
             fork_point: None,
             task_order: Vec::new(),
             detached: Vec::new(),
@@ -243,6 +288,9 @@ impl Engine {
             last_refresh: Instant::now(),
             pending_select: None,
             merge_train: train::Train::default(),
+            describing: HashSet::new(),
+            describer: describe::ask_claude,
+            wake,
         }
     }
 
@@ -257,6 +305,11 @@ impl Engine {
             let gap = if nudged { MIN_REFRESH_GAP } else { IDLE_REFRESH };
             match rx.recv_timeout(gap.saturating_sub(self.last_refresh.elapsed())) {
                 Ok(Cmd::Nudge) => nudged = true,
+                Ok(cmd @ Cmd::Described { .. }) => {
+                    self.handle(cmd);
+                    self.publish();
+                    continue;
+                }
                 Ok(cmd) => {
                     self.handle(cmd);
                     self.publish();
@@ -280,14 +333,15 @@ impl Engine {
 
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::New { handoff: false } => self.new_task(),
-            Cmd::New { handoff: true } => self.handoff_task(),
+            Cmd::New(base) => self.new_task(base),
             Cmd::Toggle(id) => self.toggle_session(id),
             Cmd::Remove { id, discard } => self.remove(id, discard),
             Cmd::Swap(id) => self.perform_swap(id),
             Cmd::Snapshot(id) => self.snapshot_task(id),
             Cmd::Rebase { id, freeze } => self.perform_rebase(id, freeze),
             Cmd::Describe(id) => self.perform_describe(id),
+            Cmd::DescribeRev(rev) => self.describe_rev(rev),
+            Cmd::Described { rev, result } => self.described(rev, result),
             Cmd::Accept(id) => self.accept(id),
             Cmd::AbortTrain => self.abort_train(),
             Cmd::Nudge => {}
@@ -313,6 +367,9 @@ impl Engine {
             tasks: self.tasks.clone(),
             rows: self.rows.clone(),
             task_of_node: self.task_of_node.clone(),
+            log_rows: self.log_rows.clone(),
+            log_task_of: self.log_task_of.clone(),
+            working_copy: self.working_copy.clone(),
             fork_point: self.fork_point.clone(),
             task_order: self.task_order.clone(),
             detached: self.detached.clone(),
@@ -322,6 +379,7 @@ impl Engine {
             revivable,
             resumable,
             select: self.pending_select.take(),
+            describing: self.describing.clone(),
         }
     }
 
@@ -338,45 +396,41 @@ impl Engine {
     /// `n`: create an empty task, fork its workspace, spawn a bare `claude`, and open
     /// it beside faff so the user types their task straight into the session. The task
     /// prompt (and title) are captured later from the first UserPromptSubmit hook.
-    fn new_task(&mut self) {
-        match self.try_new_task(false) {
-            Ok(id) => {
-                self.notices
-                    .ok(format!("new task #{id} — type your task in the pane"));
-                self.pending_select = Some(id);
-            }
-            Err(e) => self.notices.err(format!("new task failed: {e}")),
-        }
-        self.refresh();
-    }
-
-    /// `N` (Shift+n): hand off your current work. Like `new_task`, but the agent takes
-    /// over your current revision — it continues your exact commit — and your own `@`
-    /// retreats to the fork point from before your changes (see `workspace::handoff`).
-    /// You still type what you want the agent to finish into its pane, exactly as `n`.
-    fn handoff_task(&mut self) {
-        match self.try_new_task(true) {
-            Ok(id) => {
+    ///
+    /// `N` (Shift+n) hands off instead: the agent takes over a revision — your current one
+    /// in the agent view (your own `@` retreats to the fork point from before your changes,
+    /// see `workspace::handoff`), the selected one in the log view — and continues that
+    /// exact commit. You still type what you want it to finish into its pane.
+    fn new_task(&mut self, base: Base) {
+        let handoff = matches!(base, Base::Handoff | Base::Continue(_));
+        match self.try_new_task(&base) {
+            Ok(id) if handoff => {
                 self.notices.ok(format!(
                     "handed off #{id} — type what to finish in the pane"
                 ));
                 self.pending_select = Some(id);
             }
-            Err(e) => self.notices.err(format!("handoff failed: {e}")),
+            Ok(id) => {
+                self.notices
+                    .ok(format!("new task #{id} — type your task in the pane"));
+                self.pending_select = Some(id);
+            }
+            Err(e) if handoff => self.notices.err(format!("handoff failed: {e}")),
+            Err(e) => self.notices.err(format!("new task failed: {e}")),
         }
         self.refresh();
     }
 
-    /// Shared task-creation path for `n` (`handoff == false`) and `N` (`handoff == true`).
-    /// The only difference is how the workspace is forked (`prepare_workspace`); spawning,
-    /// docking, rollback, and status are identical.
-    fn try_new_task(&mut self, handoff: bool) -> Result<TaskId> {
+    /// Shared task-creation path for every [`Base`]. The only difference is how the
+    /// workspace is forked (`prepare_workspace`); spawning, docking, rollback, and status
+    /// are identical.
+    fn try_new_task(&mut self, base: &Base) -> Result<TaskId> {
         let faff = self
             .faff_pane
             .context("run faff inside WezTerm to spawn agents")?;
         let task = self.store.create_task("", 0, Autonomy::Inherit)?;
         // Roll the row back if workspace prep fails (no invisible zombie).
-        if let Err(e) = self.prepare_workspace(task.id, "", handoff) {
+        if let Err(e) = self.prepare_workspace(task.id, "", base) {
             let _ = self.store.delete_task(task.id);
             return Err(e);
         }
@@ -402,14 +456,15 @@ impl Engine {
         }
     }
 
-    fn prepare_workspace(&self, id: TaskId, prompt: &str, handoff: bool) -> Result<()> {
+    fn prepare_workspace(&self, id: TaskId, prompt: &str, base: &Base) -> Result<()> {
         let slug = config::slugify(prompt, 4);
         let name = format!("faf-task-{}", id.0);
         let path = config::task_workspace_dir(&self.repo, id.0, &slug)?;
-        let ws = if handoff {
-            workspace::handoff(&self.repo, &name, &path)?
-        } else {
-            workspace::create(&self.repo, &name, &path)?
+        let ws = match base {
+            Base::ForkPoint => workspace::create(&self.repo, &name, &path)?,
+            Base::Handoff => workspace::handoff(&self.repo, &name, &path)?,
+            Base::At(rev) => workspace::create_at(&self.repo, &name, &path, rev)?,
+            Base::Continue(rev) => workspace::continue_at(&self.repo, &name, &path, rev)?,
         };
         // The workspace now exists on disk + in jj. If recording it fails, tear it
         // back down so we don't leak an untracked jj workspace (the DB row is rolled
@@ -717,6 +772,54 @@ impl Engine {
             Err(e) => self.notices.err(format!("describe send failed: {e}")),
         }
         self.refresh();
+    }
+
+    /// `d` in the log view on a revision no agent sits on: hand its diff to a headless
+    /// claude on a thread of its own — it can take a while, and the engine must keep
+    /// refreshing meanwhile — and spin its row until [`Cmd::Described`] comes back.
+    fn describe_rev(&mut self, rev: String) {
+        let short: String = rev.chars().take(8).collect();
+        if self.describing.contains(&rev) {
+            self.notices.warn(format!("already describing {short}"));
+            return;
+        }
+        let diff = match jj::diff_git(&self.repo, &rev) {
+            Ok(d) => d,
+            Err(e) => {
+                self.notices.err(format!("describe {short} failed: {e}"));
+                return;
+            }
+        };
+        if diff.trim().is_empty() {
+            self.notices
+                .warn(format!("nothing to describe — {short} has no changes"));
+            return;
+        }
+        self.describing.insert(rev.clone());
+        let (ask, wake) = (self.describer, self.wake.clone());
+        std::thread::spawn(move || {
+            let result = ask(&diff).map_err(|e| e.to_string());
+            let _ = wake.send(Cmd::Described { rev, result });
+        });
+    }
+
+    /// A headless describe finished: write the description (on the engine thread, so it is
+    /// ordered with every other jj mutation) and stop the spinner either way.
+    fn described(&mut self, rev: String, result: std::result::Result<String, String>) {
+        self.describing.remove(&rev);
+        let short: String = rev.chars().take(8).collect();
+        let written = result.and_then(|d| {
+            jj::describe(&self.repo, &rev, &d)
+                .map(|()| d)
+                .map_err(|e| e.to_string())
+        });
+        match written {
+            Ok(d) => {
+                self.notices.ok(format!("{short} → {d}"));
+                self.refresh();
+            }
+            Err(e) => self.notices.err(format!("describe {short} failed: {e}")),
+        }
     }
 
     // ---- merge train (`a` / `A`) ----
@@ -1052,12 +1155,17 @@ impl Engine {
 
         // Build the revision graph from the (already-fetched) workspace list.
         if let Some(ws) = &ws_list {
-            match self.build_rows(ws) {
-                Ok((rows, task_of, id_display, fork_point)) => {
-                    self.rows = rows;
-                    self.task_of_node = task_of;
-                    self.id_display = id_display;
-                    self.fork_point = fork_point;
+            let revset = jj::workspace_ancestors_revset(ws, 25);
+            match jj::log_peek(&self.repo, &revset) {
+                Ok(revs) => {
+                    let g = Graphs::build(revs, ws, &self.tasks);
+                    self.rows = g.rows;
+                    self.task_of_node = g.task_of_node;
+                    self.log_rows = g.log_rows;
+                    self.log_task_of = g.log_task_of;
+                    self.working_copy = g.working_copy;
+                    self.id_display = g.id_display;
+                    self.fork_point = g.fork_point;
                 }
                 Err(e) => self.notices.err(format!("jj error: {e}")),
             }
@@ -1180,22 +1288,26 @@ impl Engine {
         }
         orphans
     }
+}
 
-    #[allow(clippy::type_complexity)]
-    fn build_rows(
-        &self,
+/// Both graph views, built from one `jj log` result. Pure (no jj), so the UI's tests can
+/// build a view from hand-written revisions.
+pub struct Graphs {
+    pub rows: Vec<GraphRow>,
+    pub task_of_node: Vec<Option<TaskId>>,
+    pub log_rows: Vec<GraphRow>,
+    pub log_task_of: Vec<Option<TaskId>>,
+    pub working_copy: Option<String>,
+    pub id_display: HashMap<String, (String, String)>,
+    pub fork_point: Option<String>,
+}
+
+impl Graphs {
+    pub fn build(
+        mut revs: Vec<jj::RevInfo>,
         workspaces: &[jj::Workspace],
-    ) -> Result<(
-        Vec<GraphRow>,
-        Vec<Option<TaskId>>,
-        std::collections::HashMap<String, (String, String)>,
-        Option<String>,
-    )> {
-        let revset = jj::workspace_ancestors_revset(workspaces, 25);
-        let mut revs = jj::log_peek(&self.repo, &revset)?;
-        // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
-        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
-        model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
+        tasks: &[Task],
+    ) -> Graphs {
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
             .iter()
@@ -1206,12 +1318,33 @@ impl Engine {
                 )
             })
             .collect();
-        let m = model::build(&revs, workspaces, &self.tasks);
+        let working_copy = revs
+            .iter()
+            .find(|r| r.is_current_wc)
+            .map(|r| r.change_id.clone());
+
+        // The log view takes jj's order as-is, so build it before the agent view reorders.
+        let m = model::build_log(&revs, workspaces, tasks);
+        let log_rows = graph::render(&m.nodes);
+        let log_task_of = model::row_tasks(&log_rows, &m.nodes, &m.task_of);
+
+        // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
+        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
+        model::order_by_fork_point(&mut revs, workspaces, tasks);
+        let m = model::build(&revs, workspaces, tasks);
         let rows = graph::render(&m.nodes);
         // task_of is parallel to rows: which task (if any) each row represents. For the
         // combined HEAD+agent node this hangs on the agent line, not the HEAD header.
-        let task_of = model::row_tasks(&rows, &m.nodes, &m.task_of);
-        Ok((rows, task_of, id_display, m.fork_point))
+        let task_of_node = model::row_tasks(&rows, &m.nodes, &m.task_of);
+        Graphs {
+            rows,
+            task_of_node,
+            log_rows,
+            log_task_of,
+            working_copy,
+            id_display,
+            fork_point: m.fork_point,
+        }
     }
 }
 
@@ -1223,9 +1356,17 @@ mod tests {
     // Build a minimal Engine with an in-memory store (no jj/wezterm needed). The receiver
     // collects everything the engine would have sent the UI.
     fn test_engine() -> (Engine, Receiver<Msg>) {
+        let (engine, rx, _wake) = test_engine_at(PathBuf::from("/tmp/repo"));
+        (engine, rx)
+    }
+
+    /// [`test_engine`] on a real repo, also returning what the engine queues for itself
+    /// (a background describe's result).
+    fn test_engine_at(repo: PathBuf) -> (Engine, Receiver<Msg>, Receiver<Cmd>) {
         let (tx, rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel();
         let engine = Engine::new(
-            PathBuf::from("/tmp/repo"),
+            repo,
             PathBuf::from("/bin/faff"),
             PathBuf::from("/tmp/faf.sock"),
             PathBuf::from("/tmp/faf.db"),
@@ -1233,8 +1374,46 @@ mod tests {
             PathBuf::from("/nope/projects"),
             Some(1),
             tx,
+            wake_tx,
         );
-        (engine, rx)
+        (engine, rx, wake_rx)
+    }
+
+    /// A jj repo with one content commit `X` under an empty `@`. Returns (repo, X).
+    fn repo_with_commit(tmp: &std::path::Path) -> (PathBuf, String) {
+        let repo = tmp.join("repo");
+        let cfg = tmp.join("jjcfg.toml");
+        std::fs::write(&cfg, "[user]\nname=\"Test\"\nemail=\"t@x.io\"\n").unwrap();
+        let jj_ = |args: &[&str]| {
+            let ok = std::process::Command::new("jj")
+                .arg("--no-pager")
+                .args(args)
+                .current_dir(tmp)
+                .env("JJ_CONFIG", &cfg)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "jj {args:?} failed");
+        };
+        jj_(&["git", "init", "repo"]);
+        jj_(&["-R", "repo", "config", "set", "--repo", "user.name", "Test"]);
+        jj_(&[
+            "-R",
+            "repo",
+            "config",
+            "set",
+            "--repo",
+            "user.email",
+            "t@x.io",
+        ]);
+        std::fs::write(repo.join("x.txt"), "x\n").unwrap();
+        jj_(&["-R", "repo", "commit", "-m", ""]);
+        let x = jj::resolve_change_id(&repo, "@-").unwrap();
+        (repo, x)
+    }
+
+    fn describes_as_add_x(_diff: &str) -> Result<String> {
+        Ok("Add the x file".into())
     }
 
     /// The notices the engine has sent so far, oldest first.
@@ -1266,6 +1445,70 @@ mod tests {
         e.pending_select = Some(t.id);
         assert_eq!(e.view().select, Some(t.id));
         assert_eq!(e.view().select, None, "consumed by the first publish");
+    }
+
+    #[test]
+    fn describing_a_revision_asks_claude_off_thread_then_sets_its_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, x) = repo_with_commit(tmp.path());
+        let (mut e, rx, wake) = test_engine_at(repo.clone());
+        e.describer = describes_as_add_x;
+
+        e.handle(Cmd::DescribeRev(x.clone()));
+        assert!(
+            e.view().describing.contains(&x),
+            "the row spins while claude thinks"
+        );
+
+        let back = wake
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the describe thread reports back");
+        e.handle(back);
+        assert_eq!(jj::description(&repo, &x).unwrap(), "Add the x file");
+        assert!(e.view().describing.is_empty(), "the spinner stops");
+        let (level, text) = notices(&rx).pop().unwrap();
+        assert_eq!(level, Level::Success);
+        assert!(text.contains("Add the x file"), "{text}");
+    }
+
+    #[test]
+    fn describing_an_empty_revision_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _x) = repo_with_commit(tmp.path());
+        let at = jj::resolve_change_id(&repo, "@").unwrap();
+        let (mut e, rx, wake) = test_engine_at(repo);
+        e.describer = describes_as_add_x;
+
+        e.handle(Cmd::DescribeRev(at));
+        assert!(e.view().describing.is_empty());
+        assert!(wake.try_recv().is_err(), "no claude was started");
+        let (level, text) = notices(&rx).pop().unwrap();
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("nothing to describe"), "{text}");
+    }
+
+    #[test]
+    fn a_second_describe_of_the_same_revision_waits_for_the_first() {
+        let (mut e, rx) = test_engine();
+        e.describing.insert("abc".into());
+        e.handle(Cmd::DescribeRev("abc".into()));
+        let (level, text) = notices(&rx).pop().unwrap();
+        assert_eq!(level, Level::Warn);
+        assert!(text.contains("already"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_describe_stops_the_spinner_and_reports_why() {
+        let (mut e, rx) = test_engine();
+        e.describing.insert("abc".into());
+        e.handle(Cmd::Described {
+            rev: "abc".into(),
+            result: Err("claude failed: boom".into()),
+        });
+        assert!(e.describing.is_empty());
+        let (level, text) = notices(&rx).pop().unwrap();
+        assert_eq!(level, Level::Error);
+        assert!(text.contains("boom"), "{text}");
     }
 
     #[test]

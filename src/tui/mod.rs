@@ -3,6 +3,7 @@
 //! (input, session, model); every side effect runs on the engine thread
 //! (`engine`); this file is the UI state, event loop, and rendering glue.
 
+mod describe;
 mod engine;
 mod input;
 mod model;
@@ -11,8 +12,9 @@ mod session;
 mod train;
 
 use crate::domain::{Task, TaskId, TaskStatus, truncate_first_line};
+use crate::graph::GraphRow;
 use anyhow::{Context, Result, bail};
-use engine::{Cmd, Engine, Msg, View};
+use engine::{Base, Cmd, Engine, Msg, View};
 use input::Action;
 use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind};
 use ratatui::crossterm::{execute, terminal};
@@ -25,7 +27,7 @@ use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
 
@@ -35,6 +37,12 @@ const ID_W: usize = 8;
 /// Most rows the notice line may occupy. A jj error can be long; three wrapped lines
 /// is enough to read one in full without letting chrome crowd out the graph.
 const NOTICE_MAX_LINES: u16 = 3;
+
+/// Frames of the spinner on a revision being described — the `desc` script's.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long each spinner frame shows.
+const SPIN_FRAME: Duration = Duration::from_millis(100);
 
 /// Entry point for the `Tui` command.
 pub fn run(repo: Option<PathBuf>) -> Result<()> {
@@ -110,6 +118,18 @@ enum Overlay {
     Help,
 }
 
+/// What the body shows. Tab switches between the two; the engine builds both from the
+/// same `jj log` on every refresh, so switching never waits on jj.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    /// The curated graph: agents lifted onto their fork points, empty commits folded out,
+    /// selection per task.
+    Agents,
+    /// Every loaded revision in jj's order, nothing collapsed or lifted, selection per
+    /// revision. Task keys don't apply here.
+    Log,
+}
+
 struct App {
     repo: PathBuf,
     /// The engine's latest snapshot. Everything rendered comes from here.
@@ -127,6 +147,12 @@ struct App {
     notices: notify::Notices,
     /// The open overlay, if any. See [`Overlay`].
     overlay: Overlay,
+    /// Which graph the body shows. See [`Body`].
+    body: Body,
+    /// The log view's selected revision, kept by change id so it survives a new view.
+    log_selected: Option<String>,
+    /// When the spinner started, so its frame follows the clock rather than redraws.
+    spin_epoch: Instant,
     /// `q` pressed: quit as soon as the in-flight commands have finished.
     should_quit: bool,
     /// `q` pressed twice: quit now, abandoning whatever is still in flight.
@@ -254,6 +280,11 @@ const HINTS: &[Hint] = &[
         grp: Grp::Del,
     },
     Hint {
+        key: "⇥",
+        verbose: "view",
+        grp: Grp::App,
+    },
+    Hint {
         key: "q",
         verbose: "quit",
         grp: Grp::App,
@@ -284,6 +315,8 @@ struct Caps {
     /// A pane-less row Enter can still act on: the workspace outlived the agent, so `↵`
     /// starts or revives one in it rather than reporting "no session".
     revivable: bool,
+    /// The log view is showing: nothing task-shaped is selected.
+    log: bool,
 }
 
 /// Clip a line to `width` columns, replacing the final column with `…` so it reads as
@@ -364,6 +397,46 @@ fn graph_viewport(total: usize, height: usize, sel: Option<(usize, usize)>) -> V
     Viewport { skip, body, up: true, down: true }
 }
 
+/// A change id cut to the id column's width, for notices and busy labels.
+fn short_id(change_id: &str) -> String {
+    change_id.chars().take(ID_W).collect()
+}
+
+/// Extend a selection's first..=last line range to take in line `at`.
+fn mark_line(sel: &mut Option<(usize, usize)>, at: usize) {
+    *sel = Some(sel.map_or((at, at), |(a, _)| (a, at)));
+}
+
+/// Draw graph `lines` into `block`: the graph can outgrow the pane (every workspace's
+/// ancestors, plus the detached list), so show the slice around the selection and mark
+/// what's hidden. Shared by both views, so they scroll alike.
+fn render_viewport(
+    f: &mut Frame,
+    area: Rect,
+    block: Block,
+    lines: Vec<Line<'static>>,
+    sel_lines: Option<(usize, usize)>,
+) {
+    let height = block.inner(area).height as usize;
+    let total = lines.len();
+    let vp = graph_viewport(total, height, sel_lines);
+    let more = |glyph: char, n: usize| {
+        Line::from(Span::styled(
+            format!("{glyph} {n} more"),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    let mut shown: Vec<Line> = Vec::with_capacity(height);
+    if vp.up {
+        shown.push(more('↑', vp.skip));
+    }
+    shown.extend(lines.into_iter().skip(vp.skip).take(vp.body));
+    if vp.down {
+        shown.push(more('↓', total - vp.skip - vp.body));
+    }
+    f.render_widget(Paragraph::new(shown).block(block), area);
+}
+
 impl App {
     fn new(repo: PathBuf, cmd_tx: Sender<Cmd>, msg_rx: Receiver<Msg>) -> App {
         let mut app = App {
@@ -375,6 +448,9 @@ impl App {
             selected: 0,
             notices: notify::Notices::default(),
             overlay: Overlay::None,
+            body: Body::Agents,
+            log_selected: None,
+            spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
             pending_swap: None,
@@ -392,13 +468,17 @@ impl App {
     /// update but never a keypress or a redraw.
     fn event_loop(&mut self, term: &mut Term) -> Result<()> {
         let mut dirty = true;
+        let mut last_draw = Instant::now();
         loop {
             dirty |= self.drain_messages()?;
             if self.quit_now || (self.should_quit && self.in_flight.is_empty()) {
                 return Ok(());
             }
+            // A revision being described spins, so keep drawing while one is.
+            dirty |= !self.view.describing.is_empty() && last_draw.elapsed() >= SPIN_FRAME;
             if dirty {
                 term.draw(|f| self.render(f))?;
+                last_draw = Instant::now();
                 dirty = false;
             }
             if event::poll(Duration::from_millis(50))? {
@@ -436,6 +516,7 @@ impl App {
     /// the engine just created (`n`/`N`) wins, so the new row is highlighted.
     fn apply_view(&mut self, view: View) {
         let prev = self.view.task_order.get(self.selected).copied();
+        let prev_log_pos = self.log_selected_pos();
         self.view = view;
         self.selected = self
             .view
@@ -446,6 +527,90 @@ impl App {
                 self.selected
                     .min(self.view.task_order.len().saturating_sub(1))
             });
+
+        // The log view follows its revision by change id. A vanished revision hands the
+        // selection to whatever took its row; a first view starts on your working copy.
+        let ids: Vec<String> = self
+            .log_node_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let kept = self.log_selected.take().filter(|id| ids.contains(id));
+        let fallback = || match prev_log_pos {
+            Some(p) => ids.get(p.min(ids.len().saturating_sub(1))).cloned(),
+            None => self
+                .view
+                .working_copy
+                .clone()
+                .filter(|id| ids.contains(id))
+                .or(ids.first().cloned()),
+        };
+        self.log_selected = kept.or_else(fallback);
+    }
+
+    /// The log view's selectable revisions, top to bottom — one per node row.
+    fn log_node_ids(&self) -> Vec<&str> {
+        self.view
+            .log_rows
+            .iter()
+            .filter_map(|r| r.change_id.as_deref())
+            .collect()
+    }
+
+    fn log_selected_pos(&self) -> Option<usize> {
+        let sel = self.log_selected.as_deref()?;
+        self.log_node_ids().iter().position(|id| *id == sel)
+    }
+
+    fn move_log_selection(&mut self, delta: isize) {
+        let ids = self.log_node_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let n = ids.len() as isize;
+        let cur = self.log_selected_pos().unwrap_or(0) as isize;
+        let next = ids[(cur + delta).rem_euclid(n) as usize].to_string();
+        self.log_selected = Some(next);
+    }
+
+    /// The revision `n`/`N` act on: the log view's selection, or `None` in the agent view
+    /// (where they act on the fork point / your `@` as always).
+    fn log_revision(&self) -> Option<String> {
+        match self.body {
+            Body::Log => self.log_selected.clone(),
+            Body::Agents => None,
+        }
+    }
+
+    /// The task whose agent sits on the log view's selected revision. Read across the
+    /// node's whole block: a combined HEAD+agent node hangs its task on the line below.
+    fn log_selected_task(&self) -> Option<Task> {
+        let sel = self.log_selected.as_deref()?;
+        let rows = &self.view.log_rows;
+        let start = rows
+            .iter()
+            .position(|r| r.change_id.as_deref() == Some(sel))?;
+        let in_block = |i: &usize| {
+            *i == start || (rows[*i].change_id.is_none() && !rows[*i].content.is_empty())
+        };
+        let id = (start..rows.len())
+            .take_while(in_block)
+            .find_map(|i| self.view.log_task_of.get(i).copied().flatten())?;
+        self.view.tasks.iter().find(|t| t.id == id).cloned()
+    }
+
+    /// `d` in the log view. On an agent's revision, ask that agent (as the agent view
+    /// does): describing its working copy from here would leave its workspace stale.
+    /// Anywhere else a headless claude writes the description.
+    fn describe_log_selection(&mut self) {
+        if let Some(t) = self.log_selected_task() {
+            self.describe_task(t);
+        } else if let Some(rev) = self.log_selected.clone() {
+            self.send(
+                format!("describing {}", short_id(&rev)),
+                Cmd::DescribeRev(rev),
+            );
+        }
     }
 
     /// Queue `cmd` on the engine; `doing` labels it in the header until it completes.
@@ -500,12 +665,51 @@ impl App {
             }
             return;
         }
+        // The log view selects revisions, not tasks, so the keys that act on the selected
+        // task have nothing to act on there. Refuse them rather than reach for the agent
+        // view's (hidden) selection.
+        let acts_on_task = matches!(
+            action,
+            Action::ToggleSession
+                | Action::Remove
+                | Action::RemoveDiscard
+                | Action::Swap
+                | Action::Snapshot
+                | Action::Rebase
+                | Action::RebaseParent
+                | Action::Accept
+        );
+        if self.body == Body::Log && acts_on_task {
+            self.notices
+                .warn("the log view has no task selected — tab back to agents");
+            return;
+        }
         match action {
             Action::Quit => self.quit(),
+            Action::Up if self.body == Body::Log => self.move_log_selection(-1),
+            Action::Down if self.body == Body::Log => self.move_log_selection(1),
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
-            Action::NewTask => self.send("creating a task", Cmd::New { handoff: false }),
-            Action::Handoff => self.send("handing off", Cmd::New { handoff: true }),
+            Action::ToggleView => {
+                self.body = match self.body {
+                    Body::Agents => Body::Log,
+                    Body::Log => Body::Agents,
+                };
+            }
+            Action::NewTask => match self.log_revision() {
+                Some(rev) => {
+                    let doing = format!("creating a task on {}", short_id(&rev));
+                    self.send(doing, Cmd::New(Base::At(rev)));
+                }
+                None => self.send("creating a task", Cmd::New(Base::ForkPoint)),
+            },
+            Action::Handoff => match self.log_revision() {
+                Some(rev) => {
+                    let doing = format!("handing off {}", short_id(&rev));
+                    self.send(doing, Cmd::New(Base::Continue(rev)));
+                }
+                None => self.send("handing off", Cmd::New(Base::Handoff)),
+            },
             Action::ToggleSession => {
                 let doing = match self.enter_hint() {
                     "detach" => "detaching",
@@ -523,6 +727,7 @@ impl App {
             Action::Snapshot => self.snapshot_selected(),
             Action::Rebase => self.rebase_selected(true),
             Action::RebaseParent => self.rebase_selected(false),
+            Action::Describe if self.body == Body::Log => self.describe_log_selection(),
             Action::Describe => self.describe_selected(),
             Action::Accept => self.accept_selected(),
             Action::AbortTrain => self.abort_train(),
@@ -668,9 +873,12 @@ impl App {
     /// press only arms a confirmation (a mid-turn prompt is disruptive, and a description
     /// is premature before the work settles); a second `d` goes through (via `handle_key`).
     fn describe_selected(&mut self) {
-        let Some(t) = self.selected_task() else {
-            return;
-        };
+        if let Some(t) = self.selected_task() {
+            self.describe_task(t);
+        }
+    }
+
+    fn describe_task(&mut self, t: Task) {
         if t.ws_name.is_none() {
             self.notices.warn("no workspace to describe for this task");
             return;
@@ -840,13 +1048,125 @@ impl App {
     }
 
     fn render_graph(&self, f: &mut Frame, area: Rect) {
+        match self.body {
+            Body::Agents => self.render_agents(f, area),
+            Body::Log => self.render_log(f, area),
+        }
+    }
+
+    fn render_agents(&self, f: &mut Frame, area: Rect) {
         let selected = self.view.task_order.get(self.selected).copied();
         let open = self.open_task_id();
         // Text width inside the block (its RIGHT border takes one column). Labels are
         // clipped to fit this — and only when they overflow — so the log fills the pane
         // and re-fits whenever docking/detaching a session resizes faff.
         let text_w = area.width.saturating_sub(1) as usize;
-        let mut lines: Vec<Line> = Vec::with_capacity(self.view.rows.len());
+        let task_of = &self.view.task_of_node;
+        let is_sel = |i: usize| selected.is_some() && task_of.get(i).copied().flatten() == selected;
+        let (mut lines, mut sel_lines) =
+            self.graph_lines(&self.view.rows, task_of, &is_sel, text_w);
+        // Detached tasks (workspace inlined into HEAD, or a stale row) have no
+        // distinct node — list them below so they stay visible and selectable.
+        if !self.view.detached.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "── detached (integrated / no node) ──",
+                Style::default().fg(Color::DarkGray),
+            )));
+            for id in &self.view.detached {
+                if let Some(t) = self.view.tasks.iter().find(|t| &t.id == id) {
+                    let (icon, _) = model::status_label(t.status);
+                    let docked = open == Some(*id);
+                    let style = if selected == Some(*id) {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    // A detached row has no revision brackets, so the docked session is
+                    // shown by greening its `· #id` prefix instead — the same fixed
+                    // left-column indicator, never crowded out by a truncated description.
+                    // Start from `Style::default()`, not `style`: on the highlighted row
+                    // `style` carries REVERSED, which would swap fg/bg into a green cell
+                    // background rather than green glyphs.
+                    let prefix = format!("· #{}", t.id.0);
+                    let rest = format!(" {} {icon}", t.label());
+                    let prefix_style = if docked {
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        style
+                    };
+                    let avail = text_w.saturating_sub(prefix.chars().count());
+                    let text = truncate_first_line(&rest, avail);
+                    // Here the glyph trails the description rather than leading it, so
+                    // tint the tail — and only when the clip left it in place; a title
+                    // long enough to be cut takes the glyph with it, as it always has.
+                    let mut spans = vec![Span::styled(prefix, prefix_style)];
+                    match text.strip_suffix(icon) {
+                        Some(head) => {
+                            spans.push(Span::styled(head.to_string(), style));
+                            spans.push(Span::styled(
+                                icon.to_string(),
+                                status_style(style, t.status),
+                            ));
+                        }
+                        None => spans.push(Span::styled(text, style)),
+                    }
+                    if selected == Some(*id) {
+                        mark_line(&mut sel_lines, lines.len());
+                    }
+                    lines.push(Line::from(spans));
+                }
+            }
+        }
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .title("revisions · agents");
+        render_viewport(f, area, block, lines, sel_lines);
+    }
+
+    fn render_log(&self, f: &mut Frame, area: Rect) {
+        let text_w = area.width.saturating_sub(1) as usize;
+        // Highlight the selected revision's node row and any continuation rows under it
+        // (a combined HEAD+agent node is two lines); link rows between nodes stay plain.
+        let rows = &self.view.log_rows;
+        let sel = self.log_selected.as_deref();
+        let mut sel_rows = vec![false; rows.len()];
+        let mut in_sel = false;
+        for (i, row) in rows.iter().enumerate() {
+            match &row.change_id {
+                Some(cid) => in_sel = Some(cid.as_str()) == sel,
+                None if row.content.is_empty() => in_sel = false,
+                None => {}
+            }
+            sel_rows[i] = in_sel;
+        }
+        let is_sel = |i: usize| sel_rows[i];
+        let (lines, sel_lines) = self.graph_lines(rows, &self.view.log_task_of, &is_sel, text_w);
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .title("revisions · log");
+        render_viewport(f, area, block, lines, sel_lines);
+    }
+
+    /// The spinner frame for now, shown on a row a headless claude is describing.
+    fn spinner_frame(&self) -> &'static str {
+        let n = self.spin_epoch.elapsed().as_millis() / SPIN_FRAME.as_millis();
+        SPINNER[n as usize % SPINNER.len()]
+    }
+
+    /// Paint laid-out graph rows: tinted gutter glyphs, the `[id]` column, the clipped
+    /// label. Shared by both views; `is_sel` says which rows are highlighted, and the
+    /// highlighted lines' first..=last index comes back with the lines for the viewport.
+    fn graph_lines(
+        &self,
+        rows: &[GraphRow],
+        task_of: &[Option<TaskId>],
+        is_sel: &dyn Fn(usize) -> bool,
+        text_w: usize,
+    ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let open = self.open_task_id();
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
         // Width of the "[abcdefgh] " id column, so continuation lines align under content.
         let id_col = ID_W + 3;
         // Pad every gutter to one uniform width so the [id] column and description line up
@@ -855,9 +1175,7 @@ impl App {
         // right-hand block shifts sideways by the difference. The 2-space separator that
         // was previously appended per-row is folded into this width. (Gutter cells are all
         // single-column box-drawing chars, so char count is the display width.)
-        let gutter_w = self
-            .view
-            .rows
+        let gutter_w = rows
             .iter()
             .map(|r| r.gutter.chars().count())
             .max()
@@ -867,30 +1185,27 @@ impl App {
         // can be greened. A combined HEAD+agent node hangs its task on a continuation line
         // below the bracketed HEAD row, so attribute each row to the nearest node row at
         // or above it — the one whose id is shown.
-        let mut node_is_docked = vec![false; self.view.rows.len()];
+        let mut node_is_docked = vec![false; rows.len()];
         if let Some(open_id) = open {
             let mut last_node: Option<usize> = None;
-            for (i, row) in self.view.rows.iter().enumerate() {
+            for (i, row) in rows.iter().enumerate() {
                 if row.change_id.is_some() {
                     last_node = Some(i);
                 }
-                if self.view.task_of_node.get(i).copied().flatten() == Some(open_id)
+                if task_of.get(i).copied().flatten() == Some(open_id)
                     && let Some(n) = last_node
                 {
                     node_is_docked[n] = true;
                 }
             }
         }
-        // The selected task's first..=last line, so the viewport can keep it on screen.
+        // The selected rows' first..=last line, so the viewport can keep them on screen.
         let mut sel_lines: Option<(usize, usize)> = None;
-        let mark = |sel: &mut Option<(usize, usize)>, at: usize| {
-            *sel = Some(sel.map_or((at, at), |(a, _)| (a, at)));
-        };
-        for (i, row) in self.view.rows.iter().enumerate() {
-            let row_task = self.view.task_of_node.get(i).copied().flatten();
+        for (i, row) in rows.iter().enumerate() {
+            let row_task = task_of.get(i).copied().flatten();
             let row_status =
                 row_task.and_then(|id| self.view.tasks.iter().find(|t| t.id == id).map(|t| t.status));
-            let is_sel = selected.is_some() && row_task == selected;
+            let is_sel = is_sel(i);
             let base = if is_sel {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -957,7 +1272,14 @@ impl App {
                     ));
                     spans.push(Span::styled(rest, frame));
                     spans.push(Span::styled("] ", frame));
-                    let avail = text_w.saturating_sub(gutter_w + id_w);
+                    let mut avail = text_w.saturating_sub(gutter_w + id_w);
+                    if self.view.describing.contains(cid) {
+                        spans.push(Span::styled(
+                            format!("{} ", self.spinner_frame()),
+                            base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        ));
+                        avail = avail.saturating_sub(2);
+                    }
                     push_row_content(
                         &mut spans,
                         truncate_first_line(&row.content, avail),
@@ -983,85 +1305,11 @@ impl App {
                 }
             }
             if is_sel {
-                mark(&mut sel_lines, lines.len());
+                mark_line(&mut sel_lines, lines.len());
             }
             lines.push(Line::from(spans));
         }
-        // Detached tasks (workspace inlined into HEAD, or a stale row) have no
-        // distinct node — list them below so they stay visible and selectable.
-        if !self.view.detached.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "── detached (integrated / no node) ──",
-                Style::default().fg(Color::DarkGray),
-            )));
-            for id in &self.view.detached {
-                if let Some(t) = self.view.tasks.iter().find(|t| &t.id == id) {
-                    let (icon, _) = model::status_label(t.status);
-                    let docked = open == Some(*id);
-                    let style = if selected == Some(*id) {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    // A detached row has no revision brackets, so the docked session is
-                    // shown by greening its `· #id` prefix instead — the same fixed
-                    // left-column indicator, never crowded out by a truncated description.
-                    // Start from `Style::default()`, not `style`: on the highlighted row
-                    // `style` carries REVERSED, which would swap fg/bg into a green cell
-                    // background rather than green glyphs.
-                    let prefix = format!("· #{}", t.id.0);
-                    let rest = format!(" {} {icon}", t.label());
-                    let prefix_style = if docked {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    };
-                    let avail = text_w.saturating_sub(prefix.chars().count());
-                    let text = truncate_first_line(&rest, avail);
-                    // Here the glyph trails the description rather than leading it, so
-                    // tint the tail — and only when the clip left it in place; a title
-                    // long enough to be cut takes the glyph with it, as it always has.
-                    let mut spans = vec![Span::styled(prefix, prefix_style)];
-                    match text.strip_suffix(icon) {
-                        Some(head) => {
-                            spans.push(Span::styled(head.to_string(), style));
-                            spans.push(Span::styled(
-                                icon.to_string(),
-                                status_style(style, t.status),
-                            ));
-                        }
-                        None => spans.push(Span::styled(text, style)),
-                    }
-                    if selected == Some(*id) {
-                        mark(&mut sel_lines, lines.len());
-                    }
-                    lines.push(Line::from(spans));
-                }
-            }
-        }
-        let block = Block::default().borders(Borders::RIGHT).title("revisions");
-        // The graph can outgrow the pane (every workspace's ancestors, plus the detached
-        // list), so show the slice around the selection and mark what's hidden.
-        let height = block.inner(area).height as usize;
-        let total = lines.len();
-        let vp = graph_viewport(total, height, sel_lines);
-        let more = |glyph: char, n: usize| {
-            Line::from(Span::styled(
-                format!("{glyph} {n} more"),
-                Style::default().fg(Color::DarkGray),
-            ))
-        };
-        let mut shown: Vec<Line> = Vec::with_capacity(height);
-        if vp.up {
-            shown.push(more('↑', vp.skip));
-        }
-        shown.extend(lines.into_iter().skip(vp.skip).take(vp.body));
-        if vp.down {
-            shown.push(more('↓', total - vp.skip - vp.body));
-        }
-        f.render_widget(Paragraph::new(shown).block(block), area);
+        (lines, sel_lines)
     }
 
     /// Rows the current notice needs, clamped to [`NOTICE_MAX_LINES`]. At least 1 even
@@ -1120,6 +1368,7 @@ impl App {
             has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
             train: !self.view.merge_train.is_empty(),
             revivable: t.as_ref().is_some_and(|t| self.view.revivable.contains(&t.id)),
+            log: self.body == Body::Log,
         }
     }
 
@@ -1127,6 +1376,9 @@ impl App {
     /// approximation.
     fn hint_available(key: &str, c: &Caps) -> bool {
         match key {
+            "↵" | "s" | "S" | "r" | "R" | "a" | "x" | "X" if c.log => false,
+            // Every revision can be described: by its agent, else by a headless claude.
+            "d" if c.log => true,
             // A lost instance has no pane, but Enter still has something to do with it.
             "↵" => c.has_pane || c.revivable,
             "s" | "S" => c.has_ws,
@@ -1171,7 +1423,13 @@ impl App {
         let unseen = self.notices.unseen();
         let badge = self.notices.max_unseen_level().map(|l| l.color());
         for h in HINTS {
-            let label = if h.key == "↵" { enter } else { h.verbose };
+            let label = match h.key {
+                "↵" => enter,
+                // In the log view `N` edits the selected revision rather than handing off
+                // your own.
+                "N" if self.body == Body::Log => "edit",
+                _ => h.verbose,
+            };
             if cur != Some(h.grp) {
                 if cur.is_some() {
                     spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
@@ -1382,6 +1640,7 @@ mod tests {
     use super::*;
     use crate::domain::Autonomy;
     use crate::graph;
+    use crate::jj;
     use crate::store::Store;
     use ratatui::backend::TestBackend;
 
@@ -1404,6 +1663,9 @@ mod tests {
             selected: 0,
             notices: notify::Notices::default(),
             overlay: Overlay::None,
+            body: Body::Agents,
+            log_selected: None,
+            spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
             pending_swap: None,
@@ -1532,7 +1794,7 @@ mod tests {
         // Guards against adding a binding to input.rs that never surfaces in the UI —
         // exactly how `R` went undocumented.
         for key in [
-            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "q",
+            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "⇥", "q",
         ] {
             assert!(
                 HINTS.iter().any(|h| h.key == key),
@@ -2521,6 +2783,300 @@ mod tests {
             );
         }
     }
+    fn log_rev(id: &str, parents: &[&str], cwc: bool, empty: bool, desc: &str) -> jj::RevInfo {
+        jj::RevInfo {
+            change_id: id.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            is_current_wc: cwc,
+            empty,
+            conflict: false,
+            id_prefix: id.chars().take(1).collect(),
+            id_rest: id.chars().skip(1).collect(),
+            description: desc.into(),
+        }
+    }
+
+    /// Hand the app the view the engine would publish for `revs`.
+    fn apply_revs(app: &mut App, revs: Vec<jj::RevInfo>, ws: &[jj::Workspace]) {
+        let g = engine::Graphs::build(revs, ws, &app.view.tasks);
+        app.apply_view(View {
+            tasks: app.view.tasks.clone(),
+            task_order: app.view.task_order.clone(),
+            rows: g.rows,
+            task_of_node: g.task_of_node,
+            log_rows: g.log_rows,
+            log_task_of: g.log_task_of,
+            working_copy: g.working_copy,
+            id_display: g.id_display,
+            fork_point: g.fork_point,
+            ..View::default()
+        });
+    }
+
+    fn default_ws(change_id: &str) -> Vec<jj::Workspace> {
+        vec![jj::Workspace {
+            name: "default".into(),
+            change_id: change_id.into(),
+        }]
+    }
+
+    /// `@` on an empty fork point `fk` (collapsed in the agent view) over a described base.
+    fn app_with_log_history() -> App {
+        let mut app = test_app();
+        let revs = vec![
+            log_rev("mp", &["fk"], true, false, "my work"),
+            log_rev("fk", &["base"], false, true, ""),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        apply_revs(&mut app, revs, &default_ws("mp"));
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(key(code));
+    }
+
+    #[test]
+    fn tab_toggles_between_the_agent_and_log_views() {
+        let mut app = app_with_log_history();
+        assert!(buffer_text(&draw(&mut app, 80, 12)).contains("revisions · agents"));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.body, Body::Log);
+        assert!(buffer_text(&draw(&mut app, 80, 12)).contains("revisions · log"));
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.body, Body::Agents);
+    }
+
+    #[test]
+    fn log_view_shows_the_empty_revisions_the_agent_view_folds_away() {
+        let mut app = app_with_log_history();
+        let agents = buffer_text(&draw(&mut app, 80, 12));
+        assert!(
+            !agents.contains("(empty)"),
+            "agent view collapses fk:\n{agents}"
+        );
+        press(&mut app, KeyCode::Tab);
+        let log = buffer_text(&draw(&mut app, 80, 12));
+        assert!(
+            log.contains("(empty) (no description set)"),
+            "log shows fk:\n{log}"
+        );
+        assert!(
+            log.contains("my work") && log.contains("base commit"),
+            "{log}"
+        );
+    }
+
+    #[test]
+    fn log_selection_starts_on_the_working_copy_and_walks_every_revision() {
+        let mut app = app_with_log_history();
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.log_selected.as_deref(), Some("mp"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.log_selected.as_deref(), Some("base"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            app.log_selected.as_deref(),
+            Some("mp"),
+            "wraps like the agent view"
+        );
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.log_selected.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn log_selection_survives_a_new_view_by_change_id() {
+        let mut app = app_with_log_history();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        // A new revision lands on top: the selection follows `fk`, not its old row.
+        let revs = vec![
+            log_rev("nw", &["mp"], true, false, "newer"),
+            log_rev("mp", &["fk"], false, false, "my work"),
+            log_rev("fk", &["base"], false, true, ""),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        apply_revs(&mut app, revs, &default_ws("nw"));
+        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        // …and a vanished one falls back to the row that took its place.
+        let revs = vec![
+            log_rev("nw", &["mp"], true, false, "newer"),
+            log_rev("mp", &["base"], false, false, "my work"),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        apply_revs(&mut app, revs, &default_ws("nw"));
+        assert_eq!(app.log_selected.as_deref(), Some("base"));
+    }
+
+    #[test]
+    fn task_keys_are_dimmed_and_refused_in_the_log_view() {
+        let (mut app, rx) = test_app_with_engine_rx();
+        task_with_pane(&mut app, "do the thing");
+        press(&mut app, KeyCode::Tab);
+        let caps = app.caps();
+        for k in ["↵", "s", "S", "r", "R", "a", "x", "X"] {
+            assert!(
+                !App::hint_available(k, &caps),
+                "{k} should dim in the log view"
+            );
+        }
+        for k in ["n", "N", "d", "⇥", "q", "?", "!"] {
+            assert!(
+                App::hint_available(k, &caps),
+                "{k} still applies in the log view"
+            );
+        }
+        press(&mut app, KeyCode::Char('x'));
+        assert!(sent(&rx).is_empty(), "x asked the engine for nothing");
+        assert_eq!(latest(&app).0, notify::Level::Warn);
+    }
+
+    /// [`app_with_log_history`] in the log view with `fk` (the empty fork point) selected,
+    /// plus what the app sends the engine.
+    fn log_view_on_fk() -> (App, Receiver<Cmd>) {
+        let (mut app, rx) = test_app_with_engine_rx();
+        let revs = vec![
+            log_rev("mp", &["fk"], true, false, "my work"),
+            log_rev("fk", &["base"], false, true, ""),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        apply_revs(&mut app, revs, &default_ws("mp"));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        (app, rx)
+    }
+
+    #[test]
+    fn n_in_the_log_view_forks_a_task_from_the_selected_revision() {
+        let (mut app, rx) = log_view_on_fk();
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(sent(&rx), vec![Cmd::New(Base::At("fk".into()))]);
+    }
+
+    #[test]
+    fn shift_n_in_the_log_view_hands_off_the_selected_revision() {
+        let (mut app, rx) = log_view_on_fk();
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(sent(&rx), vec![Cmd::New(Base::Continue("fk".into()))]);
+    }
+
+    #[test]
+    fn n_in_the_agent_view_still_forks_from_the_fork_point() {
+        let (mut app, rx) = log_view_on_fk();
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('n'));
+        press(&mut app, KeyCode::Char('N'));
+        assert_eq!(
+            sent(&rx),
+            vec![Cmd::New(Base::ForkPoint), Cmd::New(Base::Handoff)]
+        );
+    }
+
+    #[test]
+    fn d_in_the_log_view_describes_a_plain_revision_headless() {
+        let (mut app, rx) = log_view_on_fk();
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(sent(&rx), vec![Cmd::DescribeRev("mp".into())]);
+    }
+
+    #[test]
+    fn d_in_the_log_view_on_an_agents_revision_asks_that_agent() {
+        // Rewriting an agent's working copy from outside would leave its workspace stale,
+        // so its own agent is asked, exactly as `d` does in the agent view.
+        let (mut app, rx) = test_app_with_engine_rx();
+        let id = task_with_pane(&mut app, "do the thing");
+        let revs = vec![
+            log_rev("mp", &["base"], true, false, "my work"),
+            log_rev("ag", &["base"], false, false, "agent work"),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        let ws = vec![
+            jj::Workspace {
+                name: "default".into(),
+                change_id: "mp".into(),
+            },
+            jj::Workspace {
+                name: "faf-task-1".into(),
+                change_id: "ag".into(),
+            },
+        ];
+        apply_revs(&mut app, revs, &ws);
+        press(&mut app, KeyCode::Tab);
+        while app.log_selected.as_deref() != Some("ag") {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(sent(&rx), vec![Cmd::Describe(id)]);
+    }
+
+    /// The text of the first rendered line containing `needle`.
+    fn line_with(text: &str, needle: &str) -> String {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle:?} in:\n{text}"))
+            .to_string()
+    }
+
+    #[test]
+    fn a_revision_being_described_spins_in_both_views() {
+        let (mut app, _rx) = log_view_on_fk();
+        let mut view = app.view.clone();
+        view.describing = ["fk".to_string(), "mp".to_string()].into();
+        app.apply_view(view);
+        let spins = |l: &str| SPINNER.iter().any(|c| l.contains(*c));
+
+        let log = buffer_text(&draw(&mut app, 80, 12));
+        assert!(spins(&line_with(&log, "(no description set)")), "{log}");
+        assert!(!spins(&line_with(&log, "base commit")), "{log}");
+        press(&mut app, KeyCode::Tab);
+        let agents = buffer_text(&draw(&mut app, 80, 12));
+        assert!(spins(&line_with(&agents, "my work")), "{agents}");
+
+        // The engine reports it done: the spinner goes.
+        let mut view = app.view.clone();
+        view.describing.clear();
+        app.apply_view(view);
+        let agents = buffer_text(&draw(&mut app, 80, 12));
+        assert!(!spins(&line_with(&agents, "my work")), "{agents}");
+    }
+
+    #[test]
+    fn a_long_log_scrolls_to_keep_the_selection_in_view() {
+        let mut app = test_app();
+        let n = 40;
+        let ids: Vec<String> = (0..n).map(|i| format!("r{i:02}")).collect();
+        let revs: Vec<jj::RevInfo> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let parents: Vec<&str> = ids.get(i + 1).map(|p| p.as_str()).into_iter().collect();
+                log_rev(id, &parents, i == 0, false, &format!("commit {id}"))
+            })
+            .collect();
+        apply_revs(&mut app, revs, &default_ws("r00"));
+        press(&mut app, KeyCode::Tab);
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let text = buffer_text(&draw(&mut app, 80, 12));
+        assert!(
+            text.contains("commit r30"),
+            "selection scrolled into view:\n{text}"
+        );
+        assert!(!text.contains("commit r00"), "top scrolled away:\n{text}");
+        // Walking back up scrolls back up.
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        let text = buffer_text(&draw(&mut app, 80, 12));
+        assert!(text.contains("commit r00"), "{text}");
+    }
+
     #[test]
     fn renders_with_an_active_merge_train() {
         // The notice line added a layout row, pushing the merge-train panel from

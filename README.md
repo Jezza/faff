@@ -50,15 +50,16 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 
 | Key | Action |
 |---|---|
-| `n` | new task |
-| `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes |
+| `n` | new task (in the [log view](#the-log-view): forked from the selected revision) |
+| `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes (in the log view: an agent that edits the selected revision) |
 | `↑`/`↓` or `k`/`j` | move selection |
+| `Tab` | switch between the agent view and the [log view](#the-log-view) |
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab; on a task whose pane has died, bring the agent back (see [Reviving a lost agent](#reviving-a-lost-agent)) |
 | `s` | swap: trade your `@` with the selected agent's revision |
 | `S` | snapshot the selected agent's workspace |
 | `r` | refresh: tell the agent to rebase onto the latest fork point (freezes your WIP first) |
 | `R` | refresh onto your parent line instead (read-only; your WIP excluded) |
-| `d` | describe: tell the agent to set a short 4-7 word jj description of the revision's end result |
+| `d` | describe: tell the agent to set a short 4-7 word jj description of the revision's end result (in the log view, any revision: a background `claude -p` writes it) |
 | `a` | accept: toggle the selected revision into/out of the merge train (drained into your `@` one at a time) |
 | `A` | abort the merge train: dequeue everything still pending (already-merged revisions stay) |
 | `x` | remove the selected task (keeps its revision as history) |
@@ -81,7 +82,7 @@ revisions                                                │ ┃   from postcard
 · #5 Add OAuth login ✓                                   │ ┃
                                                          │ ┃ >
  · ready                                                   ┃
- new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ q ? !   ┃
+ new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ ⇥ q ? ! ┃
 ```
 
 When the merge train is non-empty a panel appears below the toolbar, one row per queued
@@ -352,6 +353,37 @@ A task whose change no longer has a node of its own, which is the usual result o
 integrating it, moves to a "detached" list under the graph. It stays selectable and
 removable there.
 
+### The log view
+
+`Tab` switches the body between the agent view above (titled `revisions · agents`) and the
+log view (`revisions · log`). The log is drawn from the same `jj log` faff already loads on
+each refresh, so switching is instant, but nothing is curated: empty commits get a row of
+their own (`(empty) (no description set)`, as jj labels them), agent branches stay in jj's
+order instead of being lifted onto their fork points, and nothing is folded away. Agent
+revisions keep their `#<id> <status> :: <title>` label, so they're still easy to spot.
+
+`j`/`k` move over revisions rather than tasks, and the log scrolls exactly like the agent
+view (same `↑ N more` / `↓ N more` markers). Each view keeps its own selection, and the
+log's follows its revision across refreshes.
+
+Three keys act on the selected revision instead:
+
+- `n` starts a new task forked from it: the agent's workspace is an empty child of the
+  selected revision rather than of the fork point.
+- `N` starts a new task that edits it: the agent's workspace sits on the revision itself
+  and continues that commit. Your own `@` is left alone, unless the revision *is* your `@`,
+  in which case this is the usual hand-off. faff refuses a revision another workspace is
+  already on, and an immutable one. If the revision is below your `@`, the agent's edits
+  rebase your `@` as they land, as any rewrite in jj would.
+- `d` describes it. On an agent's revision it asks that agent, exactly as in the agent view
+  (describing its working copy from outside would leave its workspace stale). On any other
+  revision faff hands the diff to a one-shot `claude -p` in the background and sets what
+  comes back with `jj describe`. While claude thinks, the revision's row shows a spinner,
+  in both views; the result, or why it failed, lands on the notice line.
+
+The other keys that act on a task (`↵` `s` `S` `r` `R` `a` `x` `X`) are dimmed in the log
+view and refused if pressed; `Tab` back to the agent view to use them.
+
 ### Notices and the toolbar
 
 The line above the toolbar is the notice line. It shows the most recent thing faff has
@@ -380,13 +412,13 @@ worst unseen level. Any key closes the log.
 
 The toolbar groups keys by what they do, and colours each group: **new** (`n` `N`),
 **open** (`↵`), **rev** (`s` `S` `r` `R` `d`), **train** (`a` `A`), **del** (`x` `X`),
-then `q` `?` `!`. Keys that don't apply to the selected row are dimmed rather than
+then `⇥` `q` `?` `!`. Keys that don't apply to the selected row are dimmed rather than
 hidden, so nothing ever moves. When faff is docked beside a session and the pane is too
 narrow for the full labels, the toolbar drops to its compact form — same groups, same
 order, just the letters:
 
 ```
- new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ q ? !
+ new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ ⇥ q ? !
 ```
 
 ## How state moves

@@ -358,6 +358,22 @@ fn head_label(rev: &RevInfo) -> String {
 /// Build graph nodes from the revision list (child→parent order), the workspace map,
 /// and the live tasks. Empty, description-less non-workspace commits collapse away.
 pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> GraphModel {
+    build_view(revs, workspaces, tasks, true)
+}
+
+/// The log view's model: the same nodes and labels as [`build`], but uncurated — no empty
+/// commit collapses out and no agent is pinned as a stub, so every loaded revision gets a
+/// row of its own in the order it's given (jj's).
+pub fn build_log(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> GraphModel {
+    build_view(revs, workspaces, tasks, false)
+}
+
+fn build_view(
+    revs: &[RevInfo],
+    workspaces: &[Workspace],
+    tasks: &[Task],
+    curated: bool,
+) -> GraphModel {
     let mut nodes = Vec::with_capacity(revs.len());
     let mut task_of = Vec::with_capacity(revs.len());
     let fork_point = current_fork_point(revs);
@@ -454,6 +470,14 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
                 rev.description.clone()
             };
             ('◻', vec![d], false, None)
+        } else if !curated && rev.empty && rev.description.is_empty() {
+            // The log hides nothing: an empty fork point gets a row, labelled as jj does.
+            (
+                '◻',
+                vec!["(empty) (no description set)".to_string()],
+                false,
+                None,
+            )
         } else if rev.empty && rev.description.is_empty() && rev.parents.len() < 2 {
             // Empty, description-less, single-parent fork-point / noise: collapse out of
             // the graph. Never collapse a merge (2+ parents) — that would drop a parent.
@@ -491,7 +515,7 @@ pub fn build(revs: &[RevInfo], workspaces: &[Workspace], tasks: &[Task]) -> Grap
             glyph,
             lines,
             collapse,
-            stub: tid.is_some() && !rev.is_current_wc,
+            stub: curated && tid.is_some() && !rev.is_current_wc,
         });
         task_of.push(tid);
     }
@@ -779,6 +803,51 @@ mod tests {
             pane_id: Some(12),
             session_id: None,
         }
+    }
+
+    #[test]
+    fn log_build_keeps_empty_commits_and_draws_agents_as_ordinary_nodes() {
+        let revs = vec![
+            rev("mp", &["fk"], true, true, ""),
+            rev("t7", &["fk"], false, false, "Add OAuth flow"),
+            rev("fk", &["p"], false, true, ""), // collapsed in the agent view
+            rev("p", &[], false, false, "base"),
+        ];
+        let ws = vec![
+            Workspace {
+                name: "default".into(),
+                change_id: "mp".into(),
+            },
+            Workspace {
+                name: "faf-task-7".into(),
+                change_id: "t7".into(),
+            },
+        ];
+        let tasks = vec![task(7, "faf-task-7", TaskStatus::Working)];
+
+        let agents = build(&revs, &ws, &tasks);
+        assert!(
+            agents.nodes[2].collapse,
+            "the agent view folds the empty fork point"
+        );
+        assert!(
+            agents.nodes[1].stub,
+            "the agent view pins the agent as a stub"
+        );
+
+        let log = build_log(&revs, &ws, &tasks);
+        assert!(
+            log.nodes.iter().all(|n| !n.collapse),
+            "the log hides nothing"
+        );
+        assert!(log.nodes.iter().all(|n| !n.stub), "the log lifts nothing");
+        assert_eq!(
+            log.nodes[2].lines,
+            vec!["(empty) (no description set)".to_string()]
+        );
+        // Agent revisions keep their faff label, so they stay easy to spot.
+        assert!(log.nodes[1].lines[0].starts_with("#7 ⚙ :: Add OAuth flow"));
+        assert_eq!(log.task_of[1], Some(TaskId(7)));
     }
 
     #[test]
