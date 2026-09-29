@@ -9,6 +9,7 @@ pub mod events;
 pub mod graph;
 pub mod jj;
 pub mod memory;
+pub mod proc;
 pub mod scheduler;
 pub mod store;
 pub mod tui;

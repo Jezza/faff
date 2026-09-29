@@ -1,19 +1,18 @@
 //! The faff dashboard TUI: unified revision view, browse/session modes, and the
 //! orchestration actions. See spec §11. Pure logic lives in the submodules
-//! (input, session, model); this file is the app state, event loop, and
-//! rendering glue.
+//! (input, session, model); every side effect runs on the engine thread
+//! (`engine`); this file is the UI state, event loop, and rendering glue.
 
+mod engine;
 mod input;
 mod model;
 mod notify;
 mod session;
 mod train;
 
-use crate::domain::{Autonomy, DESCRIBE_PROMPT, Task, TaskId, TaskStatus, truncate_first_line};
-use crate::graph::{self, GraphRow};
-use crate::store::Store;
-use crate::{config, events, jj, wezterm, workspace};
-use anyhow::{Context, Result};
+use crate::domain::{Task, TaskId, TaskStatus, truncate_first_line};
+use anyhow::{Context, Result, bail};
+use engine::{Cmd, Engine, Msg, View};
 use input::Action;
 use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind};
 use ratatui::crossterm::{execute, terminal};
@@ -22,10 +21,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 type Term = Terminal<ratatui::backend::CrosstermBackend<Stdout>>;
 
@@ -36,34 +36,17 @@ const ID_W: usize = 8;
 /// is enough to read one in full without letting chrome crowd out the graph.
 const NOTICE_MAX_LINES: u16 = 3;
 
-/// Cap on prompt injections a single merge-train tick will make. `wezterm::send_text` blocks
-/// the event loop (~150ms each), so a large fan-out of rebase prompts is spread over ticks
-/// to keep the UI responsive. Merges are separate and always at most one per tick.
-const MAX_MERGE_INJECTIONS_PER_TICK: usize = 4;
-
-/// Live per-member facts gathered once per merge-train tick, so the decision logic reads
-/// them instead of re-shelling to jj. `empty`/`conflict` are consumed during the drop pass
-/// and don't survive into the struct.
-struct MergeFacts {
-    id: TaskId,
-    name: String,
-    /// The agent's turn is over — idle *or* needs-input — so its revision is settled and the
-    /// train can act on it. `accept` is an explicit "merge this", so faff sequences on the
-    /// agent (wait while it's `working`, proceed once it isn't) rather than ejecting on a
-    /// status heuristic. Only `working` blocks a member from progressing.
-    stable: bool,
-    on_tip: bool,
-    described: bool,
-    /// The revision still carries conflicts (only reached while the agent is working — a
-    /// settled conflicted member is dropped before it becomes a fact).
-    conflict: bool,
-    seq: u64,
-}
-
 /// Entry point for the `Tui` command.
 pub fn run(repo: Option<PathBuf>) -> Result<()> {
     let repo = resolve_repo(repo)?;
-    let mut app = App::new(repo)?;
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (msg_tx, msg_rx) = mpsc::channel();
+    let engine = Engine::open(repo.clone(), msg_tx, cmd_tx.clone())?;
+    std::thread::Builder::new()
+        .name("faff-engine".into())
+        .spawn(move || engine.run(cmd_rx))
+        .context("spawning the engine thread")?;
+    let mut app = App::new(repo, cmd_tx, msg_rx);
     install_panic_hook();
     let mut term = setup_terminal()?;
     let result = app.event_loop(&mut term);
@@ -129,40 +112,25 @@ enum Overlay {
 
 struct App {
     repo: PathBuf,
-    faff_exe: PathBuf,
-    socket: PathBuf,
-    db: PathBuf,
-    store: Store,
-    /// Root of Claude Code's per-project data (`~/.claude/projects`). Held rather than
-    /// looked up per call so tests can point it at a scratch dir.
-    claude_projects: PathBuf,
-    events_rx: Receiver<events::Event>,
-    faff_pane: Option<u64>,
+    /// The engine's latest snapshot. Everything rendered comes from here.
+    view: View,
+    cmd_tx: Sender<Cmd>,
+    msg_rx: Receiver<Msg>,
+    /// What each command sent to the engine is doing, oldest first. The engine runs them in
+    /// order and answers each with one `Msg::Done`, so the front is always the one running.
+    in_flight: VecDeque<String>,
 
-    // View state (owned; recomputed on refresh).
-    tasks: Vec<Task>,
-    rows: Vec<GraphRow>,
-    task_of_node: Vec<Option<TaskId>>,
-    /// The current fork point (`heads(::@ ~ empty())`) — the revision new agents branch
-    /// from. Its glyph (`◆`, or `@` when it coincides) is tinted cyan in the graph.
-    fork_point: Option<String>,
-    task_order: Vec<TaskId>,
-    /// Live tasks with no distinct graph node (workspace inlined into HEAD, or a
-    /// stale row). Still selectable/removable; shown in a "detached" footer list.
-    detached: Vec<TaskId>,
+    // UI state (owned by this thread alone).
     selected: usize,
-    open_pane: Option<u64>,
-    /// change_id -> (unique prefix, padding rest) for the id column, from jj.
-    id_display: std::collections::HashMap<String, (String, String)>,
     /// Levelled notification log. The most recent note is shown on the notice line;
     /// `!` opens the scrollback. Replaces the old untyped `status: String`.
     notices: notify::Notices,
     /// The open overlay, if any. See [`Overlay`].
     overlay: Overlay,
+    /// `q` pressed: quit as soon as the in-flight commands have finished.
     should_quit: bool,
-    last_refresh: Instant,
-    /// Set when an event arrived; coalesces bursts into a throttled refresh.
-    pending_refresh: bool,
+    /// `q` pressed twice: quit now, abandoning whatever is still in flight.
+    quit_now: bool,
     /// Set to a task id after `s` on a *working* agent: the next key confirms the swap
     /// (another `s`) or cancels it (anything else). Guards yanking a live agent's files.
     pending_swap: Option<TaskId>,
@@ -174,12 +142,6 @@ struct App {
     /// prompt mid-turn is disruptive, and a description is premature until work settles),
     /// anything else cancels.
     pending_describe: Option<TaskId>,
-    /// Set to a freshly-created task's id (by `n`/`N`) so the next `refresh` lands the
-    /// selection on that new row instead of preserving the prior one. Consumed on use.
-    pending_select: Option<TaskId>,
-    /// The merge train: revisions marked with `a` to be drained into your workspace one at
-    /// a time. Advanced each refresh tick by `tick_merge_train`. See `tui::train`.
-    merge_train: train::Train,
 }
 
 /// Toolbar groups. Order and membership are fixed: keys never move between widths, so
@@ -403,89 +365,96 @@ fn graph_viewport(total: usize, height: usize, sel: Option<(usize, usize)>) -> V
 }
 
 impl App {
-    fn new(repo: PathBuf) -> Result<App> {
-        let db = config::db_path(&repo)?;
-        let store = Store::open(&db)?;
-        let socket = events::socket_path(&repo);
-        let events_rx = events::spawn_listener(&socket)?;
-        let faff_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("faff"));
-        let faff_pane = std::env::var("WEZTERM_PANE")
-            .ok()
-            .and_then(|s| s.parse().ok());
-
+    fn new(repo: PathBuf, cmd_tx: Sender<Cmd>, msg_rx: Receiver<Msg>) -> App {
         let mut app = App {
             repo,
-            faff_exe,
-            socket,
-            db,
-            store,
-            claude_projects: workspace::claude_projects_dir(),
-            events_rx,
-            faff_pane,
-            tasks: Vec::new(),
-            rows: Vec::new(),
-            task_of_node: Vec::new(),
-            fork_point: None,
-            task_order: Vec::new(),
-            detached: Vec::new(),
+            view: View::default(),
+            cmd_tx,
+            msg_rx,
+            in_flight: VecDeque::new(),
             selected: 0,
-            open_pane: None,
-            id_display: std::collections::HashMap::new(),
             notices: notify::Notices::default(),
             overlay: Overlay::None,
             should_quit: false,
-            last_refresh: Instant::now(),
-            pending_refresh: false,
+            quit_now: false,
             pending_swap: None,
             pending_rebase: None,
             pending_describe: None,
-            pending_select: None,
-            merge_train: train::Train::default(),
         };
         app.notices.info("ready");
         // The opening "ready" is not news; don't start the session with a badge.
         app.notices.mark_seen();
-        app.refresh();
-        Ok(app)
+        app
     }
 
+    /// The UI loop: draw, apply whatever the engine sent, and handle keys. Nothing here
+    /// shells out or touches the store, so a slow jj or wezterm call can delay a view
+    /// update but never a keypress or a redraw.
     fn event_loop(&mut self, term: &mut Term) -> Result<()> {
-        // Rebuilding the graph shells out to jj/wezterm; throttle it. Idle cadence is
-        // ~1s; a pending event refreshes sooner but no more often than min_gap, so a
-        // chatty agent can't drive unbounded subprocess churn.
-        let idle = Duration::from_millis(1000);
-        let min_gap = Duration::from_millis(400);
-        while !self.should_quit {
-            term.draw(|f| self.render(f))?;
-            if self.drain_channels() {
-                self.pending_refresh = true;
+        let mut dirty = true;
+        loop {
+            dirty |= self.drain_messages()?;
+            if self.quit_now || (self.should_quit && self.in_flight.is_empty()) {
+                return Ok(());
             }
-            if event::poll(Duration::from_millis(250))?
-                && let CtEvent::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key(key);
+            if dirty {
+                term.draw(|f| self.render(f))?;
+                dirty = false;
             }
-            let elapsed = self.last_refresh.elapsed();
-            if elapsed >= idle || (self.pending_refresh && elapsed >= min_gap) {
-                self.refresh();
-                // Advance the merge train on the freshly reconciled task state. Runs on the
-                // refresh cadence so it never adds subprocess churn beyond the throttle.
-                self.tick_merge_train();
+            if event::poll(Duration::from_millis(50))? {
+                if let CtEvent::Key(key) = event::read()?
+                    && key.kind == KeyEventKind::Press
+                {
+                    self.handle_key(key);
+                }
+                // A resize (or any other terminal event) needs a redraw too.
+                dirty = true;
             }
         }
-        Ok(())
     }
 
-    /// Drain the socket nudge channel. Hook events are persisted to the store by
-    /// `report-event` itself, so socket messages are only refresh nudges here (not
-    /// re-applied). Returns whether anything arrived.
-    fn drain_channels(&mut self) -> bool {
+    /// Apply everything the engine has sent since the last pass. Returns whether anything
+    /// arrived. The engine only hangs up by panicking, which leaves faff with no way to act
+    /// — surface that as an error rather than sit there looking alive.
+    fn drain_messages(&mut self) -> Result<bool> {
         let mut any = false;
-        while self.events_rx.try_recv().is_ok() {
-            any = true; // report-event already wrote the store; just nudge a refresh
+        loop {
+            match self.msg_rx.try_recv() {
+                Ok(Msg::Notice(level, text)) => self.notices.push(level, text),
+                Ok(Msg::View(view)) => self.apply_view(*view),
+                Ok(Msg::Done) => {
+                    self.in_flight.pop_front();
+                }
+                Err(TryRecvError::Empty) => return Ok(any),
+                Err(TryRecvError::Disconnected) => bail!("faff's worker thread stopped"),
+            }
+            any = true;
         }
-        any
+    }
+
+    /// Swap in a fresh view, keeping the selection on the same task by identity. A task
+    /// the engine just created (`n`/`N`) wins, so the new row is highlighted.
+    fn apply_view(&mut self, view: View) {
+        let prev = self.view.task_order.get(self.selected).copied();
+        self.view = view;
+        self.selected = self
+            .view
+            .select
+            .or(prev)
+            .and_then(|id| self.view.task_order.iter().position(|x| *x == id))
+            .unwrap_or_else(|| {
+                self.selected
+                    .min(self.view.task_order.len().saturating_sub(1))
+            });
+    }
+
+    /// Queue `cmd` on the engine; `doing` labels it in the header until it completes.
+    fn send(&mut self, doing: impl Into<String>, cmd: Cmd) {
+        if self.cmd_tx.send(cmd).is_ok() {
+            self.in_flight.push_back(doing.into());
+        } else {
+            self.notices.err("faff's worker thread stopped");
+        }
     }
 
     fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
@@ -501,7 +470,7 @@ impl App {
         // else cancels (so a live agent's files are only yanked on a deliberate re-press).
         if let Some(id) = self.pending_swap.take() {
             if action == Action::Swap {
-                self.perform_swap(id);
+                self.send(format!("swapping #{}", id.0), Cmd::Swap(id));
             } else {
                 self.notices.info("swap cancelled");
             }
@@ -514,7 +483,7 @@ impl App {
             let confirmed =
                 (freeze && action == Action::Rebase) || (!freeze && action == Action::RebaseParent);
             if confirmed {
-                self.perform_rebase(id, freeze);
+                self.send(format!("rebasing #{}", id.0), Cmd::Rebase { id, freeze });
             } else {
                 self.notices.info("rebase cancelled");
             }
@@ -525,19 +494,29 @@ impl App {
         // re-press).
         if let Some(id) = self.pending_describe.take() {
             if action == Action::Describe {
-                self.perform_describe(id);
+                self.send(format!("describing #{}", id.0), Cmd::Describe(id));
             } else {
                 self.notices.info("describe cancelled");
             }
             return;
         }
         match action {
-            Action::Quit => self.should_quit = true,
+            Action::Quit => self.quit(),
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
-            Action::NewTask => self.new_task(),
-            Action::Handoff => self.handoff_task(),
-            Action::ToggleSession => self.toggle_session(),
+            Action::NewTask => self.send("creating a task", Cmd::New { handoff: false }),
+            Action::Handoff => self.send("handing off", Cmd::New { handoff: true }),
+            Action::ToggleSession => {
+                let doing = match self.enter_hint() {
+                    "detach" => "detaching",
+                    "revive" => "reviving",
+                    "start" => "starting",
+                    _ => "opening",
+                };
+                let id = self.selected_task().map(|t| t.id);
+                let what = id.map(|id| format!(" #{}", id.0)).unwrap_or_default();
+                self.send(format!("{doing}{what}"), Cmd::Toggle(id));
+            }
             Action::Remove => self.remove_selected(false),
             Action::RemoveDiscard => self.remove_selected(true),
             Action::Swap => self.swap_selected(),
@@ -556,329 +535,60 @@ impl App {
         }
     }
 
+    /// `q`: quit once the engine is idle, so a half-finished create or remove is never
+    /// cut off mid-way. A second `q` quits regardless.
+    fn quit(&mut self) {
+        if self.in_flight.is_empty() || self.should_quit {
+            self.quit_now = true;
+            return;
+        }
+        self.should_quit = true;
+        self.notices.prompt(format!(
+            "quitting once {} finishes — press q again to quit now",
+            self.in_flight.len()
+        ));
+    }
+
     fn selected_task(&self) -> Option<Task> {
-        let id = self.task_order.get(self.selected)?;
-        self.tasks.iter().find(|t| &t.id == id).cloned()
+        let id = self.view.task_order.get(self.selected)?;
+        self.view.tasks.iter().find(|t| &t.id == id).cloned()
     }
 
     /// The task whose agent pane is currently docked beside faff (the focused session).
     fn open_task_id(&self) -> Option<TaskId> {
-        let open = self.open_pane?;
-        self.tasks
+        let open = self.view.open_pane?;
+        self.view
+            .tasks
             .iter()
             .find(|t| t.pane_id == Some(open))
             .map(|t| t.id)
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.task_order.is_empty() {
+        if self.view.task_order.is_empty() {
             return;
         }
-        let n = self.task_order.len() as isize;
+        let n = self.view.task_order.len() as isize;
         let cur = self.selected as isize;
         self.selected = ((cur + delta).rem_euclid(n)) as usize;
     }
 
-    // ---- orchestration actions ----
+    // ---- actions ----
+    //
+    // Each one checks only what the view already knows (a workspace, a pane, whether the
+    // agent is working) to refuse or arm a confirmation, then hands the real work to the
+    // engine, which re-checks against live state.
 
-    /// `n`: create an empty task, fork its workspace, spawn a bare `claude`, and open
-    /// it beside faff so the user types their task straight into the session. The task
-    /// prompt (and title) are captured later from the first UserPromptSubmit hook.
-    fn new_task(&mut self) {
-        match self.try_new_task(false) {
-            Ok(id) => {
-                self.notices
-                    .ok(format!("new task #{id} — type your task in the pane"));
-                self.pending_select = Some(id);
-            }
-            Err(e) => self.notices.err(format!("new task failed: {e}")),
-        }
-        self.refresh();
-    }
-
-    /// `N` (Shift+n): hand off your current work. Like `new_task`, but the agent takes
-    /// over your current revision — it continues your exact commit — and your own `@`
-    /// retreats to the fork point from before your changes (see `workspace::handoff`).
-    /// You still type what you want the agent to finish into its pane, exactly as `n`.
-    fn handoff_task(&mut self) {
-        match self.try_new_task(true) {
-            Ok(id) => {
-                self.notices.ok(format!(
-                    "handed off #{id} — type what to finish in the pane"
-                ));
-                self.pending_select = Some(id);
-            }
-            Err(e) => self.notices.err(format!("handoff failed: {e}")),
-        }
-        self.refresh();
-    }
-
-    /// Shared task-creation path for `n` (`handoff == false`) and `N` (`handoff == true`).
-    /// The only difference is how the workspace is forked (`prepare_workspace`); spawning,
-    /// docking, rollback, and status are identical.
-    fn try_new_task(&mut self, handoff: bool) -> Result<TaskId> {
-        let faff = self
-            .faff_pane
-            .context("run faff inside WezTerm to spawn agents")?;
-        let task = self.store.create_task("", 0, Autonomy::Inherit)?;
-        // Roll the row back if workspace prep fails (no invisible zombie).
-        if let Err(e) = self.prepare_workspace(task.id, "", handoff) {
-            let _ = self.store.delete_task(task.id);
-            return Err(e);
-        }
-        let t = self.store.get_task(task.id)?;
-        match self.spawn_claude(&t) {
-            Ok(pane) => {
-                let _ = self.store.set_pane(task.id, Some(pane));
-                // Awaiting the user's first prompt — literally needs their input.
-                let _ = self.store.update_status(task.id, TaskStatus::NeedsInput);
-                // Dock it beside faff (detaching any already-open session first) and
-                // focus it — a new task lands the user in the agent to type the task.
-                self.open_session(faff, pane, true);
-                Ok(task.id)
-            }
-            Err(e) => {
-                // Full rollback: tear the workspace back down and drop the row.
-                if let (Some(n), Some(p), Some(f)) = (&t.ws_name, &t.ws_path, &t.fork_point) {
-                    let _ = workspace::teardown(&self.repo, n, p, f);
-                }
-                let _ = self.store.delete_task(task.id);
-                Err(e)
-            }
-        }
-    }
-
-    fn prepare_workspace(&self, id: TaskId, prompt: &str, handoff: bool) -> Result<()> {
-        let slug = config::slugify(prompt, 4);
-        let name = format!("faf-task-{}", id.0);
-        let path = config::task_workspace_dir(&self.repo, id.0, &slug)?;
-        let ws = if handoff {
-            workspace::handoff(&self.repo, &name, &path)?
-        } else {
-            workspace::create(&self.repo, &name, &path)?
-        };
-        // The workspace now exists on disk + in jj. If recording it fails, tear it
-        // back down so we don't leak an untracked jj workspace (the DB row is rolled
-        // back separately by the caller).
-        if let Err(e) =
-            self.store
-                .set_workspace(id, &ws.name, &ws.path, &ws.change_id, &ws.fork_point)
-        {
-            let _ = workspace::teardown(&self.repo, &ws.name, &ws.path, &ws.fork_point);
-            return Err(e);
-        }
-        // Best-effort: memory seed, hook injection, and pre-trust the workspace dir
-        // so the agent doesn't hit the "trust this folder?" dialog on spawn.
-        let claude_projects = workspace::claude_projects_dir();
-        let _ = workspace::seed_memory(&claude_projects, &self.repo, &ws.path);
-        let mem_dir = claude_projects
-            .join(config::encode_repo_path(&ws.path))
-            .join("memory");
-        let _ = workspace::write_hooks(
-            &ws.path,
-            id.0,
-            &self.faff_exe,
-            &self.socket,
-            &self.db,
-            &mem_dir,
-        );
-        let _ = workspace::trust_workspace(&ws.path);
-        Ok(())
-    }
-
-    /// Whether this task's conversation is already on disk, i.e. whether relaunching it
-    /// must resume rather than create. Keyed on the task's *workspace* path, because that
-    /// is the directory claude was launched in and thus the project key it wrote under.
-    fn transcript_exists(&self, t: &Task, session_id: &str) -> bool {
-        t.ws_path
-            .as_deref()
-            .is_some_and(|ws| workspace::session_exists(&self.claude_projects, ws, session_id))
-    }
-
-    /// The `claude` argv for (re)launching this task's pane: pin the minted id on a first
-    /// boot, resume the conversation on every boot after that.
-    fn task_argv(&self, t: &Task) -> Vec<String> {
-        let sid = t.session_id.as_deref();
-        let launch = match sid {
-            None => session::Launch::Bare,
-            Some(s) if self.transcript_exists(t, s) => session::Launch::Resume,
-            Some(_) => session::Launch::Fresh,
-        };
-        session::claude_argv(
-            sid.unwrap_or_default(),
-            launch,
-            &t.prompt,
-            t.autonomy.permission_mode(),
-        )
-    }
-
-    /// Whether Enter can put an agent back into this task. Broader than `task_resumable`:
-    /// a task whose pane died before its first prompt has no conversation to restore, but
-    /// its workspace is intact and a blank agent belongs in it. That is the commonest lost
-    /// instance in faff, because `n` deliberately leaves the agent waiting to be typed at.
-    fn task_revivable(&self, t: &Task) -> bool {
-        session::revivable(t.pane_id, t.ws_path.is_some())
-    }
-
-    /// A *lost instance*: the agent's pane is gone but its conversation survived, so
-    /// faff can bring it back. Distinct from a task that simply never started.
-    fn task_resumable(&self, t: &Task) -> bool {
-        let sid = t.session_id.as_deref();
-        session::resumable(
-            t.pane_id,
-            sid,
-            sid.is_some_and(|s| self.transcript_exists(t, s)),
-        )
-    }
-
-    /// Launch a `claude` pane in the task's workspace and title its tab. The argv comes
-    /// from `task_argv`, so this is also the relaunch path for a lost instance: a first
-    /// boot pins the task's minted session id, a later one resumes the conversation that
-    /// id names. A task created via `n` spawns with no prompt so the user types the task
-    /// live; the prompt is passed as the initial message only if the task already has one
-    /// (and never on a resume — the conversation already holds it). `--permission-mode` is
-    /// passed only for an explicit override — otherwise the user's own default (e.g.
-    /// `permissions.defaultMode=auto`) is inherited.
-    fn spawn_claude(&self, t: &Task) -> Result<u64> {
-        let ws_path = t.ws_path.clone().context("task has no workspace")?;
-        let argv = self.task_argv(t);
-        let prog: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let pane = wezterm::spawn(&ws_path, &prog)?;
-        let _ = wezterm::set_tab_title(pane, &format!("#{}", t.id.0));
-        // `wezterm cli spawn` activates the new tab, stealing focus from faff. Return
-        // focus to faff so spawning an agent never yanks the user out of the TUI (a new
-        // task re-focuses its own pane afterward — see open_session).
-        if let Some(faff) = self.faff_pane {
-            let _ = wezterm::activate_pane(faff);
-        }
-        Ok(pane)
-    }
-
-    /// Dock `pane` beside faff, ensuring only one session is ever docked: any
-    /// currently-open session is detached first. Idempotent if `pane` is already open.
-    /// `focus` decides where the cursor lands: a new task focuses its fresh agent so
-    /// the user can type the task straight away; every other dock leaves focus on faff
-    /// (the user swaps with their own WezTerm keybinds).
-    fn open_session(&mut self, faff: u64, pane: u64, focus: bool) {
-        if let Some(prev) = self.open_pane
-            && prev != pane
-        {
-            let _ = wezterm::detach(prev);
-        }
-        if wezterm::open_beside(faff, pane).is_ok() {
-            self.open_pane = Some(pane);
-            // open_beside activates the moved pane; set focus explicitly either way.
-            let _ = wezterm::activate_pane(if focus { pane } else { faff });
-        }
-    }
-
-    /// Recreate a lost instance: relaunch `claude --resume` in the task's jj workspace,
-    /// which the pane's death never touched, and dock it focused so the user can carry
-    /// on typing. The conversation comes back; the *process* does not — a turn in flight
-    /// when the pane died is gone, and MCP/background state starts over.
-    ///
-    /// Deliberately manual rather than automatic in `reconcile_panes`: a pane usually
-    /// vanishes because the user closed it, and respawning that on sight would be a
-    /// fight, not a feature.
-    fn revive_task(&mut self, faff: u64, t: &Task) {
-        let restoring = self.task_resumable(t);
-        match self.spawn_claude(t) {
-            Ok(pane) => {
-                let _ = self.store.set_pane(t.id, Some(pane));
-                if restoring {
-                    self.notices
-                        .ok(format!("revived #{} — conversation restored", t.id));
-                } else {
-                    self.notices.ok(format!(
-                        "started #{} — fresh agent, no conversation to restore",
-                        t.id
-                    ));
-                }
-                self.open_session(faff, pane, true);
-            }
-            Err(e) => self.notices.err(format!("revive #{} failed: {e}", t.id)),
-        }
-        self.refresh();
-    }
-
-    fn toggle_session(&mut self) {
-        let selected = self.selected_task();
-        let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
-        let revivable = selected.as_ref().is_some_and(|t| self.task_revivable(t));
-        let Some(faff) = self.faff_pane else {
-            self.notices
-                .warn("no WEZTERM_PANE; run faff inside WezTerm");
-            return;
-        };
-        match session::decide(self.open_pane, selected_pane, revivable) {
-            session::Toggle::Nothing => self.notices.warn("no session for this task"),
-            // Open and Retarget both route through open_session (which detaches any
-            // currently-docked session first).
-            session::Toggle::Open(p) | session::Toggle::Retarget { open: p, .. } => {
-                // Docking to view an existing agent keeps focus on faff.
-                self.open_session(faff, p, false)
-            }
-            // The pane died but the conversation did not: bring the agent back.
-            session::Toggle::Revive => {
-                if let Some(t) = selected {
-                    self.revive_task(faff, &t);
-                }
-            }
-            session::Toggle::Detach(p) => {
-                if wezterm::detach(p).is_ok() {
-                    self.open_pane = None;
-                    // Ejecting the pane to a new tab activates it; stay on faff.
-                    let _ = wezterm::activate_pane(faff);
-                }
-            }
-        }
-    }
-
-    /// Remove the selected task: kill its pane, tear down its jj workspace, and drop the
-    /// row from the store. There is no archive/history — a removed task is gone.
-    ///
-    /// `x` (`discard_revision = false`) preserves the task's real work as ordinary jj
-    /// history; `X`/Shift+x (`discard_revision = true`) abandons the revision too,
-    /// throwing the work away (see `workspace::teardown_discarding_revision`).
-    fn remove_selected(&mut self, discard_revision: bool) {
+    /// `x` / `X`: remove the selected task. `x` keeps its real work as ordinary jj history;
+    /// `X` discards the revision too (see `workspace::teardown_discarding_revision`).
+    fn remove_selected(&mut self, discard: bool) {
         let Some(t) = self.selected_task() else {
             return;
         };
-        let id = t.id;
-        self.remove_task(id, discard_revision);
-        let msg = if discard_revision {
-            format!("removed #{} and discarded its revision", id.0)
-        } else {
-            format!("removed #{}", id.0)
-        };
-        self.notices.ok(msg);
-        self.refresh();
-    }
-
-    /// Tear a task down by id: undock and kill its pane, retire its workspace (abandoning
-    /// its revision only when `discard_revision`), drop the row, and drop it from the merge
-    /// train. Sets no status and does not refresh — the caller owns both.
-    fn remove_task(&mut self, id: TaskId, discard_revision: bool) {
-        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        if let Some(p) = t.pane_id {
-            if self.open_pane == Some(p) {
-                self.open_pane = None;
-            }
-            let _ = wezterm::kill_pane(p);
-        }
-        if let (Some(name), Some(path), Some(fork)) =
-            (t.ws_name.clone(), t.ws_path.clone(), t.fork_point.clone())
-        {
-            let _ = if discard_revision {
-                workspace::teardown_discarding_revision(&self.repo, &name, &path, &fork)
-            } else {
-                workspace::teardown(&self.repo, &name, &path, &fork)
-            };
-        }
-        let _ = self.store.delete_task(id);
-        self.merge_train.remove(id);
+        self.send(
+            format!("removing #{}", t.id.0),
+            Cmd::Remove { id: t.id, discard },
+        );
     }
 
     /// `s`: swap the default workspace's `@` with the selected agent's revision (a
@@ -901,27 +611,7 @@ impl App {
             ));
             return;
         }
-        self.perform_swap(t.id);
-    }
-
-    /// Run the swap for task `id` (already validated / confirmed) and refresh.
-    fn perform_swap(&mut self, id: TaskId) {
-        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let (Some(name), Some(path)) = (t.ws_name.clone(), t.ws_path.clone()) else {
-            self.notices.warn("no workspace to swap for this task");
-            return;
-        };
-        match workspace::swap(&self.repo, &name, &path) {
-            Ok(new_rev) => {
-                // Keep the recorded revision honest (the graph rebuilds from jj anyway).
-                let _ = self.store.set_ws_change_id(id, &new_rev);
-                self.notices.ok(format!("swapped @ ⇄ #{}", id.0));
-            }
-            Err(e) => self.notices.err(format!("swap failed: {e}")),
-        }
-        self.refresh();
+        self.send(format!("swapping #{}", t.id.0), Cmd::Swap(t.id));
     }
 
     /// `S`: snapshot the selected agent's workspace so edits from an agent that hasn't
@@ -930,15 +620,11 @@ impl App {
         let Some(t) = self.selected_task() else {
             return;
         };
-        let Some(path) = t.ws_path.clone() else {
+        if t.ws_path.is_none() {
             self.notices.warn("no workspace to snapshot for this task");
             return;
-        };
-        match workspace::snapshot(&path) {
-            Ok(()) => self.notices.ok(format!("snapshotted #{}", t.id.0)),
-            Err(e) => self.notices.err(format!("snapshot failed: {e}")),
         }
-        self.refresh();
+        self.send(format!("snapshotting #{}", t.id.0), Cmd::Snapshot(t.id));
     }
 
     /// `r` / `R`: refresh the selected agent onto a newer base. faff computes the base
@@ -969,34 +655,10 @@ impl App {
             ));
             return;
         }
-        self.perform_rebase(t.id, freeze);
-    }
-
-    /// Compute the new base and inject the rebase prompt into the agent's pane (already
-    /// validated / confirmed). No-op when the agent is already on the latest base.
-    fn perform_rebase(&mut self, id: TaskId, freeze: bool) {
-        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let (Some(name), Some(pane)) = (t.ws_name.clone(), t.pane_id) else {
-            self.notices
-                .warn("no workspace/pane to rebase for this task");
-            return;
-        };
-        match workspace::refresh(&self.repo, &name, freeze) {
-            Ok(workspace::Refresh::AlreadyFresh) => {
-                self.notices
-                    .warn(format!("#{} is already on the latest base", id.0));
-            }
-            Ok(workspace::Refresh::Rebase { prompt, .. }) => {
-                match wezterm::send_text(pane, &prompt) {
-                    Ok(()) => self.notices.ok(format!("sent rebase to #{}", id.0)),
-                    Err(e) => self.notices.err(format!("rebase send failed: {e}")),
-                }
-            }
-            Err(e) => self.notices.err(format!("rebase failed: {e}")),
-        }
-        self.refresh();
+        self.send(
+            format!("rebasing #{}", t.id.0),
+            Cmd::Rebase { id: t.id, freeze },
+        );
     }
 
     /// `d`: ask the selected agent to describe its own revision. faff never runs `jj
@@ -1026,528 +688,40 @@ impl App {
             ));
             return;
         }
-        self.perform_describe(t.id);
+        self.send(format!("describing #{}", t.id.0), Cmd::Describe(t.id));
     }
 
-    /// Inject the describe prompt into the agent's pane (already validated / confirmed).
-    fn perform_describe(&mut self, id: TaskId) {
-        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let Some(pane) = t.pane_id else {
-            self.notices.warn("no pane to describe for this task");
-            return;
-        };
-        match wezterm::send_text(pane, DESCRIBE_PROMPT) {
-            Ok(()) => self.notices.ok(format!("sent describe to #{}", id.0)),
-            Err(e) => self.notices.err(format!("describe send failed: {e}")),
-        }
-        self.refresh();
-    }
-
-    // ---- merge train (`a` / `A`) ----
-
-    /// `a`: toggle the selected agent's revision into/out of the merge train. Rejects a task
-    /// with nothing to merge or no live pane, and refuses to *start* a train while your own `@`
-    /// still holds work: the train lands revisions onto an empty, description-less `@`.
+    /// `a`: toggle the selected agent's revision into/out of the merge train. A queued task
+    /// always toggles back out; otherwise one with no workspace or live pane is refused here,
+    /// and the engine makes the jj checks (content to merge, a clear `@`).
     fn accept_selected(&mut self) {
         let Some(t) = self.selected_task() else {
             return;
         };
-        // Already queued → toggle it back out.
-        if self.merge_train.contains(t.id) {
-            self.merge_train.remove(t.id);
-            self.notices
-                .ok(format!("#{} removed from the merge train", t.id.0));
-            return;
+        if !self.view.merge_train.contains(t.id) {
+            if t.ws_name.is_none() {
+                self.notices.warn("no workspace to accept for this task");
+                return;
+            }
+            if t.pane_id.is_none() {
+                self.notices.warn(format!(
+                    "no live pane to drive #{} through the merge train",
+                    t.id.0
+                ));
+                return;
+            }
         }
-        let Some(name) = t.ws_name.clone() else {
-            self.notices.warn("no workspace to accept for this task");
-            return;
-        };
-        if t.pane_id.is_none() {
-            self.notices.warn(format!(
-                "no live pane to drive #{} through the merge train",
-                t.id.0
-            ));
-            return;
-        }
-        // Nothing to merge if the agent's revision is empty.
-        if !jj::any_revision(&self.repo, &format!("{name}@ ~ empty()")).unwrap_or(false) {
-            self.notices
-                .warn(format!("#{} has no content to merge", t.id.0));
-            return;
-        }
-        // Starting a train needs a clear `@` to land the first revision onto.
-        if self.merge_train.is_empty() && !self.at_is_clear() {
-            self.notices
-                .warn("your @ has content — commit or hand it off before accepting");
-            return;
-        }
-        self.merge_train.add(t.id);
-        self.notices
-            .ok(format!("#{} accepted into the merge train", t.id.0));
+        self.send(format!("accepting #{}", t.id.0), Cmd::Accept(t.id));
     }
 
     /// `A`: abort the merge train — dequeue everything still pending. Revisions already
     /// taken over stay merged; nothing is rolled back.
     fn abort_train(&mut self) {
-        if self.merge_train.is_empty() {
+        if self.view.merge_train.is_empty() {
             self.notices.warn("no merge train to abort");
             return;
         }
-        let n = self.merge_train.len();
-        self.merge_train.clear();
-        self.notices
-            .ok(format!("merge train aborted — {n} dequeued"));
-    }
-
-    /// Whether your `@` is an empty, description-less commit — the landing spot the train
-    /// needs. On a jj error it reports "not clear" (never merge onto an unknown `@`).
-    fn at_is_clear(&self) -> bool {
-        let empty = !jj::any_revision(&self.repo, "@ ~ empty()").unwrap_or(true);
-        let described = !jj::description(&self.repo, "@")
-            .unwrap_or_default()
-            .is_empty();
-        empty && !described
-    }
-
-    fn member_cooling(&self, id: TaskId, now: Instant) -> bool {
-        self.merge_train
-            .members
-            .iter()
-            .find(|m| m.task == id)
-            .map(|m| m.cooling(now))
-            .unwrap_or(false)
-    }
-
-    /// Advance the merge train by at most one integration step (called each refresh tick).
-    ///
-    /// Each tick: drop members faff genuinely can't merge (conflicted, empty, or vanished);
-    /// recompute every survivor's display stage; then, if `@` is a clear landing spot, take
-    /// over one ready revision (`jj new`). If none is ready, nudge work forward concurrently
-    /// — describe the earliest on-tip member that still lacks a description, and ask off-tip
-    /// members to rebase onto the tip (the ready-first fan-out; injections are capped per
-    /// tick so `send_text` never freezes the UI for long). A `working` member is simply
-    /// waited on — never ejected — since `accept` is an explicit request to merge it.
-    fn tick_merge_train(&mut self) {
-        if self.merge_train.is_empty() {
-            return;
-        }
-        let now = Instant::now();
-        self.merge_train.note.clear();
-
-        // The tip the set lands on: the newest non-empty ancestor of @ (which advances as
-        // revisions are taken over). A transient jj error just defers to the next tick.
-        let Ok(tip) = jj::resolve_change_id(&self.repo, "heads(::@ ~ empty())") else {
-            return;
-        };
-
-        // 1. Gather live facts, dropping members that can't be cleanly accepted.
-        let mut facts: Vec<MergeFacts> = Vec::new();
-        let member_ids: Vec<TaskId> = self.merge_train.members.iter().map(|m| m.task).collect();
-        for id in member_ids {
-            let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-                self.merge_train.remove(id); // task vanished
-                continue;
-            };
-            let Some(name) = t.ws_name.clone() else {
-                self.merge_train.remove(id);
-                continue;
-            };
-            let info = jj::log(&self.repo, &format!("{name}@"))
-                .ok()
-                .and_then(|v| v.into_iter().next());
-            let (empty, conflict, described) = match &info {
-                Some(r) => (r.empty, r.conflict, !r.description.is_empty()),
-                None => (false, false, false),
-            };
-            // The agent's turn is over (not `working`) → its revision is settled. A working
-            // agent is waited on, not dropped.
-            let stable = t.status != TaskStatus::Working;
-            // A settled-but-conflicted revision, or a settled one gone empty, genuinely
-            // can't merge — drop it (leaving it as an ordinary task to handle by hand).
-            if stable && conflict {
-                self.merge_train.remove(id);
-                self.notices.warn(format!(
-                    "#{} has conflicts — dropped from the merge train",
-                    id.0
-                ));
-                continue;
-            }
-            if stable && empty {
-                self.merge_train.remove(id);
-                self.notices
-                    .warn(format!("#{} has no content to merge — dropped", id.0));
-                continue;
-            }
-            let on_tip =
-                jj::any_revision(&self.repo, &format!("{tip} & ::({name}@)")).unwrap_or(false);
-            let seq = self
-                .merge_train
-                .members
-                .iter()
-                .find(|m| m.task == id)
-                .map(|m| m.seq)
-                .unwrap_or(0);
-            facts.push(MergeFacts {
-                id,
-                name,
-                stable,
-                on_tip,
-                described,
-                conflict,
-                seq,
-            });
-        }
-        if facts.is_empty() {
-            return;
-        }
-
-        // 2. Recompute each survivor's display stage. A settled member is labelled by where it
-        //    sits in the pipeline; a working one by whatever prompt faff last handed it (so an
-        //    agent still on its own task reads "working", not "describing").
-        for f in &facts {
-            let last = self
-                .merge_train
-                .members
-                .iter()
-                .find(|m| m.task == f.id)
-                .and_then(|m| m.last_inject);
-            let stage = if f.conflict {
-                train::Stage::Resolving
-            } else if !f.stable {
-                match last {
-                    Some(train::Injected::Rebase) => train::Stage::Rebasing,
-                    Some(train::Injected::Describe) => train::Stage::Describing,
-                    None => train::Stage::Working,
-                }
-            } else if !f.on_tip {
-                train::Stage::Rebasing
-            } else if !f.described {
-                train::Stage::Describing
-            } else {
-                train::Stage::Ready
-            };
-            if let Some(m) = self.merge_train.member_mut(f.id) {
-                m.stage = stage;
-            }
-        }
-
-        // 3. The landing spot must be a clear `@` — never merge onto your own WIP.
-        if !self.at_is_clear() {
-            self.merge_train.note = "paused — your @ has content; clear it to resume".to_string();
-            return;
-        }
-
-        // 4. Take over one ready revision (settled, on the tip, described), earliest accepted.
-        if let Some(f) = facts
-            .iter()
-            .filter(|f| f.stable && f.on_tip && f.described)
-            .min_by_key(|f| f.seq)
-        {
-            let id = f.id;
-            if let Some(m) = self.merge_train.member_mut(id) {
-                m.stage = train::Stage::Merging;
-            }
-            self.merge_train_take_over(id);
-            return; // state changed under us; the next tick continues the drain
-        }
-
-        // 5. Not merging this tick — nudge work forward concurrently (capped injections).
-        let mut sent = 0usize;
-        // (a) Describe the earliest on-tip settled member that still lacks a description.
-        if let Some(f) = facts
-            .iter()
-            .filter(|f| f.stable && f.on_tip && !f.described)
-            .min_by_key(|f| f.seq)
-        {
-            let id = f.id;
-            if !self.member_cooling(id, now) {
-                self.merge_train_inject(
-                    id,
-                    train::Injected::Describe,
-                    DESCRIBE_PROMPT.to_string(),
-                    now,
-                );
-                sent += 1;
-            }
-        }
-        // (b) Ask off-tip settled members to rebase onto the tip (the ready-first fan-out).
-        let mut off_tip: Vec<&MergeFacts> =
-            facts.iter().filter(|f| f.stable && !f.on_tip).collect();
-        off_tip.sort_by_key(|f| f.seq);
-        for f in off_tip {
-            if sent >= MAX_MERGE_INJECTIONS_PER_TICK {
-                break;
-            }
-            let id = f.id;
-            if self.member_cooling(id, now) {
-                continue;
-            }
-            if let Ok(workspace::Refresh::Rebase { prompt, .. }) =
-                workspace::refresh_onto(&self.repo, &f.name, &tip)
-            {
-                self.merge_train_inject(id, train::Injected::Rebase, prompt, now);
-                sent += 1;
-            }
-        }
-    }
-
-    /// Inject `prompt` into a member's agent pane, record what was sent (for the panel), and
-    /// start its cooldown (see `train::INJECT_COOLDOWN`). Best-effort: a send failure is left
-    /// for the next tick.
-    fn merge_train_inject(
-        &mut self,
-        id: TaskId,
-        kind: train::Injected,
-        prompt: String,
-        now: Instant,
-    ) {
-        let Some(pane) = self
-            .tasks
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.pane_id)
-        else {
-            return;
-        };
-        let _ = wezterm::send_text(pane, &prompt);
-        if let Some(m) = self.merge_train.member_mut(id) {
-            m.cooldown_until = Some(now + train::INJECT_COOLDOWN);
-            m.last_inject = Some(kind);
-        }
-    }
-
-    /// Take a ready member's revision over into your workspace (`jj new <head>`) and retire
-    /// its agent. On success the revision is now integrated into `::@`, so `teardown` keeps
-    /// it. On failure the member stays in the train and is retried next tick.
-    fn merge_train_take_over(&mut self, id: TaskId) {
-        let Some(t) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let (Some(name), Some(path)) = (t.ws_name.clone(), t.ws_path.clone()) else {
-            return;
-        };
-        match workspace::take_over(&self.repo, &name, &path) {
-            Ok(_head) => {
-                self.remove_task(id, false); // also drops it from the train
-                self.notices
-                    .ok(format!("merged #{} into your workspace", id.0));
-            }
-            Err(e) => self.notices.err(format!("merge of #{} failed: {e}", id.0)),
-        }
-        self.refresh();
-    }
-
-    // ---- refresh (recompute view from store + jj) ----
-
-    fn refresh(&mut self) {
-        self.pending_refresh = false;
-        // Preserve the selected task by identity across the rebuild.
-        let prev_selected = self.task_order.get(self.selected).copied();
-
-        self.tasks = self.store.list_tasks().unwrap_or_default();
-
-        // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
-        let mut ws_list = jj::workspace_list(&self.repo).ok();
-
-        // Heal orphans so stale rows don't linger forever or misreport their status.
-        let panes = wezterm::list().ok();
-        if let Some(p) = &panes {
-            self.reconcile_panes(p);
-        }
-        if let Some(ws) = &ws_list {
-            self.reconcile_workspaces(ws);
-        }
-        // Forget faff workspaces no task tracks — ghosts from a remove/swap that didn't
-        // fully unregister — and drop them from the list so the graph doesn't redraw a
-        // workspace we just forgot. This is what stops a stale `faf-task-N` registration
-        // from blocking the next `n` with a workspace-name collision.
-        if let Some(ws) = &mut ws_list {
-            let forgotten = self.reconcile_orphan_workspaces(ws);
-            ws.retain(|w| !forgotten.contains(&w.name));
-        }
-        // Reload to reflect any status changes the reconcile passes made.
-        self.tasks = self.store.list_tasks().unwrap_or_default();
-
-        // Recover which agent (if any) is already docked beside faff. Derived from the
-        // live layout each refresh, so a restart — where `open_pane` starts `None` —
-        // doesn't leave faff blind to an already-docked session and re-open (double) it.
-        if let Some(p) = &panes {
-            self.open_pane = self.detect_open_pane(p);
-        }
-
-        // Build the revision graph from the (already-fetched) workspace list.
-        if let Some(ws) = &ws_list {
-            match self.build_rows(ws) {
-                Ok((rows, task_of, id_display, fork_point)) => {
-                    self.rows = rows;
-                    self.task_of_node = task_of;
-                    self.id_display = id_display;
-                    self.fork_point = fork_point;
-                }
-                Err(e) => self.notices.err(format!("jj error: {e}")),
-            }
-        }
-
-        // Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
-        // appear as graph nodes first (in graph order), then any detached tasks
-        // (workspace inlined into HEAD, or otherwise not a distinct node). This keeps
-        // every task selectable/removable even after its change is integrated.
-        let graph_tasks: Vec<TaskId> = self.task_of_node.iter().flatten().copied().collect();
-        let in_graph: std::collections::HashSet<TaskId> = graph_tasks.iter().copied().collect();
-        self.detached = self
-            .tasks
-            .iter()
-            .filter(|t| !in_graph.contains(&t.id))
-            .map(|t| t.id)
-            .collect();
-        self.task_order = graph_tasks;
-        self.task_order.extend(self.detached.iter().copied());
-
-        // A freshly-created task (armed by `n`/`N`) wins over identity preservation so the
-        // new row is highlighted; otherwise keep the prior selection.
-        self.selected = self
-            .pending_select
-            .take()
-            .or(prev_selected)
-            .and_then(|id| self.task_order.iter().position(|x| *x == id))
-            .unwrap_or_else(|| self.selected.min(self.task_order.len().saturating_sub(1)));
-        self.last_refresh = Instant::now();
-    }
-
-    /// Heal orphaned tasks so their status stays honest. Both cases below are flipped
-    /// back to `Idle` (and any dead pane cleared):
-    /// - a task whose agent pane has vanished (finished/died while we weren't looking);
-    /// - a `Working` task that never got a pane (its `wezterm spawn` failed).
-    fn reconcile_panes(&self, panes: &[wezterm::Pane]) {
-        let alive: std::collections::HashSet<u64> = panes.iter().map(|p| p.pane_id).collect();
-        for t in &self.tasks {
-            match t.pane_id {
-                Some(p) if !alive.contains(&p) => {
-                    let _ = self.store.set_pane(t.id, None);
-                    let _ = self.store.update_status(t.id, TaskStatus::Idle);
-                }
-                None if matches!(t.status, TaskStatus::Working | TaskStatus::NeedsInput) => {
-                    // Working/NeedsInput imply a running agent, but there's no pane —
-                    // a failed spawn. Park it as Idle.
-                    let _ = self.store.update_status(t.id, TaskStatus::Idle);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// Derive which agent pane (if any) is currently docked beside faff: a known task
-    /// pane that shares faff's WezTerm tab (that is how `open_beside` docks it). This
-    /// lets faff recover the docked session after a restart — when `open_pane` starts
-    /// `None` — instead of treating Enter as a fresh open and spawning a duplicate
-    /// split. An agent detached to its own tab, or a non-agent pane, is not "open".
-    fn detect_open_pane(&self, panes: &[wezterm::Pane]) -> Option<u64> {
-        let faff = self.faff_pane?;
-        let faff_tab = panes.iter().find(|p| p.pane_id == faff)?.tab_id;
-        let agent_panes: std::collections::HashSet<u64> =
-            self.tasks.iter().filter_map(|t| t.pane_id).collect();
-        panes
-            .iter()
-            .find(|p| p.tab_id == faff_tab && p.pane_id != faff && agent_panes.contains(&p.pane_id))
-            .map(|p| p.pane_id)
-    }
-
-    /// Drop tasks whose jj workspace has vanished (integrated + cleaned, or forgotten
-    /// outside faff): the workspace is gone, so the task is done — remove it. Keeps the
-    /// active list honest. Only runs with an authoritative workspace list.
-    fn reconcile_workspaces(&self, workspaces: &[jj::Workspace]) {
-        let live: std::collections::HashSet<&str> =
-            workspaces.iter().map(|w| w.name.as_str()).collect();
-        for t in &self.tasks {
-            if let Some(name) = &t.ws_name
-                && !live.contains(name.as_str())
-            {
-                if let Some(p) = &t.ws_path {
-                    let _ = std::fs::remove_dir_all(p); // best-effort dir cleanup
-                }
-                let _ = self.store.delete_task(t.id);
-            }
-        }
-    }
-
-    /// faff-owned jj workspaces (`faf-task-<id>`) that no task row claims — ghosts left by
-    /// a remove or swap that didn't fully unregister. A workspace is a ghost only when the
-    /// store has **no task row for its id** (`faf-task-<id>` ↔ task `<id>` is fixed; see
-    /// `prepare_workspace`).
-    ///
-    /// This keys on row existence, not on the task's `ws_name` — and that is what makes it
-    /// safe against a *concurrent* faff instance mid-create. `create_task` commits the row
-    /// *before* `jj workspace add` registers the workspace, whereas `ws_name` is written
-    /// only *after* the add. So a sibling instance that keyed on `ws_name` would forget an
-    /// in-flight workspace whose task is perfectly live (the bug: "workspace … missing
-    /// after add"). The store is read fresh here rather than from `self.tasks`: `self.tasks`
-    /// is snapshotted at the top of `refresh`, possibly before the sibling committed its
-    /// row, whereas a read *now* is necessarily after we listed the workspace — hence after
-    /// its row was committed. Pure w.r.t. jj: returns names to forget, no side effects.
-    fn orphaned_workspaces(&self, workspaces: &[jj::Workspace]) -> Vec<String> {
-        let live: std::collections::HashSet<i64> = self
-            .store
-            .list_tasks()
-            .unwrap_or_default()
-            .iter()
-            .map(|t| t.id.0)
-            .collect();
-        workspaces
-            .iter()
-            .filter_map(|w| {
-                // Only faff-owned names with a numeric id; anything else is left alone.
-                let id: i64 = w.name.strip_prefix("faf-task-")?.parse().ok()?;
-                (!live.contains(&id)).then(|| w.name.clone())
-            })
-            .collect()
-    }
-
-    /// Forget the ghost workspaces `orphaned_workspaces` finds, so a future task's id and
-    /// its `faf-task-<id>` name can never collide with a stale registration on `n`.
-    /// Returns the names forgotten so the caller can drop them from this cycle's graph.
-    /// Best-effort: a forget that fails is retried next refresh.
-    fn reconcile_orphan_workspaces(&self, workspaces: &[jj::Workspace]) -> Vec<String> {
-        let orphans = self.orphaned_workspaces(workspaces);
-        for name in &orphans {
-            let _ = jj::workspace_forget(&self.repo, name);
-        }
-        orphans
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn build_rows(
-        &self,
-        workspaces: &[jj::Workspace],
-    ) -> Result<(
-        Vec<GraphRow>,
-        Vec<Option<TaskId>>,
-        std::collections::HashMap<String, (String, String)>,
-        Option<String>,
-    )> {
-        let revset = jj::workspace_ancestors_revset(workspaces, 25);
-        let mut revs = jj::log(&self.repo, &revset)?;
-        // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
-        // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
-        model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
-        // change_id -> (unique prefix, padding rest) for the id column.
-        let id_display = revs
-            .iter()
-            .map(|r| {
-                (
-                    r.change_id.clone(),
-                    (r.id_prefix.clone(), r.id_rest.clone()),
-                )
-            })
-            .collect();
-        let m = model::build(&revs, workspaces, &self.tasks);
-        let rows = graph::render(&m.nodes);
-        // task_of is parallel to rows: which task (if any) each row represents. For the
-        // combined HEAD+agent node this hangs on the agent line, not the HEAD header.
-        let task_of = model::row_tasks(&rows, &m.nodes, &m.task_of);
-        Ok((rows, task_of, id_display, m.fork_point))
+        self.send("aborting the merge train", Cmd::AbortTrain);
     }
 
     // ---- rendering ----
@@ -1584,23 +758,24 @@ impl App {
     /// row when present), capped so it never dominates the screen. Zero — panel not drawn —
     /// when the train is empty.
     fn merge_train_height(&self) -> u16 {
-        if self.merge_train.is_empty() {
+        if self.view.merge_train.is_empty() {
             return 0;
         }
-        let note = u16::from(!self.merge_train.note.is_empty());
-        (self.merge_train.members.len() as u16 + note + 1).min(12)
+        let note = u16::from(!self.view.merge_train.note.is_empty());
+        (self.view.merge_train.members.len() as u16 + note + 1).min(12)
     }
 
     fn render_merge_train(&self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
-        if !self.merge_train.note.is_empty() {
+        if !self.view.merge_train.note.is_empty() {
             lines.push(Line::from(Span::styled(
-                format!(" {}", self.merge_train.note),
+                format!(" {}", self.view.merge_train.note),
                 Style::default().fg(Color::Yellow),
             )));
         }
-        for m in &self.merge_train.members {
+        for m in &self.view.merge_train.members {
             let label = self
+                .view
                 .tasks
                 .iter()
                 .find(|t| t.id == m.task)
@@ -1628,6 +803,7 @@ impl App {
 
     fn render_header(&self, f: &mut Frame, area: Rect) {
         let working = self
+            .view
             .tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Working)
@@ -1636,8 +812,15 @@ impl App {
             Some(id) => format!(" · ▶ #{}", id.0),
             None => String::new(),
         };
+        // What the engine is busy with, so a slow create or remove reads as progress
+        // rather than as a dead key.
+        let busy = match (self.in_flight.front(), self.in_flight.len()) {
+            (None, _) => String::new(),
+            (Some(doing), 1) => format!(" · ⋯ {doing}"),
+            (Some(doing), n) => format!(" · ⋯ {doing} (+{})", n - 1),
+        };
         let text = format!(
-            " faff · {} · {working} working{session} ",
+            " faff · {} · {working} working{session}{busy} ",
             self.repo
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -1657,13 +840,13 @@ impl App {
     }
 
     fn render_graph(&self, f: &mut Frame, area: Rect) {
-        let selected = self.task_order.get(self.selected).copied();
+        let selected = self.view.task_order.get(self.selected).copied();
         let open = self.open_task_id();
         // Text width inside the block (its RIGHT border takes one column). Labels are
         // clipped to fit this — and only when they overflow — so the log fills the pane
         // and re-fits whenever docking/detaching a session resizes faff.
         let text_w = area.width.saturating_sub(1) as usize;
-        let mut lines: Vec<Line> = Vec::with_capacity(self.rows.len());
+        let mut lines: Vec<Line> = Vec::with_capacity(self.view.rows.len());
         // Width of the "[abcdefgh] " id column, so continuation lines align under content.
         let id_col = ID_W + 3;
         // Pad every gutter to one uniform width so the [id] column and description line up
@@ -1673,6 +856,7 @@ impl App {
         // was previously appended per-row is folded into this width. (Gutter cells are all
         // single-column box-drawing chars, so char count is the display width.)
         let gutter_w = self
+            .view
             .rows
             .iter()
             .map(|r| r.gutter.chars().count())
@@ -1683,14 +867,14 @@ impl App {
         // can be greened. A combined HEAD+agent node hangs its task on a continuation line
         // below the bracketed HEAD row, so attribute each row to the nearest node row at
         // or above it — the one whose id is shown.
-        let mut node_is_docked = vec![false; self.rows.len()];
+        let mut node_is_docked = vec![false; self.view.rows.len()];
         if let Some(open_id) = open {
             let mut last_node: Option<usize> = None;
-            for (i, row) in self.rows.iter().enumerate() {
+            for (i, row) in self.view.rows.iter().enumerate() {
                 if row.change_id.is_some() {
                     last_node = Some(i);
                 }
-                if self.task_of_node.get(i).copied().flatten() == Some(open_id)
+                if self.view.task_of_node.get(i).copied().flatten() == Some(open_id)
                     && let Some(n) = last_node
                 {
                     node_is_docked[n] = true;
@@ -1702,10 +886,10 @@ impl App {
         let mark = |sel: &mut Option<(usize, usize)>, at: usize| {
             *sel = Some(sel.map_or((at, at), |(a, _)| (a, at)));
         };
-        for (i, row) in self.rows.iter().enumerate() {
-            let row_task = self.task_of_node.get(i).copied().flatten();
+        for (i, row) in self.view.rows.iter().enumerate() {
+            let row_task = self.view.task_of_node.get(i).copied().flatten();
             let row_status =
-                row_task.and_then(|id| self.tasks.iter().find(|t| t.id == id).map(|t| t.status));
+                row_task.and_then(|id| self.view.tasks.iter().find(|t| t.id == id).map(|t| t.status));
             let is_sel = selected.is_some() && row_task == selected;
             let base = if is_sel {
                 Style::default().add_modifier(Modifier::REVERSED)
@@ -1721,7 +905,7 @@ impl App {
                     // branch from — is a cyan `◆`, or a cyan `@` when it coincides with the
                     // working copy; a non-fork working-copy `@` is green, like jj log.
                     let gutter = format!("{:<gutter_w$}", row.gutter);
-                    let is_fork = self.fork_point.as_deref() == Some(cid.as_str());
+                    let is_fork = self.view.fork_point.as_deref() == Some(cid.as_str());
                     let highlight = if is_fork {
                         gutter
                             .find('◆')
@@ -1743,6 +927,7 @@ impl App {
                         None => spans.push(Span::styled(gutter, base)),
                     }
                     let (prefix, rest) = self
+                        .view
                         .id_display
                         .get(cid)
                         .cloned()
@@ -1804,13 +989,13 @@ impl App {
         }
         // Detached tasks (workspace inlined into HEAD, or a stale row) have no
         // distinct node — list them below so they stay visible and selectable.
-        if !self.detached.is_empty() {
+        if !self.view.detached.is_empty() {
             lines.push(Line::from(Span::styled(
                 "── detached (integrated / no node) ──",
                 Style::default().fg(Color::DarkGray),
             )));
-            for id in &self.detached {
-                if let Some(t) = self.tasks.iter().find(|t| &t.id == id) {
+            for id in &self.view.detached {
+                if let Some(t) = self.view.tasks.iter().find(|t| &t.id == id) {
                     let (icon, _) = model::status_label(t.status);
                     let docked = open == Some(*id);
                     let style = if selected == Some(*id) {
@@ -1933,8 +1118,8 @@ impl App {
         Caps {
             has_ws: t.as_ref().is_some_and(|t| t.ws_path.is_some()),
             has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
-            train: !self.merge_train.is_empty(),
-            revivable: t.as_ref().is_some_and(|t| self.task_revivable(t)),
+            train: !self.view.merge_train.is_empty(),
+            revivable: t.as_ref().is_some_and(|t| self.view.revivable.contains(&t.id)),
         }
     }
 
@@ -1956,11 +1141,17 @@ impl App {
     fn enter_hint(&self) -> &'static str {
         let selected = self.selected_task();
         let selected_pane = selected.as_ref().and_then(|t| t.pane_id);
-        if self.open_pane.is_some() && self.open_pane == selected_pane {
+        if self.view.open_pane.is_some() && self.view.open_pane == selected_pane {
             "detach"
-        } else if selected.as_ref().is_some_and(|t| self.task_resumable(t)) {
+        } else if selected
+            .as_ref()
+            .is_some_and(|t| self.view.resumable.contains(&t.id))
+        {
             "revive"
-        } else if selected.as_ref().is_some_and(|t| self.task_revivable(t)) {
+        } else if selected
+            .as_ref()
+            .is_some_and(|t| self.view.revivable.contains(&t.id))
+        {
             "start"
         } else {
             "open"
@@ -2189,40 +1380,37 @@ fn push_row_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Autonomy;
+    use crate::graph;
+    use crate::store::Store;
     use ratatui::backend::TestBackend;
 
     // Build a minimal App with an in-memory store (no jj/wezterm needed).
+    // Build a minimal App with no engine behind it (no jj/wezterm needed). The command
+    // receiver is dropped; tests that check what was sent use `test_app_with_engine_rx`.
     fn test_app() -> App {
-        let (_ev_tx, events_rx) = std::sync::mpsc::channel();
-        App {
+        test_app_with_engine_rx().0
+    }
+
+    fn test_app_with_engine_rx() -> (App, Receiver<Cmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_msg_tx, msg_rx) = mpsc::channel();
+        let app = App {
             repo: PathBuf::from("/tmp/repo"),
-            faff_exe: PathBuf::from("/bin/faff"),
-            socket: PathBuf::from("/tmp/faf.sock"),
-            db: PathBuf::from("/tmp/faf.db"),
-            store: Store::open_memory().unwrap(),
-            claude_projects: PathBuf::from("/nope/projects"),
-            events_rx,
-            faff_pane: Some(1),
-            tasks: Vec::new(),
-            rows: Vec::new(),
-            task_of_node: Vec::new(),
-            fork_point: None,
-            task_order: Vec::new(),
-            detached: Vec::new(),
+            view: View::default(),
+            cmd_tx,
+            msg_rx,
+            in_flight: VecDeque::new(),
             selected: 0,
-            open_pane: None,
-            id_display: std::collections::HashMap::new(),
             notices: notify::Notices::default(),
             overlay: Overlay::None,
             should_quit: false,
-            pending_refresh: false,
+            quit_now: false,
             pending_swap: None,
             pending_rebase: None,
             pending_describe: None,
-            pending_select: None,
-            merge_train: train::Train::default(),
-            last_refresh: Instant::now(),
-        }
+        };
+        (app, cmd_rx)
     }
 
     /// The rendered buffer as newline-joined rows, for substring assertions.
@@ -2358,7 +1546,7 @@ mod tests {
         // `docked_node_app` sets up the graph rows but not the selection (its other
         // callers read `task_of_node`), and the ↵ label keys off the *selected* task.
         let select = |app: &mut App, id: TaskId| {
-            app.task_order = vec![id];
+            app.view.task_order = vec![id];
             app.selected = 0;
         };
         let (mut app, id) = docked_node_app(true);
@@ -2374,10 +1562,11 @@ mod tests {
     #[test]
     fn keys_are_dimmed_when_unavailable_for_the_selected_row() {
         // A task with no workspace: `s`/`S` are dimmed, `n` is not.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
         let c = app.caps();
         assert!(!c.has_ws, "fixture has no workspace");
@@ -2477,9 +1666,10 @@ mod tests {
     fn an_armed_confirmation_still_swallows_the_bang_key() {
         // Pre-existing contract: while a swap is armed, any non-`s` key cancels. `!`
         // must cancel, not open the log over a live confirmation.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2488,9 +1678,9 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.swap_selected();
@@ -2520,9 +1710,10 @@ mod tests {
     fn swap_on_working_agent_arms_then_cancels() {
         // `s` on a working agent must not shell out to jj; it only arms a confirmation.
         // A non-`s` key then cancels and clears the pending state.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2531,9 +1722,9 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.swap_selected();
@@ -2558,9 +1749,10 @@ mod tests {
     fn rebase_on_working_agent_arms_then_cancels() {
         // `r` on a working agent must not send anything; it only arms a confirmation.
         // A non-matching key then cancels and clears the pending state.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2569,10 +1761,10 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.set_pane(t.id, Some(42)).unwrap();
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.rebase_selected(true);
@@ -2596,9 +1788,10 @@ mod tests {
     #[test]
     fn rebase_before_first_prompt_is_allowed() {
         // `r`/`R` needs no prompt of its own: on a working agent it arms the confirmation.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2607,10 +1800,10 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.set_pane(t.id, Some(42)).unwrap();
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.rebase_selected(true);
@@ -2621,9 +1814,10 @@ mod tests {
     fn describe_on_working_agent_arms_then_cancels() {
         // `d` on a working agent must not send anything; it only arms a confirmation.
         // A non-`d` key then cancels and clears the pending state.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2632,10 +1826,10 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.set_pane(t.id, Some(42)).unwrap();
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.describe_selected();
@@ -2660,9 +1854,10 @@ mod tests {
     fn describe_before_first_prompt_is_allowed() {
         // The scheduler never captures the describe prompt as the task's title, so `d`
         // needs no prompt of its own: on a working agent it arms the confirmation.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2671,10 +1866,10 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.store.update_status(t.id, TaskStatus::Working).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.set_pane(t.id, Some(42)).unwrap();
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.describe_selected();
@@ -2684,8 +1879,9 @@ mod tests {
     // Build a selectable task with a workspace + pane + prompt (the accept happy-path
     // prerequisites bar the jj checks, which need a real repo).
     fn task_with_pane(app: &mut App, prompt: &str) -> TaskId {
-        let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
-        app.store
+        let store = Store::open_memory().unwrap();
+        let t = store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2694,9 +1890,9 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        store.set_pane(t.id, Some(42)).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
         t.id
     }
@@ -2704,9 +1900,10 @@ mod tests {
     #[test]
     fn accept_without_pane_is_blocked() {
         // No live pane means the train can't drive the agent (describe/rebase prompts).
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("do x", 0, Autonomy::Inherit).unwrap();
-        app.store
+        let t = store.create_task("do x", 0, Autonomy::Inherit).unwrap();
+        store
             .set_workspace(
                 t.id,
                 "faf-task-1",
@@ -2715,48 +1912,15 @@ mod tests {
                 "f1",
             )
             .unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         app.accept_selected();
-        assert!(app.merge_train.is_empty());
+        assert!(app.view.merge_train.is_empty());
         let (level, text) = latest(&app);
         assert_eq!(level, notify::Level::Warn, "refused, not failed: {text}");
         assert!(text.contains("no live pane"), "notice: {text}");
-    }
-
-    #[test]
-    fn accept_toggles_a_queued_task_back_out() {
-        // Pressing `a` on a task already in the train removes it (no jj needed on this path).
-        let mut app = test_app();
-        let id = task_with_pane(&mut app, "do x");
-        app.merge_train.add(id);
-        assert!(app.merge_train.contains(id));
-
-        app.accept_selected();
-        assert!(!app.merge_train.contains(id), "second a dequeues it");
-        let (level, text) = latest(&app);
-        assert_eq!(level, notify::Level::Success);
-        assert!(text.contains("removed from the merge train"));
-    }
-
-    #[test]
-    fn abort_train_clears_all_and_reports() {
-        let mut app = test_app();
-        app.abort_train();
-        assert_eq!(
-            latest(&app),
-            (notify::Level::Warn, "no merge train to abort".to_string())
-        );
-
-        app.merge_train.add(TaskId(1));
-        app.merge_train.add(TaskId(2));
-        app.abort_train();
-        assert!(app.merge_train.is_empty());
-        let (level, text) = latest(&app);
-        assert_eq!(level, notify::Level::Success);
-        assert!(text.contains("aborted"), "notice: {text}");
     }
 
     #[test]
@@ -2769,11 +1933,11 @@ mod tests {
         );
 
         let id = task_with_pane(&mut app, "Convert bridges to JSON");
-        app.merge_train.add(id);
-        if let Some(m) = app.merge_train.member_mut(id) {
+        app.view.merge_train.add(id);
+        if let Some(m) = app.view.merge_train.member_mut(id) {
             m.stage = train::Stage::Rebasing;
         }
-        app.merge_train.note = "paused — your @ has content".into();
+        app.view.merge_train.note = "paused — your @ has content".into();
         // title/border + note + one member = 3 rows.
         assert_eq!(app.merge_train_height(), 3);
 
@@ -2783,56 +1947,11 @@ mod tests {
     }
 
     #[test]
-    fn new_task_selection_lands_on_new_row() {
-        // Hitting `n`/`N` arms `pending_select` with the fresh task's id; the refresh that
-        // follows must move the highlight onto that new row, not keep it on whatever was
-        // selected before.
-        let mut app = test_app();
-        let a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
-        app.refresh();
-        app.selected = app.task_order.iter().position(|x| *x == a.id).unwrap();
-
-        // A new task is created and armed, mirroring what `new_task`/`handoff_task` do
-        // just before calling refresh.
-        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
-        app.pending_select = Some(b.id);
-        app.refresh();
-
-        assert_eq!(
-            app.task_order.get(app.selected).copied(),
-            Some(b.id),
-            "hitting new highlights the newly added row"
-        );
-        assert_eq!(
-            app.pending_select, None,
-            "pending_select is consumed by refresh"
-        );
-    }
-
-    #[test]
-    fn refresh_without_pending_select_preserves_selection() {
-        // Absent a fresh-task arming, refresh keeps the prior selection by identity — the
-        // behavior `pending_select` must not disturb.
-        let mut app = test_app();
-        let _a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
-        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
-        app.refresh();
-        app.selected = app.task_order.iter().position(|x| *x == b.id).unwrap();
-
-        app.refresh();
-
-        assert_eq!(
-            app.task_order.get(app.selected).copied(),
-            Some(b.id),
-            "refresh keeps the prior selection by identity"
-        );
-    }
-
-    #[test]
     fn header_notice_and_keys_render_without_panicking() {
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        app.tasks = vec![
-            app.store
+        app.view.tasks = vec![
+            store
                 .create_task("do a thing", 0, Autonomy::AcceptEdits)
                 .unwrap(),
         ];
@@ -2843,65 +1962,16 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_heals_orphaned_panes_to_idle() {
-        let app = test_app();
-        // Task A: Working with a pane that is still alive.
-        let a = app
-            .store
-            .create_task("a", 0, Autonomy::AcceptEdits)
-            .unwrap();
-        app.store.set_pane(a.id, Some(10)).unwrap();
-        app.store.update_status(a.id, TaskStatus::Working).unwrap();
-        // Task B: Working with a pane that has vanished.
-        let b = app
-            .store
-            .create_task("b", 0, Autonomy::AcceptEdits)
-            .unwrap();
-        app.store.set_pane(b.id, Some(99)).unwrap();
-        app.store.update_status(b.id, TaskStatus::Working).unwrap();
-        // Task C: Working but never got a pane (a failed spawn).
-        let c = app
-            .store
-            .create_task("c", 0, Autonomy::AcceptEdits)
-            .unwrap();
-        app.store.update_status(c.id, TaskStatus::Working).unwrap();
-
-        let mut app = app;
-        app.tasks = app.store.list_tasks().unwrap();
-
-        // Only pane 10 is alive.
-        let panes = vec![wezterm::Pane {
-            window_id: 1,
-            tab_id: 1,
-            pane_id: 10,
-            workspace: String::new(),
-            title: String::new(),
-            cwd: String::new(),
-        }];
-        app.reconcile_panes(&panes);
-
-        // A stays Working (pane alive); B healed (dead pane); C healed (no pane).
-        assert_eq!(
-            app.store.get_task(a.id).unwrap().status,
-            TaskStatus::Working
-        );
-        let b2 = app.store.get_task(b.id).unwrap();
-        assert_eq!(b2.status, TaskStatus::Idle);
-        assert_eq!(b2.pane_id, None);
-        assert_eq!(app.store.get_task(c.id).unwrap().status, TaskStatus::Idle);
-    }
-
-    #[test]
     fn graph_renders_id_column_with_prefix() {
         let mut app = test_app();
-        app.rows = vec![graph::GraphRow {
+        app.view.rows = vec![graph::GraphRow {
             gutter: "@".into(),
             content: "(no description set)".into(),
             node_index: Some(0),
             change_id: Some("abcd1234efgh".into()),
         }];
-        app.task_of_node = vec![None];
-        app.id_display = std::collections::HashMap::from([(
+        app.view.task_of_node = vec![None];
+        app.view.id_display = std::collections::HashMap::from([(
             "abcd1234efgh".to_string(),
             ("ab".to_string(), "cd1234".to_string()),
         )]);
@@ -2936,7 +2006,7 @@ mod tests {
         // The fork-point node carries a ◆; the view tints it cyan. A non-fork `@` on
         // another row stays green.
         let mut app = test_app();
-        app.rows = vec![
+        app.view.rows = vec![
             graph::GraphRow {
                 gutter: "@".into(),
                 content: "(no description set)".into(),
@@ -2950,8 +2020,8 @@ mod tests {
                 change_id: Some("basebase".into()),
             },
         ];
-        app.task_of_node = vec![None, None];
-        app.id_display = std::collections::HashMap::from([
+        app.view.task_of_node = vec![None, None];
+        app.view.id_display = std::collections::HashMap::from([
             (
                 "wcwcwcwc".to_string(),
                 ("wcwcwcwc".to_string(), String::new()),
@@ -2961,7 +2031,7 @@ mod tests {
                 ("basebase".to_string(), String::new()),
             ),
         ]);
-        app.fork_point = Some("basebase".to_string());
+        app.view.fork_point = Some("basebase".to_string());
 
         let backend = TestBackend::new(80, 10);
         let mut term = Terminal::new(backend).unwrap();
@@ -2985,18 +2055,18 @@ mod tests {
     fn graph_tints_working_copy_cyan_when_it_is_the_fork_point() {
         // @ itself is the fork point: keep the @ glyph but tint it cyan, not green.
         let mut app = test_app();
-        app.rows = vec![graph::GraphRow {
+        app.view.rows = vec![graph::GraphRow {
             gutter: "@".into(),
             content: "my work".into(),
             node_index: Some(0),
             change_id: Some("wcwcwcwc".into()),
         }];
-        app.task_of_node = vec![None];
-        app.id_display = std::collections::HashMap::from([(
+        app.view.task_of_node = vec![None];
+        app.view.id_display = std::collections::HashMap::from([(
             "wcwcwcwc".to_string(),
             ("wcwcwcwc".to_string(), String::new()),
         )]);
-        app.fork_point = Some("wcwcwcwc".to_string());
+        app.view.fork_point = Some("wcwcwcwc".to_string());
 
         let backend = TestBackend::new(80, 10);
         let mut term = Terminal::new(backend).unwrap();
@@ -3020,7 +2090,7 @@ mod tests {
         //   • agent stub    `├─●`
         // Every `[id]` must start at the same x regardless.
         let mut app = test_app();
-        app.rows = vec![
+        app.view.rows = vec![
             graph::GraphRow {
                 gutter: "◻".into(),
                 content: "trunk work".into(),
@@ -3040,8 +2110,8 @@ mod tests {
                 change_id: Some("cccccccc".into()),
             },
         ];
-        app.task_of_node = vec![None, None, None];
-        app.id_display = std::collections::HashMap::from([
+        app.view.task_of_node = vec![None, None, None];
+        app.view.id_display = std::collections::HashMap::from([
             (
                 "aaaaaaaa".to_string(),
                 ("aaaaaaaa".to_string(), String::new()),
@@ -3091,20 +2161,21 @@ mod tests {
 
     // A one-row graph whose single node's session is docked beside faff.
     fn docked_node_app(open: bool) -> (App, TaskId) {
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store.set_pane(t.id, Some(77)).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = if open { Some(77) } else { None };
-        app.rows = vec![graph::GraphRow {
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store.set_pane(t.id, Some(77)).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.open_pane = if open { Some(77) } else { None };
+        app.view.rows = vec![graph::GraphRow {
             gutter: "@".into(),
             content: format!("#{} x", t.id.0),
             node_index: Some(0),
             change_id: Some("abcd1234".into()),
         }];
-        app.task_of_node = vec![Some(t.id)];
+        app.view.task_of_node = vec![Some(t.id)];
         // `ab` is the unique prefix; `cd1234` the rest of the id after it.
-        app.id_display = std::collections::HashMap::from([(
+        app.view.id_display = std::collections::HashMap::from([(
             "abcd1234".to_string(),
             ("ab".to_string(), "cd1234".to_string()),
         )]);
@@ -3124,7 +2195,7 @@ mod tests {
         // select a task, then dock it). A naive green foreground on the REVERSED selection
         // style would swap fg/bg and paint the cell background green, not the id glyphs;
         // the id must stay green *glyphs*.
-        app.task_order = vec![tid];
+        app.view.task_order = vec![tid];
         app.selected = 0;
 
         let (w, h) = (90usize, 10usize);
@@ -3196,12 +2267,13 @@ mod tests {
         // (its description) and the agent hangs beneath. row_tasks hangs the task on the
         // agent line, so the docked indicator is the HEAD row's green id above it —
         // never a trailing marker on the agent line.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store.set_pane(t.id, Some(55)).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = Some(55); // the agent is docked beside faff
-        app.rows = vec![
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store.set_pane(t.id, Some(55)).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.open_pane = Some(55); // the agent is docked beside faff
+        app.view.rows = vec![
             graph::GraphRow {
                 gutter: "@".into(),
                 content: "(no description set)".into(),
@@ -3222,8 +2294,8 @@ mod tests {
             },
         ];
         // What model::row_tasks produces for a combined node: task on the agent line.
-        app.task_of_node = vec![None, Some(t.id), None];
-        app.task_order = vec![t.id];
+        app.view.task_of_node = vec![None, Some(t.id), None];
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         let (w, h) = (60usize, 12usize);
@@ -3271,6 +2343,7 @@ mod tests {
         // The status glyphs are plain one-column marks, so colour is what separates the
         // three modes: blue working, bold magenta needs-you, green review-ready. Each must
         // land on the glyph cell alone — the `#id` and the title stay uncoloured.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
         let mut ids = vec![];
         for (prompt, status) in [
@@ -3278,12 +2351,12 @@ mod tests {
             ("oauth", TaskStatus::NeedsInput),
             ("cleanup", TaskStatus::Idle),
         ] {
-            let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
-            app.store.update_status(t.id, status).unwrap();
+            let t = store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
+            store.update_status(t.id, status).unwrap();
             ids.push(t.id);
         }
-        app.tasks = app.store.list_tasks().unwrap();
-        app.rows = vec![
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.rows = vec![
             graph::GraphRow {
                 gutter: "├─●".into(),
                 content: "#1 ⚙ :: migrate".into(),
@@ -3303,8 +2376,8 @@ mod tests {
                 change_id: Some("cccccccc".into()),
             },
         ];
-        app.task_of_node = ids.iter().copied().map(Some).collect();
-        app.id_display = std::collections::HashMap::from([
+        app.view.task_of_node = ids.iter().copied().map(Some).collect();
+        app.view.id_display = std::collections::HashMap::from([
             (
                 "aaaaaaaa".to_string(),
                 ("aaaaaaaa".to_string(), String::new()),
@@ -3360,14 +2433,14 @@ mod tests {
         // A plain description has no status field. Anchoring on ` :: ` must not invent one
         // — the row renders exactly as it did before colour existed.
         let mut app = test_app();
-        app.rows = vec![graph::GraphRow {
+        app.view.rows = vec![graph::GraphRow {
             gutter: "◻".into(),
             content: "spawn: declare! child-class refs".into(),
             node_index: Some(0),
             change_id: Some("aaaaaaaa".into()),
         }];
-        app.task_of_node = vec![None];
-        app.id_display = std::collections::HashMap::from([(
+        app.view.task_of_node = vec![None];
+        app.view.id_display = std::collections::HashMap::from([(
             "aaaaaaaa".to_string(),
             ("aaaaaaaa".to_string(), String::new()),
         )]);
@@ -3391,18 +2464,18 @@ mod tests {
         // A detached (integrated / no-node) task has no revision brackets, so when its
         // session is docked the `#N` id is greened instead — still a left-anchored
         // indicator that a truncated description can never push off screen.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app
-            .store
+        let t = store
             .create_task("cleanup", 0, Autonomy::Inherit)
             .unwrap();
-        app.store.set_pane(t.id, Some(88)).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.open_pane = Some(88); // docked, but this task has no graph node
-        app.detached = vec![t.id];
+        store.set_pane(t.id, Some(88)).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.open_pane = Some(88); // docked, but this task has no graph node
+        app.view.detached = vec![t.id];
         // ...and it is the highlighted (selected) row too, so the green prefix must be a
         // glyph colour, not a REVERSED swap that would paint the cell background green.
-        app.task_order = vec![t.id];
+        app.view.task_order = vec![t.id];
         app.selected = 0;
 
         let (w, h) = (60usize, 8usize);
@@ -3436,301 +2509,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_docked_agent_pane_after_restart() {
-        fn pane(tab: u64, id: u64, title: &str) -> wezterm::Pane {
-            wezterm::Pane {
-                window_id: 1,
-                tab_id: tab,
-                pane_id: id,
-                workspace: String::new(),
-                title: title.into(),
-                cwd: String::new(),
-            }
-        }
-
-        let mut app = test_app(); // faff_pane = Some(1), open_pane = None (fresh start)
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.store.set_pane(t.id, Some(42)).unwrap(); // persisted across the restart
-        app.tasks = app.store.list_tasks().unwrap();
-
-        // Agent docked in faff's tab (7) -> recovered as the open session.
-        let docked = vec![
-            pane(7, 1, "faff"),
-            pane(7, 42, "#1 x"),
-            pane(9, 99, "unrelated other-tab pane"),
-        ];
-        assert_eq!(app.detect_open_pane(&docked), Some(42));
-
-        // Agent detached to its own tab (8) -> nothing docked.
-        let detached = vec![pane(7, 1, "faff"), pane(8, 42, "#1 x")];
-        assert_eq!(app.detect_open_pane(&detached), None);
-
-        // A non-agent pane sharing faff's tab is ignored (not a known task pane).
-        let stray = vec![pane(7, 1, "faff"), pane(7, 500, "a shell")];
-        assert_eq!(app.detect_open_pane(&stray), None);
-    }
-
-    #[test]
-    fn reconcile_workspaces_removes_only_gone_ones() {
-        use std::path::Path;
-        let app = test_app();
-        // Task A: workspace still present in jj.
-        let a = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
-        app.store
-            .set_workspace(a.id, "faf-task-1", Path::new("/nope/1"), "c1", "f1")
-            .unwrap();
-        // Task B: workspace gone (forgotten externally / integrated + cleaned).
-        let b = app.store.create_task("b", 0, Autonomy::Inherit).unwrap();
-        app.store
-            .set_workspace(b.id, "faf-task-2", Path::new("/nope/2"), "c2", "f2")
-            .unwrap();
-        let mut app = app;
-        app.tasks = app.store.list_tasks().unwrap();
-
-        let live = vec![
-            jj::Workspace {
-                name: "default".into(),
-                change_id: "x".into(),
-            },
-            jj::Workspace {
-                name: "faf-task-1".into(),
-                change_id: "y".into(),
-            },
-        ];
-        app.reconcile_workspaces(&live);
-
-        // Present workspace stays; vanished workspace's task is dropped entirely.
-        assert!(app.store.try_get_task(a.id).unwrap().is_some());
-        assert!(app.store.try_get_task(b.id).unwrap().is_none());
-    }
-
-    #[test]
-    fn orphaned_workspaces_flags_only_untracked_faff_workspaces() {
-        use std::path::Path;
-        let app = test_app();
-        // A live task; its workspace is `faf-task-<id>` (the invariant prepare_workspace holds).
-        let t = app.store.create_task("a", 0, Autonomy::Inherit).unwrap();
-        let tracked = format!("faf-task-{}", t.id.0);
-        app.store
-            .set_workspace(t.id, &tracked, Path::new("/nope"), "c", "f")
-            .unwrap();
-        let mut app = app;
-        app.tasks = app.store.list_tasks().unwrap();
-
-        // A ghost id with no task row (well past the allocated id).
-        let ghost = format!("faf-task-{}", t.id.0 + 1000);
-        let live = vec![
-            // The default workspace is never faff-owned — must be left alone.
-            jj::Workspace {
-                name: "default".into(),
-                change_id: "x".into(),
-            },
-            // Tracked by task `t` — must be kept.
-            jj::Workspace {
-                name: tracked.clone(),
-                change_id: "y".into(),
-            },
-            // A faff workspace with no DB row — a ghost to forget.
-            jj::Workspace {
-                name: ghost.clone(),
-                change_id: "z".into(),
-            },
-        ];
-
-        assert_eq!(app.orphaned_workspaces(&live), vec![ghost]);
-    }
-
-    #[test]
-    fn orphaned_workspaces_keeps_row_created_before_ws_name_set() {
-        // Regression (concurrent-instance race): `create_task` commits the task row
-        // *before* `jj workspace add` registers the workspace and *before* `set_workspace`
-        // records its `ws_name`. A sibling faff instance whose refresh lands in that window
-        // must NOT forget the in-flight workspace. Keying on row existence (not `ws_name`)
-        // is what makes the reaper safe here.
-        let app = test_app();
-        let t = app
-            .store
-            .create_task("mid-create", 0, Autonomy::Inherit)
-            .unwrap();
-        // ws_name deliberately left unset, mirroring the window inside prepare_workspace.
-        let live = vec![jj::Workspace {
-            name: format!("faf-task-{}", t.id.0),
-            change_id: "z".into(),
-        }];
-        assert!(app.orphaned_workspaces(&live).is_empty());
-    }
-
-    // ---- recreating lost instances ----
-
-    /// An app whose Claude project root is a scratch dir, so transcript presence
-    /// (the thing that decides fresh-vs-resume) is controllable in a test.
-    fn app_with_projects(dir: &std::path::Path) -> App {
-        let mut app = test_app();
-        app.claude_projects = dir.to_path_buf();
-        app
-    }
-
-    /// A task with a workspace but no pane — the shape faff is left with after an
-    /// agent's pane dies. Returns the task and its minted session id.
-    fn lost_task(app: &mut App, ws: &std::path::Path) -> (Task, String) {
-        lost_task_with(app, ws, "do the thing")
-    }
-
-    fn lost_task_with(app: &mut App, ws: &std::path::Path, prompt: &str) -> (Task, String) {
-        let t = app.store.create_task(prompt, 0, Autonomy::Inherit).unwrap();
-        app.store
-            .set_workspace(t.id, "faf-task-1", ws, "c1", "f1")
-            .unwrap();
-        let t = app.store.get_task(t.id).unwrap();
-        let sid = t.session_id.clone().expect("minted at creation");
-        app.tasks = vec![t.clone()];
-        app.task_order = vec![t.id];
-        app.selected = 0;
-        (t, sid)
-    }
-
-    fn write_transcript(projects: &std::path::Path, ws: &std::path::Path, sid: &str) {
-        let dir = projects.join(config::encode_repo_path(ws));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{sid}.jsonl")), "{}\n").unwrap();
-    }
-
-    #[test]
-    fn a_task_that_never_ran_launches_fresh_and_pins_its_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-
-        assert_eq!(
-            app.task_argv(&t),
-            vec!["claude", "--session-id", &sid, "do the thing"]
-        );
-    }
-
-    #[test]
-    fn a_task_with_a_transcript_relaunches_as_a_resume() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-        write_transcript(tmp.path(), &ws, &sid);
-
-        // No prompt re-sent, and --session-id would be rejected as already in use.
-        assert_eq!(app.task_argv(&t), vec!["claude", "--resume", &sid]);
-    }
-
-    #[test]
-    fn a_task_is_only_resumable_once_it_has_a_transcript() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-
-        assert!(!app.task_resumable(&t), "nothing written yet");
-        write_transcript(tmp.path(), &ws, &sid);
-        assert!(app.task_resumable(&t), "pane gone, conversation on disk");
-    }
-
-    #[test]
-    fn a_running_agent_is_not_treated_as_lost() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-        write_transcript(tmp.path(), &ws, &sid);
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        let t = app.store.get_task(t.id).unwrap();
-
-        assert!(!app.task_resumable(&t));
-    }
-
-    #[test]
-    fn enter_on_a_lost_task_routes_to_revive_instead_of_reporting_no_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-        write_transcript(tmp.path(), &ws, &sid);
-
-        assert_eq!(
-            session::decide(app.open_pane, t.pane_id, app.task_resumable(&t)),
-            session::Toggle::Revive
-        );
-    }
-
-    #[test]
-    fn a_legacy_task_without_a_minted_id_still_launches() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, _) = lost_task(&mut app, &ws);
-        let legacy = Task {
-            session_id: None,
-            ..t
-        };
-
-        assert_eq!(app.task_argv(&legacy), vec!["claude", "do the thing"]);
-        assert!(!app.task_resumable(&legacy), "no id, nothing to resume");
-    }
-
-    #[test]
-    fn the_enter_hint_offers_revive_only_for_a_lost_task() {
-        // The toolbar is where a lost instance becomes discoverable: selecting the row
-        // has to say that Enter will bring it back, not just "open".
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task(&mut app, &ws);
-
-        assert_eq!(
-            app.enter_hint(),
-            "start",
-            "workspace intact, no conversation yet"
-        );
-
-        write_transcript(tmp.path(), &ws, &sid);
-        assert_eq!(app.enter_hint(), "revive", "pane gone, conversation kept");
-
-        app.store.set_pane(t.id, Some(42)).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        assert_eq!(app.enter_hint(), "open", "alive again, just not docked");
-
-        app.open_pane = Some(42);
-        assert_eq!(app.enter_hint(), "detach");
-    }
-
-    #[test]
-    fn a_task_that_died_before_its_first_prompt_gets_a_fresh_agent() {
-        // `n` spawns an agent sitting at an empty prompt, and claude writes no transcript
-        // until the first message — so faff's commonest lost instance has a live
-        // workspace and nothing to resume. It still deserves an agent back.
-        let tmp = tempfile::tempdir().unwrap();
-        let ws = tmp.path().join("ws");
-        let mut app = app_with_projects(tmp.path());
-        let (t, sid) = lost_task_with(&mut app, &ws, "");
-
-        assert!(app.task_revivable(&t), "workspace is intact");
-        assert!(!app.task_resumable(&t), "nothing written to resume from");
-        assert_eq!(app.task_argv(&t), vec!["claude", "--session-id", &sid]);
-        assert_eq!(app.enter_hint(), "start");
-    }
-
-    #[test]
-    fn a_task_with_no_workspace_left_cannot_be_revived() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut app = app_with_projects(tmp.path());
-        let t = app
-            .store
-            .create_task("orphan", 0, Autonomy::Inherit)
-            .unwrap();
-        app.tasks = vec![t.clone()];
-        app.task_order = vec![t.id];
-
-        assert!(!app.task_revivable(&t));
-        assert_eq!(app.enter_hint(), "open");
-    }
-    #[test]
     fn help_overlay_shows_every_binding_even_in_a_narrow_pane() {
         // The keymap is the authoritative reference; it must never silently clip one.
         let mut app = test_app();
@@ -3747,13 +2525,14 @@ mod tests {
     fn renders_with_an_active_merge_train() {
         // The notice line added a layout row, pushing the merge-train panel from
         // chunks[3] to chunks[4]. An off-by-one here is an index panic at runtime.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("x", 0, Autonomy::Inherit).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
-        app.merge_train.add(t.id);
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+        app.view.merge_train.add(t.id);
         app.notices.ok("snapshotted #7");
-        assert!(!app.merge_train.is_empty(), "fixture has a queued member");
+        assert!(!app.view.merge_train.is_empty(), "fixture has a queued member");
         assert!(app.merge_train_height() > 0, "the panel is drawn");
         let text = buffer_text(&draw(&mut app, 62, 14));
         assert!(
@@ -3764,6 +2543,201 @@ mod tests {
             text.contains("snapshotted #7"),
             "notice still visible:\n{text}"
         );
+    }
+
+    /// Drain what the app sent the engine.
+    fn sent(rx: &Receiver<Cmd>) -> Vec<Cmd> {
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn remove_goes_to_the_engine_and_shows_as_busy() {
+        // `x` must not do the teardown itself — that is what used to freeze the UI while a
+        // workspace's `target/` was deleted. It queues the command and says so in the header.
+        let store = Store::open_memory().unwrap();
+        let (mut app, rx) = test_app_with_engine_rx();
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(
+            sent(&rx),
+            vec![Cmd::Remove {
+                id: t.id,
+                discard: false
+            }]
+        );
+        let text = buffer_text(&draw(&mut app, 80, 10));
+        assert!(text.contains(&format!("⋯ removing #{}", t.id.0)), "got:\n{text}");
+    }
+
+    #[test]
+    fn done_clears_the_oldest_busy_label() {
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let (mut app, _rx) = test_app_with_engine_rx();
+        app.msg_rx = msg_rx;
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.in_flight, ["creating a task", "handing off"]);
+
+        msg_tx.send(Msg::Done).unwrap();
+        assert!(app.drain_messages().unwrap());
+        assert_eq!(app.in_flight, ["handing off"]);
+    }
+
+    #[test]
+    fn a_dead_engine_is_an_error_not_a_silent_ui() {
+        let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+        let mut app = test_app();
+        app.msg_rx = msg_rx;
+        drop(msg_tx);
+        assert!(app.drain_messages().is_err());
+    }
+
+    #[test]
+    fn engine_notices_land_in_the_log() {
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let mut app = test_app();
+        app.msg_rx = msg_rx;
+        msg_tx
+            .send(Msg::Notice(notify::Level::Error, "swap failed: boom".into()))
+            .unwrap();
+        app.drain_messages().unwrap();
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Error, "swap failed: boom".to_string())
+        );
+    }
+
+    #[test]
+    fn quit_waits_for_in_flight_work_unless_pressed_twice() {
+        let (mut app, _rx) = test_app_with_engine_rx();
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit && !app.quit_now, "waits for the create");
+        assert_eq!(latest(&app).0, notify::Level::Prompt);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.quit_now, "a second q quits regardless");
+    }
+
+    #[test]
+    fn quit_is_immediate_when_idle() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.quit_now);
+    }
+
+    #[test]
+    fn a_created_task_takes_the_selection() {
+        // The engine names the task `n`/`N` just made; the next view must move the highlight
+        // onto that new row, not keep it on whatever was selected before.
+        let mut app = test_app();
+        app.apply_view(View {
+            task_order: vec![TaskId(1), TaskId(2)],
+            ..View::default()
+        });
+        assert_eq!(app.selected, 0);
+        app.apply_view(View {
+            task_order: vec![TaskId(1), TaskId(2), TaskId(3)],
+            select: Some(TaskId(3)),
+            ..View::default()
+        });
+        assert_eq!(app.view.task_order[app.selected], TaskId(3));
+    }
+
+    #[test]
+    fn a_new_view_keeps_the_selection_by_identity() {
+        // Rows can reorder between views; the highlight follows the task, not the index.
+        let mut app = test_app();
+        app.apply_view(View {
+            task_order: vec![TaskId(1), TaskId(2)],
+            ..View::default()
+        });
+        app.selected = 1;
+        app.apply_view(View {
+            task_order: vec![TaskId(2), TaskId(1)],
+            ..View::default()
+        });
+        assert_eq!(app.view.task_order[app.selected], TaskId(2));
+
+        // The selected task vanished: clamp rather than point past the end.
+        app.apply_view(View {
+            task_order: vec![TaskId(1)],
+            ..View::default()
+        });
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn the_enter_hint_follows_the_views_lost_instance_sets() {
+        // The toolbar is where a lost instance becomes discoverable: selecting the row
+        // has to say that Enter will bring it back, not just "open".
+        let store = Store::open_memory().unwrap();
+        let mut app = test_app();
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+        assert_eq!(app.enter_hint(), "open");
+
+        app.view.revivable.insert(t.id);
+        assert_eq!(app.enter_hint(), "start", "workspace intact, no conversation yet");
+        app.view.resumable.insert(t.id);
+        assert_eq!(app.enter_hint(), "revive", "pane gone, conversation kept");
+
+        app.view.revivable.clear();
+        app.view.resumable.clear();
+        store.set_pane(t.id, Some(42)).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.open_pane = Some(42);
+        assert_eq!(app.enter_hint(), "detach");
+    }
+
+    #[test]
+    fn accept_on_a_queued_task_asks_the_engine_to_dequeue_it() {
+        // A queued task toggles out even without a pane, so the UI guards must not refuse it.
+        let store = Store::open_memory().unwrap();
+        let (mut app, rx) = test_app_with_engine_rx();
+        let t = store.create_task("do x", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+        app.view.merge_train.add(t.id);
+
+        app.accept_selected();
+        assert_eq!(sent(&rx), vec![Cmd::Accept(t.id)]);
+    }
+
+    #[test]
+    fn abort_with_no_train_is_refused_without_asking_the_engine() {
+        let (mut app, rx) = test_app_with_engine_rx();
+        app.abort_train();
+        assert_eq!(
+            latest(&app),
+            (notify::Level::Warn, "no merge train to abort".to_string())
+        );
+        assert!(sent(&rx).is_empty());
+
+        app.view.merge_train.add(TaskId(1));
+        app.abort_train();
+        assert_eq!(sent(&rx), vec![Cmd::AbortTrain]);
+    }
+
+    #[test]
+    fn a_confirmed_swap_is_sent_once() {
+        let store = Store::open_memory().unwrap();
+        let (mut app, rx) = test_app_with_engine_rx();
+        let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
+        store
+            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .unwrap();
+        store.update_status(t.id, TaskStatus::Working).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(sent(&rx).is_empty(), "first s only arms");
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(sent(&rx), vec![Cmd::Swap(t.id)]);
     }
 
     #[test]
@@ -3816,26 +2790,27 @@ mod tests {
     fn a_selected_task_below_the_cut_is_scrolled_into_view() {
         // 40 history rows then one agent: far taller than the pane. The agent must be on
         // screen, with a marker saying how much history scrolled off the top.
+        let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = app.store.create_task("deep", 0, Autonomy::Inherit).unwrap();
-        app.tasks = app.store.list_tasks().unwrap();
-        app.task_order = vec![t.id];
-        let mut rows: Vec<GraphRow> = (0..40)
-            .map(|i| GraphRow {
+        let t = store.create_task("deep", 0, Autonomy::Inherit).unwrap();
+        app.view.tasks = store.list_tasks().unwrap();
+        app.view.task_order = vec![t.id];
+        let mut rows: Vec<graph::GraphRow> = (0..40)
+            .map(|i| graph::GraphRow {
                 gutter: "◻".into(),
                 content: format!("history {i}"),
                 node_index: Some(i),
                 change_id: Some(format!("h{i:07}")),
             })
             .collect();
-        rows.push(GraphRow {
+        rows.push(graph::GraphRow {
             gutter: "├─●".into(),
             content: format!("#{} :: the deep agent", t.id.0),
             node_index: Some(40),
             change_id: Some("agentaaa".into()),
         });
-        app.task_of_node = (0..40).map(|_| None).chain([Some(t.id)]).collect();
-        app.rows = rows;
+        app.view.task_of_node = (0..40).map(|_| None).chain([Some(t.id)]).collect();
+        app.view.rows = rows;
 
         let text = buffer_text(&draw(&mut app, 70, 16));
         assert!(text.contains("the deep agent"), "selection visible:\n{text}");
@@ -3847,15 +2822,15 @@ mod tests {
     #[test]
     fn an_unselected_overflow_marks_what_is_hidden_below() {
         let mut app = test_app();
-        app.rows = (0..40)
-            .map(|i| GraphRow {
+        app.view.rows = (0..40)
+            .map(|i| graph::GraphRow {
                 gutter: "◻".into(),
                 content: format!("history {i}"),
                 node_index: Some(i),
                 change_id: Some(format!("h{i:07}")),
             })
             .collect();
-        app.task_of_node = vec![None; 40];
+        app.view.task_of_node = vec![None; 40];
         let text = buffer_text(&draw(&mut app, 70, 16));
         assert!(text.contains("history 0"), "pinned to the top:\n{text}");
         assert!(text.contains("↓ ") && text.contains(" more"), "down marker:\n{text}");

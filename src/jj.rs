@@ -16,6 +16,11 @@ const LOG_TEMPLATE: &str = r#"change_id ++ "\x1f" ++ parents.map(|c| c.change_id
 /// name<US>change_id per workspace.
 const WS_TEMPLATE: &str = r#"name ++ "\x1f" ++ target.change_id() ++ "\n""#;
 
+/// How long any one jj command may run before faff kills it and reports an error. Generous,
+/// since `workspace add` checks out a whole tree, but finite, so a jj stuck on a lock can't
+/// wedge faff's engine for good.
+const JJ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Just the change_id, one per matched revision.
 const CHANGE_ID_TEMPLATE: &str = r#"change_id ++ "\n""#;
 
@@ -44,13 +49,15 @@ pub struct Workspace {
 
 /// Run `jj -R <repo> --no-pager <args>` and return stdout, erroring with stderr.
 fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("jj")
-        .arg("-R")
-        .arg(repo)
-        .arg("--no-pager")
-        .args(args)
-        .output()
-        .context("spawning jj (is it installed and on PATH?)")?;
+    let out = crate::proc::output(
+        Command::new("jj")
+            .arg("-R")
+            .arg(repo)
+            .arg("--no-pager")
+            .args(args),
+        JJ_TIMEOUT,
+    )
+    .map_err(|e| crate::proc::failure(format!("jj {args:?}"), "is jj on PATH?", e))?;
     if !out.status.success() {
         bail!(
             "jj {:?} failed: {}",
@@ -66,12 +73,14 @@ fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
 /// `dir` belongs to. This is the only way to operate on a non-default workspace: `-R`
 /// (as `run_jj` passes it) always pins the `default` workspace and ignores the cwd.
 fn run_jj_in(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("jj")
-        .arg("--no-pager")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .context("spawning jj (is it installed and on PATH?)")?;
+    let out = crate::proc::output(
+        Command::new("jj")
+            .arg("--no-pager")
+            .args(args)
+            .current_dir(dir),
+        JJ_TIMEOUT,
+    )
+    .map_err(|e| crate::proc::failure(format!("jj {args:?}"), "is jj on PATH?", e))?;
     if !out.status.success() {
         bail!(
             "jj {:?} (in {}) failed: {}",

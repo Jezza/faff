@@ -92,6 +92,8 @@ impl Notices {
         self.push(Level::Info, text);
     }
 
+    // Successes are reported by the engine, which pushes through `push`; tests still use it.
+    #[allow(dead_code)]
     pub fn ok(&mut self, text: impl Into<String>) {
         self.push(Level::Success, text);
     }

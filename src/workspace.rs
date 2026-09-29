@@ -276,11 +276,56 @@ fn retire(
         }
     }
     jj::workspace_forget(repo, ws_name).context("jj workspace forget")?;
-    if ws_path.exists() {
-        fs::remove_dir_all(ws_path)
-            .with_context(|| format!("removing workspace dir {}", ws_path.display()))?;
+    discard_dir(ws_path)
+}
+
+/// Prefix of a workspace directory renamed aside by [`discard_dir`] and not yet deleted.
+const TRASH_PREFIX: &str = ".trash-";
+
+/// Delete a workspace directory without waiting for the delete. An agent's workspace can
+/// hold hundreds of MB of build output (`target/`), and deleting that inline would hold up
+/// every faff command queued behind the removal. So the directory is renamed aside — the
+/// same filesystem, so instant — and the renamed copy is deleted on a background thread.
+/// If faff exits first, [`sweep_trash`] finishes the job on the next start. Falls back to
+/// deleting in place if the rename fails. A missing directory is already gone: `Ok`.
+pub fn discard_dir(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
     }
-    Ok(())
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let trash = path.with_file_name(format!("{TRASH_PREFIX}{name}-{nanos}"));
+    if fs::rename(path, &trash).is_ok() {
+        std::thread::spawn(move || {
+            let _ = fs::remove_dir_all(&trash);
+        });
+        return Ok(());
+    }
+    fs::remove_dir_all(path).with_context(|| format!("removing workspace dir {}", path.display()))
+}
+
+/// Delete, in the background, anything [`discard_dir`] renamed aside under `root` but
+/// didn't get to finish deleting (faff exited mid-delete).
+pub fn sweep_trash(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let trash: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(TRASH_PREFIX))
+        .map(|e| e.path())
+        .collect();
+    if trash.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for dir in trash {
+            let _ = fs::remove_dir_all(dir);
+        }
+    });
 }
 
 /// Swap the default workspace's `@` with a task workspace's revision — a literal trade
@@ -555,6 +600,47 @@ fn hook_settings(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// Poll until `cond` holds (the background delete), failing after a few seconds.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn discard_dir_is_gone_at_once_and_deleted_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("0007-task");
+        fs::create_dir_all(ws.join("target/debug")).unwrap();
+        fs::write(ws.join("target/debug/big"), vec![0u8; 4096]).unwrap();
+
+        discard_dir(&ws).unwrap();
+        assert!(!ws.exists(), "the workspace path is free immediately");
+        assert!(
+            eventually(|| fs::read_dir(tmp.path()).unwrap().next().is_none()),
+            "the renamed copy is deleted in the background"
+        );
+        discard_dir(&ws).unwrap(); // already gone: still fine
+    }
+
+    #[test]
+    fn sweep_trash_finishes_an_interrupted_discard_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leftover = tmp.path().join(".trash-0007-task-123");
+        let live = tmp.path().join("0008-task");
+        fs::create_dir_all(leftover.join("target")).unwrap();
+        fs::create_dir_all(&live).unwrap();
+
+        sweep_trash(tmp.path());
+        assert!(eventually(|| !leftover.exists()), "leftover trash deleted");
+        assert!(live.exists(), "a live workspace is never swept");
+    }
 
     #[test]
     fn write_hooks_produces_expected_settings() {

@@ -5,9 +5,8 @@
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// One pane as reported by `wezterm cli list --format json` (unknown fields ignored).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -112,11 +111,13 @@ pub fn kill_pane_args(pane_id: u64) -> Vec<String> {
 
 // ---- exec wrappers -----------------------------------------------------------
 
+/// How long any one `wezterm cli` call may take. They answer in milliseconds when the mux
+/// is healthy; one that doesn't answer at all must not wedge faff's engine.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn run(args: &[String]) -> Result<String> {
-    let out = Command::new("wezterm")
-        .args(args)
-        .output()
-        .context("spawning wezterm (is it installed and is a mux running?)")?;
+    let out = crate::proc::output(Command::new("wezterm").args(args), CLI_TIMEOUT)
+        .map_err(|e| crate::proc::failure(format!("wezterm {args:?}"), "is wezterm on PATH?", e))?;
     if !out.status.success() {
         bail!(
             "wezterm {:?} failed: {}",
@@ -189,20 +190,12 @@ pub fn send_text(pane_id: u64, text: &str) -> Result<()> {
 
 /// Pipe `bytes` to a single `wezterm cli send-text` invocation.
 fn send_bytes(pane_id: u64, bytes: &[u8]) -> Result<()> {
-    let mut child = Command::new("wezterm")
-        .args(send_text_args(pane_id))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning wezterm cli send-text")?;
-    {
-        let mut stdin = child.stdin.take().context("send-text stdin unavailable")?;
-        stdin
-            .write_all(bytes)
-            .context("writing to send-text")?;
-    }
-    let out = child.wait_with_output().context("waiting on send-text")?;
+    let out = crate::proc::output_with_input(
+        Command::new("wezterm").args(send_text_args(pane_id)),
+        bytes,
+        CLI_TIMEOUT,
+    )
+    .map_err(|e| crate::proc::failure("wezterm cli send-text", "is wezterm on PATH?", e))?;
     if !out.status.success() {
         bail!(
             "wezterm send-text failed: {}",

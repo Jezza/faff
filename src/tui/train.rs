@@ -6,8 +6,8 @@
 //! (left as an ordinary task) while the rest carry on.
 //!
 //! This module holds the *state* and its pure membership operations. The state machine that
-//! advances it each refresh tick lives in `tui::mod` (`App::tick_merge_train`), because
-//! stepping it shells out to jj/wezterm and mutates the app.
+//! advances it each refresh tick lives in `tui::engine` (`Engine::tick_merge_train`), because
+//! stepping it shells out to jj/wezterm.
 
 use crate::domain::TaskId;
 use std::time::{Duration, Instant};
@@ -80,8 +80,8 @@ impl Member {
     }
 }
 
-/// The merge train owned by the TUI app.
-#[derive(Debug, Default)]
+/// The merge train, owned by the engine and copied into each `View` for the panel.
+#[derive(Debug, Clone, Default)]
 pub struct Train {
     pub members: Vec<Member>,
     /// A train-level note for the panel (e.g. "paused — your @ has content").
