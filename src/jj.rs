@@ -68,6 +68,18 @@ fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// [`run_jj`] with `--ignore-working-copy`: a pure read. jj neither snapshots the working
+/// copy nor imports git refs, so it records no operation, and a background poll can't
+/// race a concurrent `jj git fetch`/rebase into a divergent op log. The price is that
+/// unsnapshotted edits in `@` aren't seen until some other jj command snapshots them, so
+/// only use this where a slightly stale view is harmless (the refresh poll), never to
+/// decide whether a mutation is safe.
+fn peek_jj(repo: &Path, args: &[&str]) -> Result<String> {
+    let mut full = vec!["--ignore-working-copy"];
+    full.extend_from_slice(args);
+    run_jj(repo, &full)
+}
+
 /// Run `jj --no-pager <args>` with the working directory set to `dir` and **no** `-R`
 /// flag. jj infers the repo + workspace from `dir`, so this acts on whatever workspace
 /// `dir` belongs to. This is the only way to operate on a non-default workspace: `-R`
@@ -138,6 +150,15 @@ pub fn log(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
     Ok(parse_log(&out))
 }
 
+/// [`log`] without snapshotting or importing git refs (see [`peek_jj`]).
+pub fn log_peek(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
+    let out = peek_jj(
+        repo,
+        &["log", "--no-graph", "-r", revset, "-T", LOG_TEMPLATE],
+    )?;
+    Ok(parse_log(&out))
+}
+
 /// The revset for the revision graph: `ancestors(<each workspace's @> | @, limit)`.
 ///
 /// Each workspace is named by its `<name>@` working-copy reference, **not** by its
@@ -155,7 +176,17 @@ pub fn workspace_ancestors_revset(workspaces: &[Workspace], limit: usize) -> Str
 /// All workspaces attached to the repo and the change_id each is checked out at.
 pub fn workspace_list(repo: &Path) -> Result<Vec<Workspace>> {
     let out = run_jj(repo, &["workspace", "list", "-T", WS_TEMPLATE])?;
-    Ok(out
+    Ok(parse_workspaces(&out))
+}
+
+/// [`workspace_list`] without snapshotting or importing git refs (see [`peek_jj`]).
+pub fn workspace_list_peek(repo: &Path) -> Result<Vec<Workspace>> {
+    let out = peek_jj(repo, &["workspace", "list", "-T", WS_TEMPLATE])?;
+    Ok(parse_workspaces(&out))
+}
+
+fn parse_workspaces(stdout: &str) -> Vec<Workspace> {
+    stdout
         .lines()
         .filter(|l| !l.is_empty())
         .filter_map(|line| {
@@ -165,7 +196,7 @@ pub fn workspace_list(repo: &Path) -> Result<Vec<Workspace>> {
                 change_id: cid.to_string(),
             })
         })
-        .collect())
+        .collect()
 }
 
 /// The revset for faff's fork point: the newest ancestor of `head` (inclusive) that
@@ -454,6 +485,51 @@ mod tests {
         assert!(!any_revision(&repo, "none()").unwrap());
         // The fresh @ is empty, so its non-empty subset matches nothing.
         assert!(!any_revision(&repo, "@ ~ empty()").unwrap());
+    }
+
+    #[test]
+    fn integration_peeks_record_no_operation() {
+        // The refresh poll must be a pure read: a snapshot or git import it recorded could
+        // race your own `jj git fetch`/rebase and leave a divergent op log behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+        let init = Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success(), "jj git init failed");
+        let op_count = || {
+            run_jj(
+                &repo,
+                &[
+                    "--ignore-working-copy",
+                    "op",
+                    "log",
+                    "--no-graph",
+                    "-T",
+                    r#"id ++ "\n""#,
+                ],
+            )
+            .unwrap()
+            .lines()
+            .count()
+        };
+        let before = op_count();
+
+        // Unsnapshotted edits in @: a plain jj command would record a snapshot.
+        std::fs::write(repo.join("edit.txt"), "edit").unwrap();
+        assert!(!workspace_list_peek(&repo).unwrap().is_empty());
+        let revs = log_peek(&repo, "@").unwrap();
+        assert!(revs[0].empty, "a peek must not snapshot the edit into @");
+        assert_eq!(op_count(), before, "peeks must record no operation");
+
+        // The non-peek variant does snapshot, which is what the peek avoids.
+        assert!(!log(&repo, "@").unwrap()[0].empty);
+        assert!(op_count() > before);
     }
 
     #[test]

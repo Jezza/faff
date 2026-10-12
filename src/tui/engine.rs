@@ -1020,7 +1020,9 @@ impl Engine {
         self.tasks = self.store.list_tasks().unwrap_or_default();
 
         // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
-        let mut ws_list = jj::workspace_list(&self.repo).ok();
+        // The poll peeks (no snapshot, no git import) so it never records an operation
+        // that could race your own `jj git fetch`/rebase into a divergent op log.
+        let mut ws_list = jj::workspace_list_peek(&self.repo).ok();
 
         // Heal orphans so stale rows don't linger forever or misreport their status.
         let panes = wezterm::list().ok();
@@ -1190,7 +1192,7 @@ impl Engine {
         Option<String>,
     )> {
         let revset = jj::workspace_ancestors_revset(workspaces, 25);
-        let mut revs = jj::log(&self.repo, &revset)?;
+        let mut revs = jj::log_peek(&self.repo, &revset)?;
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
         // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
         model::order_by_fork_point(&mut revs, workspaces, &self.tasks);
