@@ -1034,8 +1034,16 @@ impl App {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
+        let style = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(text).style(style), area);
+        // Which body Tab has switched to, pinned to the far right; drawn second so a long
+        // status on the left is clipped under it rather than pushing it off-screen.
+        let body = match self.body {
+            Body::Agents => " agents ",
+            Body::Log => " log ",
+        };
         f.render_widget(
-            Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED)),
+            Paragraph::new(Line::from(body).right_aligned()).style(style),
             area,
         );
     }
@@ -1119,9 +1127,7 @@ impl App {
                 }
             }
         }
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .title("revisions · agents");
+        let block = Block::default().borders(Borders::RIGHT);
         render_viewport(f, area, block, lines, sel_lines);
     }
 
@@ -1143,9 +1149,7 @@ impl App {
         }
         let is_sel = |i: usize| sel_rows[i];
         let (lines, sel_lines) = self.graph_lines(rows, &self.view.log_task_of, &is_sel, text_w);
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .title("revisions · log");
+        let block = Block::default().borders(Borders::RIGHT);
         render_viewport(f, area, block, lines, sel_lines);
     }
 
@@ -2839,10 +2843,15 @@ mod tests {
     #[test]
     fn tab_toggles_between_the_agent_and_log_views() {
         let mut app = app_with_log_history();
-        assert!(buffer_text(&draw(&mut app, 80, 12)).contains("revisions · agents"));
+        // The active view is named at the far right of the header line.
+        let header = |app: &mut App| {
+            let text = buffer_text(&draw(app, 80, 12));
+            text.lines().next().unwrap().trim_end().to_string()
+        };
+        assert!(header(&mut app).ends_with("agents"), "{}", header(&mut app));
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.body, Body::Log);
-        assert!(buffer_text(&draw(&mut app, 80, 12)).contains("revisions · log"));
+        assert!(header(&mut app).ends_with("log"), "{}", header(&mut app));
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.body, Body::Agents);
     }

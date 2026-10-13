@@ -355,12 +355,13 @@ removable there.
 
 ### The log view
 
-`Tab` switches the body between the agent view above (titled `revisions · agents`) and the
-log view (`revisions · log`). The log is drawn from the same `jj log` faff already loads on
-each refresh, so switching is instant, but nothing is curated: empty commits get a row of
-their own (`(empty) (no description set)`, as jj labels them), agent branches stay in jj's
-order instead of being lifted onto their fork points, and nothing is folded away. Agent
-revisions keep their `#<id> <status> :: <title>` label, so they're still easy to spot.
+`Tab` switches the body between the agent view above and the log view; the header names
+the active one (`agents` or `log`) at its far right. The log is drawn from the same `jj log`
+faff already loads on each refresh, so switching is instant, but nothing is curated: empty
+commits get a row of their own (`(empty) (no description set)`, as jj labels them), agent
+branches stay in jj's order instead of being lifted onto their fork points, and nothing is
+folded away. Agent revisions keep their `#<id> <status> :: <title>` label, so they're still
+easy to spot.
 
 `j`/`k` move over revisions rather than tasks, and the log scrolls exactly like the agent
 view (same `↑ N more` / `↓ N more` markers). Each view keeps its own selection, and the
