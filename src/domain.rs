@@ -117,17 +117,30 @@ pub struct Task {
 }
 
 impl Task {
-    /// Display label: the first line of the prompt, else a placeholder (a task created
-    /// via `n` before its first prompt). Returned untruncated — the log view clips it to
-    /// the current pane width at render time. The jj change's own description, when set,
-    /// is preferred over this in the graph (see `tui::model::build`).
+    /// Display label: the first non-blank line of the prompt, else a placeholder (a task
+    /// created via `n` before its first prompt). Lines inside a `<pasted_content>` block
+    /// are skipped in favour of the user's own words, unless the prompt is only a paste.
+    /// Returned untruncated — the log view clips it to the current pane width at render
+    /// time. The jj change's own description, when set, is preferred over this in the
+    /// graph (see `tui::model::build`).
     pub fn label(&self) -> String {
-        let from_prompt = self.prompt.lines().next().unwrap_or("").trim();
-        if from_prompt.is_empty() {
-            "(new task — awaiting prompt)".to_string()
-        } else {
-            from_prompt.to_string()
+        let mut in_paste = false;
+        let mut first_pasted = None;
+        for line in self.prompt.lines().map(str::trim) {
+            if line.starts_with("<pasted_content") {
+                in_paste = true;
+            } else if line.starts_with("</pasted_content") {
+                in_paste = false;
+            } else if line.is_empty() {
+            } else if !in_paste {
+                return line.to_string();
+            } else if first_pasted.is_none() {
+                first_pasted = Some(line);
+            }
         }
+        first_pasted
+            .unwrap_or("(new task — awaiting prompt)")
+            .to_string()
     }
 }
 
@@ -182,6 +195,46 @@ mod tests {
             Autonomy::Bypass.permission_mode(),
             Some("bypassPermissions")
         );
+    }
+
+    fn task_with_prompt(prompt: &str) -> Task {
+        Task {
+            id: TaskId(1),
+            prompt: prompt.to_string(),
+            status: TaskStatus::Idle,
+            priority: 0,
+            autonomy: Autonomy::Inherit,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            archived_at: None,
+            fork_point: None,
+            ws_name: None,
+            ws_path: None,
+            ws_change_id: None,
+            pane_id: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn label_is_first_line_of_prompt_or_placeholder() {
+        assert_eq!(task_with_prompt("  do it  \nmore").label(), "do it");
+        assert_eq!(task_with_prompt("").label(), "(new task — awaiting prompt)");
+        assert_eq!(task_with_prompt(" \n\n").label(), "(new task — awaiting prompt)");
+    }
+
+    #[test]
+    fn label_skips_leading_blank_lines_and_pasted_content() {
+        // The real case: a prompt that opens with blank lines and a paste was labelled
+        // "awaiting prompt", though the prompt had been captured.
+        let prompt = "\n\n<pasted_content id=\"a6fa\">\n│ ╭─● [zlvlzspr] #263\n\
+                      </pasted_content id=\"a6fa\">\n\n\nRevisions crossed over others.\n";
+        assert_eq!(task_with_prompt(prompt).label(), "Revisions crossed over others.");
+
+        // A prompt that is nothing but a paste falls back to the paste's first line.
+        let only = "<pasted_content id=\"b1\">\n\n  error: boom\nmore\n</pasted_content id=\"b1\">";
+        assert_eq!(task_with_prompt(only).label(), "error: boom");
     }
 
     #[test]
