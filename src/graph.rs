@@ -464,12 +464,16 @@ fn place(nodes: &[SNode], plan: Option<&[usize]>) -> (Vec<GraphRow>, Vec<Seg>) {
 ///   * a segment sits right of the lanes it forks out of and closes into, so its
 ///     connectors read left-to-right; and
 ///   * a segment nested in a sibling (same lane joined, span inside the other's) sits left
-///     of it — and so does everything hanging off the nested one while the sibling is open.
+///     of it — and so does everything hanging off the nested one while the sibling is open;
+///     likewise a sibling it merely overlaps, when fewer of that sibling's connectors fall
+///     inside its span than of its own inside the sibling's (a branch head opens bare, so
+///     it goes right of a lane that closes while it's open).
 ///
 /// Columns then go out in an order respecting those edges: each segment takes the lowest
 /// column right of everything it must clear that no overlapping segment holds. Lanes that
-/// merely overlap (one opens inside the other and closes after) cross once whichever way
-/// round, so they only need distinct columns. A segment that joins nothing — HEAD's line, a
+/// overlap with a connector inside each other's span (one opens inside the other and
+/// closes after) cross once whichever way round, so they only need distinct columns. A
+/// segment that joins nothing — HEAD's line, a
 /// line resuming below the window cut — may take the leftmost lane as before.
 ///
 /// The greedy layout can join two segments both ways round (a lane opened out of another
@@ -518,16 +522,29 @@ fn plan_columns(segs: &[Seg]) -> Vec<usize> {
             succ[a].push(i);
         }
     }
+    // How many of `a`'s connectors run past `b`'s column, were `b` left of `a`: those on rows
+    // where `b` is open. A lane only has a connector at an end that joins something, so a
+    // branch head opens bare and a lane running off the window closes bare.
+    let reaches = |a: &Seg, b: &Seg| {
+        [(a.source, a.start), (a.target, a.end)]
+            .into_iter()
+            .filter(|&(join, row)| join.is_some() && b.start < row && row < b.end)
+            .count()
+    };
     for (k, ks) in segs.iter().enumerate() {
         for (o, os) in segs.iter().enumerate() {
             let nested = (ks.start, ks.end) != (os.start, os.end)
                 && ks.start >= os.start
                 && ks.end <= os.end;
             let twin = (ks.start, ks.end) == (os.start, os.end) && k < o;
+            // Lanes that overlap without nesting cross whichever way round only when each has
+            // a connector inside the other's span. When one has fewer — a branch head opening
+            // inside a lane it outlives — it costs fewer crossings to put the other inside.
+            let lopsided = reaches(os, ks) < reaches(ks, os);
             if k == o
                 || anchor(ks).is_none()
                 || anchor(ks) != anchor(os)
-                || !(nested || twin)
+                || !(nested || twin || lopsided)
                 || joined(k, o)
             {
                 continue;
@@ -1030,6 +1047,30 @@ mod tests {
         assert_eq!(
             gutters(&render(&nodes)),
             vec!["@───╮", "│   ◻", "◻─╮ │", "├─◻ │", "├───◻", "◆"],
+        );
+    }
+
+    #[test]
+    fn a_branch_head_starts_outside_a_lane_it_outlives() {
+        // `m` is a branch head: its lane opens with no connector, on the column `l` has just
+        // freed, while `f`'s lane (opened by `c`) is still open further out. The two lanes
+        // overlap without nesting, but only `f`'s close reaches across the other — `m` opens
+        // bare and closes after `f` is gone — so `m` belongs right of `f`, not on the freed
+        // column inside it where `f` has to cross it (`├─│─◻`). The crossing at `c`, where
+        // `f` opens past `l`, is forced: `l` closes inside `f` and `f` opens inside `l`.
+        let nodes = vec![
+            node("h", &["a"], '@', &["HEAD"]),
+            node("a", &["c", "l"], '◻', &["merge l"]),
+            node("c", &["d", "f"], '◻', &["merge f"]),
+            node("l", &["d"], '◻', &["l"]),
+            node("m", &["x"], '◻', &["branch head"]),
+            node("f", &["d"], '◻', &["f"]),
+            node("d", &["x"], '◻', &["trunk"]),
+            node("x", &[], '◆', &["base"]),
+        ];
+        assert_eq!(
+            gutters(&render(&nodes)),
+            vec!["@", "◻─╮", "◻─│─╮", "├─◻ │", "│   │ ◻", "├───◻ │", "◻     │", "├─────╯", "◆"],
         );
     }
 
