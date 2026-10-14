@@ -25,7 +25,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::VecDeque;
 use std::io::{Stdout, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -54,9 +54,10 @@ pub fn run(repo: Option<PathBuf>) -> Result<()> {
         .name("faff-engine".into())
         .spawn(move || engine.run(cmd_rx))
         .context("spawning the engine thread")?;
+    let title = format!("faff | {}", repo_name(&repo));
     let mut app = App::new(repo, cmd_tx, msg_rx);
     install_panic_hook();
-    let mut term = setup_terminal()?;
+    let mut term = setup_terminal(&title)?;
     let result = app.event_loop(&mut term);
     restore_terminal(&mut term)?;
     result
@@ -92,10 +93,20 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
     std::env::current_dir().context("getting current dir")
 }
 
-fn setup_terminal() -> Result<Term> {
+/// The repo's folder name, which tells one faff from another: in the header and the title.
+fn repo_name(repo: &Path) -> String {
+    repo.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn setup_terminal(title: &str) -> Result<Term> {
     terminal::enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, terminal::EnterAlternateScreen)?;
+    // Title faff's own pane (and so its tab, while it's the active pane). An OSC title
+    // rather than `wezterm cli set-tab-title`: the shell's next prompt replaces it, so it
+    // can't outlive faff the way a sticky tab title would.
+    execute!(out, terminal::EnterAlternateScreen, terminal::SetTitle(title))?;
     let term = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
     Ok(term)
 }
@@ -1029,10 +1040,7 @@ impl App {
         };
         let text = format!(
             " faff · {} · {working} working{session}{busy} ",
-            self.repo
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            repo_name(&self.repo),
         );
         let style = Style::default().add_modifier(Modifier::REVERSED);
         f.render_widget(Paragraph::new(text).style(style), area);
