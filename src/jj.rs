@@ -1,6 +1,7 @@
 //! jj adapter: structured extraction via `jj log`/`jj workspace list` templates.
 //! No `jj-lib`, no consuming jj's rendered graph — we parse `\x1f`-delimited records
-//! (verified against jj 0.43). See spec §3 and the fork recipe in §5.
+//! (verified against jj 0.43), taking only jj's row order from the graph it draws around
+//! them. See spec §3 and the fork recipe in §5.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -9,9 +10,13 @@ use std::process::Command;
 /// Field separator emitted by our templates (ASCII Unit Separator, 0x1f).
 const US: char = '\u{1f}';
 
-/// One-line-per-commit record: change_id, parents(comma), current_wc, empty,
+/// Where a log record starts on its line (ASCII Record Separator, 0x1e): `jj log` draws its
+/// graph to the left of each record, and everything up to here is that drawing.
+const RS: char = '\u{1e}';
+
+/// One-line-per-commit record, after an RS: change_id, parents(comma), current_wc, empty,
 /// conflict, id_prefix (shortest unique), id_rest (padding to 8), description.
-const LOG_TEMPLATE: &str = r#"change_id ++ "\x1f" ++ parents.map(|c| c.change_id()).join(",") ++ "\x1f" ++ if(current_working_copy,"1","0") ++ "\x1f" ++ if(empty,"1","0") ++ "\x1f" ++ if(conflict,"1","0") ++ "\x1f" ++ change_id.shortest(8).prefix() ++ "\x1f" ++ change_id.shortest(8).rest() ++ "\x1f" ++ description.first_line() ++ "\n""#;
+const LOG_TEMPLATE: &str = r#""\x1e" ++ change_id ++ "\x1f" ++ parents.map(|c| c.change_id()).join(",") ++ "\x1f" ++ if(current_working_copy,"1","0") ++ "\x1f" ++ if(empty,"1","0") ++ "\x1f" ++ if(conflict,"1","0") ++ "\x1f" ++ change_id.shortest(8).prefix() ++ "\x1f" ++ change_id.shortest(8).rest() ++ "\x1f" ++ description.first_line() ++ "\n""#;
 
 /// name<US>change_id per workspace.
 const WS_TEMPLATE: &str = r#"name ++ "\x1f" ++ target.change_id() ++ "\n""#;
@@ -104,11 +109,12 @@ fn run_jj_in(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Parse the log template output into RevInfo records.
+/// Parse the log template output into RevInfo records, dropping jj's graph: the drawing
+/// left of each record and the rows holding no record at all (`├─╯` links, elided runs).
 fn parse_log(stdout: &str) -> Vec<RevInfo> {
     stdout
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter_map(|line| line.split_once(RS).map(|(_, record)| record))
         .filter_map(|line| {
             let mut f = line.split(US);
             let change_id = f.next()?.to_string();
@@ -141,22 +147,30 @@ fn parse_log(stdout: &str) -> Vec<RevInfo> {
         .collect()
 }
 
-/// Revisions matching `revset`, in jj's default (child→parent) order.
+/// `jj log` arguments for [`LOG_TEMPLATE`] records over `revset`. The graph stays on, though
+/// faff draws its own, for the order jj gives it rows in: `--no-graph` lists revisions in
+/// commit order, interleaving branches committed side by side, while the graph keeps each
+/// branch's run of commits together — which is what lets faff's lanes nest rather than
+/// cross. Word wrap is off so a long description can't spill a record onto a second line.
+fn log_args(revset: &str) -> [&str; 6] {
+    [
+        "log",
+        "--config=ui.log-word-wrap=false",
+        "-r",
+        revset,
+        "-T",
+        LOG_TEMPLATE,
+    ]
+}
+
+/// Revisions matching `revset`, in jj's graph (child→parent) order.
 pub fn log(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
-    let out = run_jj(
-        repo,
-        &["log", "--no-graph", "-r", revset, "-T", LOG_TEMPLATE],
-    )?;
-    Ok(parse_log(&out))
+    Ok(parse_log(&run_jj(repo, &log_args(revset))?))
 }
 
 /// [`log`] without snapshotting or importing git refs (see [`peek_jj`]).
 pub fn log_peek(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
-    let out = peek_jj(
-        repo,
-        &["log", "--no-graph", "-r", revset, "-T", LOG_TEMPLATE],
-    )?;
-    Ok(parse_log(&out))
+    Ok(parse_log(&peek_jj(repo, &log_args(revset))?))
 }
 
 /// The revset for the revision graph: `ancestors(<each workspace's @> | @, limit)`.
@@ -334,13 +348,17 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    // Fixture in the LOG_TEMPLATE shape (8 US-separated fields; US shown as \u{1f}):
-    // change_id, parents, current_wc, empty, conflict, id_prefix, id_rest, description.
-    const FIXTURE: &str = "rwmqzmnkwwnknszkrypzzoxyklmqzyol\u{1f}nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}0\u{1f}1\u{1f}0\u{1f}rw\u{1f}mqzmnk\u{1f}\n\
-        zylsskwvzvzyunuryqzqxstpnlmupyqx\u{1f}nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}1\u{1f}1\u{1f}0\u{1f}zy\u{1f}lsskwv\u{1f}\n\
-        nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}vttuzqwuxunwuvsqytuwnlqpxxskoooy\u{1f}0\u{1f}0\u{1f}0\u{1f}n\u{1f}lqmxnsr\u{1f}\n\
-        vttuzqwuxunwuvsqytuwnlqpxxskoooy\u{1f}zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\u{1f}0\u{1f}0\u{1f}1\u{1f}v\u{1f}ttuzqwu\u{1f}base commit\n\
-        zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\u{1f}\u{1f}0\u{1f}1\u{1f}0\u{1f}zzzzzzzz\u{1f}\u{1f}\n";
+    // Fixture in the LOG_TEMPLATE shape as `jj log` draws it: jj's graph to the left of each
+    // record, a link row (`├─╯`) and an elided-revisions row between them. A record starts
+    // at RS (\u{1e}) and holds 8 US-separated fields (US shown as \u{1f}): change_id,
+    // parents, current_wc, empty, conflict, id_prefix, id_rest, description.
+    const FIXTURE: &str = "○  \u{1e}rwmqzmnkwwnknszkrypzzoxyklmqzyol\u{1f}nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}0\u{1f}1\u{1f}0\u{1f}rw\u{1f}mqzmnk\u{1f}\n\
+        │ @  \u{1e}zylsskwvzvzyunuryqzqxstpnlmupyqx\u{1f}nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}1\u{1f}1\u{1f}0\u{1f}zy\u{1f}lsskwv\u{1f}\n\
+        ├─╯\n\
+        ○  \u{1e}nlqmxnsrrzpswxrqwlrlstszrrstqpkq\u{1f}vttuzqwuxunwuvsqytuwnlqpxxskoooy\u{1f}0\u{1f}0\u{1f}0\u{1f}n\u{1f}lqmxnsr\u{1f}\n\
+        ~  (elided revisions)\n\
+        ×  \u{1e}vttuzqwuxunwuvsqytuwnlqpxxskoooy\u{1f}zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\u{1f}0\u{1f}0\u{1f}1\u{1f}v\u{1f}ttuzqwu\u{1f}base commit\n\
+        ◆  \u{1e}zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\u{1f}\u{1f}0\u{1f}1\u{1f}0\u{1f}zzzzzzzz\u{1f}\u{1f}\n";
 
     #[test]
     fn parses_log_records() {
@@ -497,6 +515,42 @@ mod tests {
         assert!(!any_revision(&repo, "none()").unwrap());
         // The fresh @ is empty, so its non-empty subset matches nothing.
         assert!(!any_revision(&repo, "@ ~ empty()").unwrap());
+    }
+
+    #[test]
+    fn integration_log_keeps_each_branch_together() {
+        // `head` merges `x2` (on `x1`) and `y1`, all off `base`, committed base, x1, y1, x2.
+        // Plain `--no-graph` order is commit order, which interleaves the branches — x2, y1,
+        // x1 — so the y1 lane has to run past the x line. faff wants the order jj's own graph
+        // uses, each branch contiguous, so lanes nest instead of crossing.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cfg = jj_cfg(tmp.path());
+        let init = Command::new("jj")
+            .args(["git", "init"])
+            .arg(&repo)
+            .env("JJ_CONFIG", &cfg)
+            .status()
+            .unwrap();
+        assert!(init.success(), "jj git init failed");
+        let at = || resolve_change_id(&repo, "@").unwrap();
+        jj_setup(&repo, &cfg, &["describe", "-m", "base"]);
+        let base = at();
+        jj_setup(&repo, &cfg, &["new", "-m", "x1"]);
+        let x1 = at();
+        jj_setup(&repo, &cfg, &["new", &base, "-m", "y1"]);
+        let y1 = at();
+        jj_setup(&repo, &cfg, &["new", &x1, "-m", "x2"]);
+        let x2 = at();
+        jj_setup(&repo, &cfg, &["new", &x2, &y1, "-m", "head"]);
+
+        let order: Vec<String> = log_peek(&repo, "all() ~ root()")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.description)
+            .collect();
+        assert_eq!(order, vec!["head", "y1", "x2", "x1", "base"]);
     }
 
     #[test]
