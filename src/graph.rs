@@ -112,10 +112,173 @@ fn splice_collapsed(nodes: &[GraphNode]) -> Vec<SNode> {
     out
 }
 
+/// One lane of the graph: the change_id it is flowing toward (a pending parent), and the
+/// segment — one continuous run of this lane, from where it opens to where it closes — it
+/// belongs to.
+struct Lane {
+    target: String,
+    seg: usize,
+}
+
+/// A lane segment as laid out: the node rows it opens and closes on (`end` is past the last
+/// node for a lane still open at the bottom), and the segments its connectors reach —
+/// `source` the lane it forked out of (a merge's `●─╮`, a fold's trunk), `target` the lane
+/// it closes into (`├─╯`, `├─●`). Either is `None` for a lane that just starts (a branch
+/// head) or just ends (a root, or a parent off the loaded window).
+struct Seg {
+    start: usize,
+    end: usize,
+    source: Option<usize>,
+    target: Option<usize>,
+}
+
 fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
+    // Lay out once picking columns greedily (leftmost free), which records every lane
+    // segment, then plan columns for those segments so short lanes nest inside long ones
+    // instead of crossing them, and lay out again with that plan. The plan is a heuristic
+    // over the greedy layout's segments, and a planned column can tip a fold or merge
+    // decision the other way, so it is kept only when it really draws fewer crossings (or,
+    // crossing as often, fewer columns) — never a regression on the greedy layout.
+    let (greedy, segs) = place(nodes, None);
+    let (planned, _) = place(nodes, Some(&plan_columns(&segs)));
+    let mut rows = if score(&planned) < score(&greedy) {
+        planned
+    } else {
+        greedy
+    };
+
+    // Birth of HEAD's reserved trunk lane. Pre-seeding lane 0 (in `place`) makes it show a
+    // bare `│` on every row above HEAD, which reads as "the trunk continues upward
+    // off-screen". It doesn't: the trunk is born where it first does something — the
+    // topmost fork merging in, else HEAD's own commit. So blank that phantom `│` on
+    // the rows above the birth, and if the birth is a merge, turn its `├` T-junction
+    // into a `╭` corner (nothing continues above it). Lower forks keep their `├`, since
+    // for them the trunk genuinely continues up to the birth.
+    if nodes.iter().any(|n| n.glyph == '@')
+        && let Some(birth) = rows.iter().position(|r| !r.gutter.starts_with('│'))
+    {
+        for r in &mut rows[..birth] {
+            if let Some(rest) = r.gutter.strip_prefix('│') {
+                r.gutter = format!(" {rest}");
+            }
+        }
+        if let Some(rest) = rows[birth].gutter.strip_prefix('├') {
+            rows[birth].gutter = format!("╭{rest}");
+        }
+    }
+    rows
+}
+
+/// How badly rows draw, lower is better: lanes crossed by a connector (a `│` with `─` run
+/// through it), then the widest gutter.
+fn score(rows: &[GraphRow]) -> (usize, usize) {
+    let crossings = rows
+        .iter()
+        .map(|r| {
+            let c: Vec<char> = r.gutter.chars().collect();
+            c.windows(3).filter(|w| w == &['─', '│', '─']).count()
+        })
+        .sum();
+    let width = rows
+        .iter()
+        .map(|r| r.gutter.chars().count())
+        .max()
+        .unwrap_or(0);
+    (crossings, width)
+}
+
+/// The lanes being laid out, and every segment opened so far. With a `plan`, a new segment
+/// takes its planned column when that is free and at least `min`; otherwise `default` picks.
+struct Lanes<'a> {
+    lanes: Vec<Option<Lane>>,
+    segs: Vec<Seg>,
+    plan: Option<&'a [usize]>,
+}
+
+impl Lanes<'_> {
+    fn targeting(&self, id: &str) -> Option<usize> {
+        self.lanes
+            .iter()
+            .position(|l| l.as_ref().is_some_and(|l| l.target == id))
+    }
+
+    fn seg_at(&self, col: usize) -> Option<usize> {
+        self.lanes.get(col)?.as_ref().map(|l| l.seg)
+    }
+
+    /// Open a segment flowing toward `target`, forked out of segment `source`, on node row
+    /// `row`, in a column at least `min`: the planned one if it is free, else the first
+    /// free lane from `min` on, or a new one on the right.
+    fn open(&mut self, target: &str, source: Option<usize>, row: usize, min: usize) -> usize {
+        let seg = self.segs.len();
+        let free = |c: usize| self.lanes.get(c).is_none_or(|l| l.is_none());
+        let col = match self.plan.and_then(|p| p.get(seg)) {
+            Some(&c) if c >= min && free(c) => c,
+            _ => (min..).find(|&c| free(c)).unwrap_or(min),
+        };
+        if col >= self.lanes.len() {
+            self.lanes.resize_with(col + 1, || None);
+        }
+        self.lanes[col] = Some(Lane {
+            target: target.to_string(),
+            seg,
+        });
+        self.segs.push(Seg {
+            start: row,
+            end: usize::MAX,
+            source,
+            target: None,
+        });
+        col
+    }
+
+    /// Close the lane at `col` on node row `row`, joining it into segment `into` (if any).
+    fn close(&mut self, col: usize, row: usize, into: Option<usize>) {
+        if let Some(l) = self.lanes[col].take() {
+            self.segs[l.seg].end = row;
+            self.segs[l.seg].target = into;
+        }
+    }
+
+    /// Tidy up after node row `row`: drop freed lanes off the right, and bring a lone lane
+    /// stranded right of an empty leftmost column home to it, with a `╭───╯` row. That
+    /// happens when the line holding the leftmost lane ends — HEAD's line running off the
+    /// loaded window — and only some other line carries on; left where it is, that line
+    /// would sit indented behind blank columns all the way to the bottom. It moves as a fresh
+    /// segment (a line of its own from here), so the column plan is free to put it leftmost.
+    fn settle(&mut self, row: usize, rows: &mut Vec<GraphRow>) {
+        while matches!(self.lanes.last(), Some(None)) {
+            self.lanes.pop();
+        }
+        let c = self.lanes.len().saturating_sub(1);
+        if c == 0 || self.lanes[..c].iter().any(|l| l.is_some()) {
+            return;
+        }
+        let target = self.lanes[c]
+            .as_ref()
+            .map(|l| l.target.clone())
+            .unwrap_or_default();
+        self.close(c, row, None);
+        self.lanes.truncate(c);
+        self.open(&target, None, row + 1, 0);
+        rows.push(GraphRow {
+            gutter: format!("╭{}╯", "─".repeat(2 * c - 1)),
+            content: String::new(),
+            node_index: None,
+            change_id: None,
+        });
+    }
+}
+
+/// Lay the nodes out, columns from `plan` where given. Returns the rows and every lane
+/// segment opened, in opening order (a segment's index is its id, which the plan keys on).
+fn place(nodes: &[SNode], plan: Option<&[usize]>) -> (Vec<GraphRow>, Vec<Seg>) {
     let mut rows = Vec::new();
-    // Each lane holds the change_id it is currently flowing toward (a pending parent).
-    let mut lanes: Vec<Option<String>> = Vec::new();
+    let mut lanes = Lanes {
+        lanes: Vec::new(),
+        segs: Vec::new(),
+        plan,
+    };
     // Where each node sits in the list, so a stub can tell whether its parent is still to
     // come (it is, in a child→parent order — unless the parent was spliced out).
     let pos: HashMap<&str, usize> = nodes
@@ -131,14 +294,19 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
     // in, instead of grabbing lane 0 itself. If HEAD is the first node this is a no-op
     // (it just takes lane 0 immediately, no phantom trunk drawn above it).
     if let Some(m) = nodes.iter().find(|n| n.glyph == '@') {
-        lanes.push(Some(m.change_id.clone()));
+        lanes.open(&m.change_id, None, 0, 0);
     }
 
     for (i, n) in nodes.iter().enumerate() {
         let incoming: Vec<usize> = lanes
+            .lanes
             .iter()
             .enumerate()
-            .filter_map(|(j, l)| (l.as_deref() == Some(n.change_id.as_str())).then_some(j))
+            .filter_map(|(j, l)| {
+                l.as_ref()
+                    .is_some_and(|l| l.target == n.change_id)
+                    .then_some(j)
+            })
             .collect();
 
         // Fold: a branch whose single parent is already targeted by an open lane renders as
@@ -166,98 +334,85 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         // above that line's first node would just grab the freed lane and leave its own base
         // to draw a second column; instead it opens the lane for the base and hangs off it.
         let (trunk, born) = match n.parents.as_slice() {
-            [p] if incoming.len() <= 1 => {
-                match lanes.iter().position(|l| l.as_deref() == Some(p.as_str())) {
-                    Some(t) if incoming.first().is_none_or(|&j| j > t) => (Some(t), false),
-                    None if n.stub
-                        && incoming.is_empty()
-                        && pos.get(p.as_str()).is_some_and(|&j| j > i) =>
-                    {
-                        (Some(open_lane(&mut lanes, p)), true)
-                    }
-                    _ => (None, false),
+            [p] if incoming.len() <= 1 => match lanes.targeting(p) {
+                Some(t) if incoming.first().is_none_or(|&j| j > t) => (Some(t), false),
+                None if n.stub
+                    && incoming.is_empty()
+                    && pos.get(p.as_str()).is_some_and(|&j| j > i) =>
+                {
+                    (Some(lanes.open(p, None, i, 0)), true)
                 }
-            }
+                _ => (None, false),
+            },
             _ => (None, false),
         };
         if let Some(trunk) = trunk {
             // The stub lane carrying the node's glyph, always to the right of the trunk so
             // the connector reads left-to-right (`├─●`): reuse the incoming lane when one
             // already flows in, else borrow a free lane right of the trunk.
+            let trunk_seg = lanes.seg_at(trunk);
             let stub = match incoming.first() {
-                Some(&j) => {
-                    lanes[j] = Some(n.change_id.clone());
-                    j
-                }
-                None => match (trunk + 1..lanes.len()).find(|&j| lanes[j].is_none()) {
-                    Some(s) => {
-                        lanes[s] = Some(n.change_id.clone());
-                        s
-                    }
-                    None => {
-                        lanes.push(Some(n.change_id.clone()));
-                        lanes.len() - 1
-                    }
-                },
+                Some(&j) => j,
+                None => lanes.open(&n.change_id, trunk_seg, i, trunk + 1),
             };
             // The folded row carries the node's id + first content line; the branch closes
             // on this same row.
             rows.push(GraphRow {
-                gutter: fold_gutter(&lanes, trunk, stub, n.glyph, born),
+                gutter: fold_gutter(&lanes.lanes, trunk, stub, n.glyph, born),
                 content: n.lines[0].clone(),
                 node_index: Some(n.orig),
                 change_id: Some(n.change_id.clone()),
             });
-            lanes[stub] = None;
+            lanes.close(stub, i, trunk_seg);
             for line in n.lines.iter().skip(1) {
                 rows.push(GraphRow {
-                    gutter: cont_gutter(&lanes, trunk, true),
+                    gutter: cont_gutter(&lanes.lanes, trunk, true),
                     content: line.clone(),
                     node_index: None,
                     change_id: None,
                 });
             }
-            while matches!(lanes.last(), Some(None)) {
-                lanes.pop();
-            }
+            lanes.settle(i, &mut rows);
             continue;
         }
 
         let col = match incoming.first() {
             Some(&c) => c,
             // Branch head: reuse a freed lane, else append.
-            None => open_lane(&mut lanes, &n.change_id),
+            None => lanes.open(&n.change_id, None, i, 0),
         };
-        lanes[col] = Some(n.change_id.clone());
+        let col_seg = lanes.seg_at(col);
 
         // Lanes to the right of col that also target this node merge into it.
         let merges: Vec<usize> = incoming.into_iter().filter(|&j| j != col).collect();
         if !merges.is_empty() {
             rows.push(GraphRow {
-                gutter: merge_link_row(&lanes, col, &merges),
+                gutter: merge_link_row(&lanes.lanes, col, &merges),
                 content: String::new(),
                 node_index: None,
                 change_id: None,
             });
             for &j in &merges {
-                lanes[j] = None;
+                lanes.close(j, i, col_seg);
             }
         }
 
         // Advance lanes to this node's parents first, tracking any lane freshly opened for
         // an extra parent so a merge (2+ parents) can draw its fork inline on the row below.
+        // Those open right of the merge, where its `─╮` fork can reach them.
         let mut opened: Vec<usize> = Vec::new();
         match n.parents.first() {
             Some(p0) => {
-                lanes[col] = Some(p0.clone());
+                if let Some(l) = lanes.lanes[col].as_mut() {
+                    l.target = p0.clone();
+                }
                 for p in n.parents.iter().skip(1) {
-                    let exists = lanes.iter().any(|l| l.as_deref() == Some(p.as_str()));
-                    if !exists {
-                        opened.push(open_lane(&mut lanes, p));
+                    if lanes.targeting(p).is_none() {
+                        opened.push(lanes.open(p, col_seg, i, col + 1));
                     }
                 }
             }
-            None => lanes[col] = None,
+            None => lanes.close(col, i, None),
         }
 
         // Commit row (carries the change_id for the id column). A merge fans out to multiple
@@ -266,7 +421,7 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         // a lane opens none, so no connector reaches it — a rare cross-merge the module
         // leaves to degrade, as with other deep shapes.)
         rows.push(GraphRow {
-            gutter: commit_gutter(&lanes, col, n.glyph, &opened),
+            gutter: commit_gutter(&lanes.lanes, col, n.glyph, &opened),
             content: n.lines[0].clone(),
             node_index: Some(n.orig),
             change_id: Some(n.change_id.clone()),
@@ -276,60 +431,165 @@ fn layout(nodes: &[SNode]) -> Vec<GraphRow> {
         let has_parent = !n.parents.is_empty();
         for line in n.lines.iter().skip(1) {
             rows.push(GraphRow {
-                gutter: cont_gutter(&lanes, col, has_parent),
+                gutter: cont_gutter(&lanes.lanes, col, has_parent),
                 content: line.clone(),
                 node_index: None,
                 change_id: None,
             });
         }
 
-        while matches!(lanes.last(), Some(None)) {
-            lanes.pop();
+        lanes.settle(i, &mut rows);
+    }
+
+    let mut segs = lanes.segs;
+    for s in &mut segs {
+        if s.end == usize::MAX {
+            s.end = nodes.len(); // still open at the bottom: runs off the loaded window
+        }
+    }
+    (rows, segs)
+}
+
+/// Columns for the segments of a greedy layout, chosen so lanes cross as rarely as possible.
+///
+/// A lane's connectors — the `●─╮` that opens it, the `├─╯`/`├─●` that closes it — run
+/// sideways from the lane it joins to its own column, crossing every lane open in between.
+/// Greedy leftmost-free placement puts whichever lane opens *first* nearest the trunk, so a
+/// long-lived branch (one that back-merges master, say) takes the inner column and every
+/// short PR branch opened and merged while it's alive has to cross it, twice. The fix is
+/// to nest: of two lanes joining the same lane, the one whose span lies inside the other's
+/// goes to its left, so it opens and closes without reaching past it. That is a partial
+/// order, given as edges `a → b` (col(a) < col(b)):
+///
+///   * a segment sits right of the lanes it forks out of and closes into, so its
+///     connectors read left-to-right; and
+///   * a segment nested in a sibling (same lane joined, span inside the other's) sits left
+///     of it — and so does everything hanging off the nested one while the sibling is open.
+///
+/// Columns then go out in an order respecting those edges: each segment takes the lowest
+/// column right of everything it must clear that no overlapping segment holds. Lanes that
+/// merely overlap (one opens inside the other and closes after) cross once whichever way
+/// round, so they only need distinct columns. A segment that joins nothing — HEAD's line, a
+/// line resuming below the window cut — may take the leftmost lane as before.
+///
+/// The greedy layout can join two segments both ways round (a lane opened out of another
+/// that later swaps which of the two continues), so the edges can cycle; the walk then
+/// carries on from the topmost segment left, and [`score`] judges the result.
+fn plan_columns(segs: &[Seg]) -> Vec<usize> {
+    let n = segs.len();
+    let overlaps = |a: &Seg, b: &Seg| a.start <= b.end && b.start <= a.end;
+    let anchor = |s: &Seg| s.target.or(s.source);
+
+    // What hangs off each segment: segments whose join chain (target, else source) runs
+    // through it. They sit right of it, so they must clear whatever it must clear.
+    let mut hanging: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for d in 0..n {
+        let mut cur = anchor(&segs[d]);
+        let mut guard = 0;
+        while let Some(a) = cur {
+            guard += 1;
+            if guard > n {
+                break; // joined both ways round — see above
+            }
+            hanging[a].push(d);
+            cur = anchor(&segs[a]);
         }
     }
 
-    // Birth of HEAD's reserved trunk lane. Pre-seeding lane 0 (above) makes it show a
-    // bare `│` on every row above HEAD, which reads as "the trunk continues upward
-    // off-screen". It doesn't: the trunk is born where it first does something — the
-    // topmost fork merging in, else HEAD's own commit. So blank that phantom `│` on
-    // the rows above the birth, and if the birth is a merge, turn its `├` T-junction
-    // into a `╭` corner (nothing continues above it). Lower forks keep their `├`, since
-    // for them the trunk genuinely continues up to the birth.
-    if nodes.iter().any(|n| n.glyph == '@')
-        && let Some(birth) = rows.iter().position(|r| !r.gutter.starts_with('│'))
-    {
-        for r in &mut rows[..birth] {
-            if let Some(rest) = r.gutter.strip_prefix('│') {
-                r.gutter = format!(" {rest}");
+    // Everything each segment must sit right of through its own joins, transitively: the
+    // nesting rule never overrides these (a lane opened out of a sibling stays right of it).
+    let mut right_of: Vec<std::collections::HashSet<usize>> = vec![Default::default(); n];
+    for i in 0..n {
+        let mut stack: Vec<usize> = [segs[i].source, segs[i].target]
+            .into_iter()
+            .flatten()
+            .collect();
+        while let Some(a) = stack.pop() {
+            if right_of[i].insert(a) {
+                stack.extend([segs[a].source, segs[a].target].into_iter().flatten());
             }
         }
-        if let Some(rest) = rows[birth].gutter.strip_prefix('├') {
-            rows[birth].gutter = format!("╭{rest}");
+    }
+    let joined = |a: usize, b: usize| right_of[a].contains(&b) || right_of[b].contains(&a);
+
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, s) in segs.iter().enumerate() {
+        for a in [s.source, s.target].into_iter().flatten() {
+            succ[a].push(i);
         }
     }
-    rows
+    for (k, ks) in segs.iter().enumerate() {
+        for (o, os) in segs.iter().enumerate() {
+            let nested = (ks.start, ks.end) != (os.start, os.end)
+                && ks.start >= os.start
+                && ks.end <= os.end;
+            let twin = (ks.start, ks.end) == (os.start, os.end) && k < o;
+            if k == o
+                || anchor(ks).is_none()
+                || anchor(ks) != anchor(os)
+                || !(nested || twin)
+                || joined(k, o)
+            {
+                continue;
+            }
+            succ[k].push(o);
+            for &d in &hanging[k] {
+                if d != o && overlaps(&segs[d], os) && !joined(d, o) {
+                    succ[d].push(o);
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm, ready segments taken top-down (by opening row, then id) so the
+    // result is deterministic and, with nothing to untangle, matches the greedy layout.
+    let mut indeg = vec![0usize; n];
+    for s in &succ {
+        for &b in s {
+            indeg[b] += 1;
+        }
+    }
+    let mut ready: std::collections::BTreeSet<(usize, usize)> = (0..n)
+        .filter(|&i| indeg[i] == 0)
+        .map(|i| (segs[i].start, i))
+        .collect();
+    let mut floor = vec![0usize; n];
+    let mut col: Vec<Option<usize>> = vec![None; n];
+    for _ in 0..n {
+        // Topmost ready segment; on a cycle, the topmost one not yet placed.
+        let i = match ready.pop_first() {
+            Some((_, i)) => i,
+            None => match (0..n)
+                .filter(|&i| col[i].is_none())
+                .min_by_key(|&i| segs[i].start)
+            {
+                Some(i) => i,
+                None => break,
+            },
+        };
+        let s = &segs[i];
+        let joins = s.source.is_some() || s.target.is_some();
+        let mut c = floor[i].max(usize::from(joins));
+        while (0..n).any(|j| col[j] == Some(c) && overlaps(&segs[j], s)) {
+            c += 1;
+        }
+        col[i] = Some(c);
+        for &b in &succ[i] {
+            floor[b] = floor[b].max(c + 1);
+            indeg[b] = indeg[b].saturating_sub(1);
+            if indeg[b] == 0 && col[b].is_none() {
+                ready.insert((segs[b].start, b));
+            }
+        }
+    }
+    col.into_iter().map(|c| c.unwrap_or(0)).collect()
 }
 
 fn gutter_width(nlanes: usize) -> usize {
     if nlanes == 0 { 1 } else { 2 * nlanes - 1 }
 }
 
-/// Claim a lane flowing toward `target`: the leftmost freed lane, else a new one on the
-/// right. Returns its index.
-fn open_lane(lanes: &mut Vec<Option<String>>, target: &str) -> usize {
-    match lanes.iter().position(|l| l.is_none()) {
-        Some(j) => {
-            lanes[j] = Some(target.to_string());
-            j
-        }
-        None => {
-            lanes.push(Some(target.to_string()));
-            lanes.len() - 1
-        }
-    }
-}
-
-fn commit_gutter(lanes: &[Option<String>], col: usize, glyph: char, opened: &[usize]) -> String {
+fn commit_gutter(lanes: &[Option<Lane>], col: usize, glyph: char, opened: &[usize]) -> String {
     let mut cells = vec![' '; gutter_width(lanes.len())];
     let max_open = opened.iter().max().copied();
     for (j, lane) in lanes.iter().enumerate() {
@@ -356,7 +616,7 @@ fn commit_gutter(lanes: &[Option<String>], col: usize, glyph: char, opened: &[us
     trim_end(cells)
 }
 
-fn cont_gutter(lanes: &[Option<String>], col: usize, has_parent: bool) -> String {
+fn cont_gutter(lanes: &[Option<Lane>], col: usize, has_parent: bool) -> String {
     let mut cells = vec![' '; gutter_width(lanes.len())];
     for (j, lane) in lanes.iter().enumerate() {
         cells[2 * j] = if j == col {
@@ -370,7 +630,7 @@ fn cont_gutter(lanes: &[Option<String>], col: usize, has_parent: bool) -> String
     trim_end(cells)
 }
 
-fn merge_link_row(lanes: &[Option<String>], col: usize, merges: &[usize]) -> String {
+fn merge_link_row(lanes: &[Option<Lane>], col: usize, merges: &[usize]) -> String {
     let mut cells = vec![' '; gutter_width(lanes.len())];
     for (j, lane) in lanes.iter().enumerate() {
         cells[2 * j] = if j == col {
@@ -399,7 +659,7 @@ fn merge_link_row(lanes: &[Option<String>], col: usize, merges: &[usize]) -> Str
 /// lane starts on this row — nothing above it belongs to that lane — so the T-junction
 /// becomes a `╭` corner, exactly as it does for the topmost fork into HEAD's own lane.
 fn fold_gutter(
-    lanes: &[Option<String>],
+    lanes: &[Option<Lane>],
     trunk: usize,
     stub: usize,
     glyph: char,
@@ -749,6 +1009,63 @@ mod tests {
         assert_eq!(
             gutters(&render(&nodes)),
             vec!["@", "×─╮", "● │", "├─●", "◆"],
+        );
+    }
+
+    #[test]
+    fn a_long_lived_branch_runs_outside_the_short_ones_it_spans() {
+        // `w1`→`w2` is a long-lived branch: `m1` merges it at the top, but its own base is at
+        // the bottom, so its lane spans the whole log. A short PR (`s1`, merged by `a`) opens
+        // and closes inside that span. Placed first-come (leftmost free), the long lane took
+        // the inner column and the short one had to cross it both ways (`◻─│─╮`, `├─│─◻`);
+        // nested, the short one runs inside it and nothing crosses.
+        let nodes = vec![
+            node("m1", &["a", "w1"], '@', &["merge long branch"]),
+            node("w1", &["w2"], '◻', &["long branch tip"]),
+            node("a", &["b", "s1"], '◻', &["merge short PR"]),
+            node("s1", &["b"], '◻', &["short PR"]),
+            node("w2", &["b"], '◻', &["long branch base"]),
+            node("b", &[], '◆', &["base"]),
+        ];
+        assert_eq!(
+            gutters(&render(&nodes)),
+            vec!["@───╮", "│   ◻", "◻─╮ │", "├─◻ │", "├───◻", "◆"],
+        );
+    }
+
+    #[test]
+    fn a_merge_opens_its_extra_parent_lane_to_its_right() {
+        // The merge `w` sits in column 2 while column 0 is free (HEAD's line has ended). Its
+        // extra parent's lane used to take the leftmost free column — 0, left of the merge,
+        // where its `─╮` fork can't reach (`╮ │ ◻`). It opens to the right instead.
+        let nodes = vec![
+            node("x", &["y"], '◻', &["line x"]),
+            node("z", &["w"], '◻', &["line z"]),
+            node("h", &[], '@', &["HEAD"]),
+            node("w", &["y", "q"], '◻', &["merge"]),
+            node("q", &["y"], '◻', &["merged in"]),
+            node("y", &[], '◻', &["base"]),
+        ];
+        let rows = render(&nodes);
+        assert_eq!(rows[3].gutter, "  │ ◻─╮");
+    }
+
+    #[test]
+    fn a_lone_line_left_off_the_leftmost_lane_moves_home() {
+        // HEAD's line ends (here a root; in practice it runs off the loaded window) while
+        // another line carries on in column 1. Rather than stay indented behind an empty
+        // column to the bottom, it moves home with one `╭─╯` row.
+        let nodes = vec![
+            node("s", &["t"], '◻', &["side line"]),
+            node("h", &[], '@', &["HEAD"]),
+            node("t", &["u"], '◻', &["carries on"]),
+            node("u", &[], '◻', &["base"]),
+        ];
+        let rows = render(&nodes);
+        assert_eq!(gutters(&rows), vec!["  ◻", "@ │", "╭─╯", "◻", "◻"]);
+        assert_eq!(
+            rows[2].node_index, None,
+            "the move is a link row, not a node"
         );
     }
 

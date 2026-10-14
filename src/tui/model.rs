@@ -100,9 +100,27 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     // line. Without this the revisions below the cut aren't recognised as trunk, so agents
     // forked off them never anchor: one takes the lane outright, the next holds a lane open
     // across the whole block, and the third is pushed out to a `├─│─○` third column.
+    //
+    // A new line is only one that really is cut off: its first-parent chain must run off the
+    // window without ever landing on the trunk. One that lands on it — however far down — is
+    // a side branch to lift, not a line. jj's recency order can float a side branch's tip
+    // above its base, and resuming the trunk there marked the whole branch trunk, so it was
+    // never lifted and its lane ran from the top of the log across every agent below.
     let by_id: std::collections::HashMap<&str, &RevInfo> =
         revs.iter().map(|r| (r.change_id.as_str(), r)).collect();
     let mut on_trunk: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let lands_on_trunk = |on_trunk: &std::collections::HashSet<String>, start: &RevInfo| {
+        let mut cur = start;
+        for _ in 0..revs.len() {
+            let Some(p) = cur.parents.first() else { return false };
+            if on_trunk.contains(p) {
+                return true;
+            }
+            let Some(&r) = by_id.get(p.as_str()) else { return false };
+            cur = r;
+        }
+        false // cycle guard — never on a DAG
+    };
     let mut cur = Some(head_id.clone());
     loop {
         while let Some(id) = cur.take() {
@@ -115,7 +133,7 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
         let next = revs.iter().find(|r| {
             !on_trunk.contains(&r.change_id)
                 && task_id_of(&r.change_id).is_none()
-                && !r.parents.first().is_some_and(|p| on_trunk.contains(p))
+                && !lands_on_trunk(&on_trunk, r)
         });
         match next {
             Some(r) => cur = Some(r.change_id.clone()),
@@ -130,6 +148,27 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     // recency order — and it is total and deterministic, with a rev carrying no faff task (a
     // stray workspace) sorting last. Doubles as the branch tree: a branch is exactly what is
     // reachable through these edges, since a first-parent child rides its parent's lane.
+    //
+    // One exception goes ahead of that: a branch that a merge pulls in. The merge's row opens
+    // a lane for it, so any sibling stacked between the merge and that branch would run
+    // beside the lane and cross it to fold back. Put first, the merged branch closes the lane
+    // on the very next rows. Several merged into one base — a run of PRs merged one after
+    // another — go lowest merge first: the lanes then close in the reverse of the order they
+    // opened, each nested inside the one before, rather than every closing lane crossing the
+    // ones still open. `merged_at` maps every revision whose first-parent line ends up as a
+    // merge's extra parent to that merge's position; the walk is child→parent, so a child
+    // marks its parent first.
+    let mut merged_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, r) in revs.iter().enumerate() {
+        for p in r.parents.iter().skip(1) {
+            merged_at.insert(p.as_str(), i);
+        }
+        if let Some(&m) = merged_at.get(r.change_id.as_str())
+            && let Some(p) = r.parents.first()
+        {
+            merged_at.entry(p.as_str()).or_insert(m);
+        }
+    }
     let mut kids: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for (i, r) in revs.iter().enumerate() {
         if let Some(p) = r.parents.first() {
@@ -139,7 +178,12 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     for v in kids.values_mut() {
         v.sort_by(|&a, &b| {
             let (ka, kb) = (task_id_of(&revs[a].change_id), task_id_of(&revs[b].change_id));
-            kb.cmp(&ka)
+            let (ma, mb) = (
+                merged_at.get(revs[a].change_id.as_str()),
+                merged_at.get(revs[b].change_id.as_str()),
+            );
+            mb.cmp(&ma)
+                .then_with(|| kb.cmp(&ka))
                 .then_with(|| revs[a].change_id.cmp(&revs[b].change_id))
         });
     }
@@ -747,12 +791,13 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "pnoounou", "onnosvup", "rkrrupqn", "oztsompu", "poqnvpzq", "wotounsx",
-                "urzuyvvl", "owpmrpwq", "ymtvxlyn", "wkovrsru", "uwpmoxsy", "sqntutps",
+                "pnoounou", "ymtvxlyn", "onnosvup", "rkrrupqn", "oztsompu", "poqnvpzq",
+                "wotounsx", "urzuyvvl", "owpmrpwq", "wkovrsru", "uwpmoxsy", "sqntutps",
                 "xxzzqsrp", "xunlwwqm",
             ],
             "the sqntutps branch (base + agent #175) moves as one, to just above the trunk \
-             revision xxzzqsrp it forks from — below wkovrsru, not straddling it"
+             revision xxzzqsrp it forks from — below wkovrsru, not straddling it; the \
+             rkrrupqn line lands on wkovrsru, so it is a branch lifted there too, after #176"
         );
 
         let m = build(&revs, &workspaces, &tasks);
@@ -763,7 +808,7 @@ mod tests {
         assert_eq!(
             gutters,
             vec![
-                "@", "│ ╭─●", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "├─◻", "├─○", "◆", "│ ╭─○",
+                "@", "├─○", "│ ╭─●", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "├─◻", "◆", "│ ╭─○",
                 "├─◻", "◻", "◻",
             ],
             "#176 folds onto the trunk as ├─○ and the ◆ fork point is a clean single lane; \
@@ -771,6 +816,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_side_line_that_lands_on_the_trunk_is_a_branch_not_a_new_line() {
+        // Regression, from a real screenshot (change ids are the reported ones, abbreviated):
+        //
+        //     │ ╭─●  [zlvlzspr] #263 ✓ :: …       ← agent zoomed to the top
+        //     │ ◻    [uquuznxn] Replica messages …
+        //     ├─│─●  [qlpwxlrw] #267 ✓ :: …       ← every agent pushed past its lane
+        //     ◆─│─╮  [owqmqkqm] … (#74)
+        //     …
+        //     ◻─│─╮  [qvzuoxzq] … (#73)
+        //     │ ◻ │  [xsttkxuz] …
+        //     ├─◻ │  [vykzlnlw] …
+        //     ├───◻  [ktlqqxys] …
+        //
+        // `uqu → xst → vyk` is a side branch off the trunk revision `qrw`, carrying agent #263.
+        // jj's recency order floats `uqu` to the top. The trunk walk resumed a "new line" at
+        // the first non-trunk revision whose parent wasn't on the trunk *yet* — `uqu` — which
+        // exists for lines cut off by the window edge, but `uqu`'s line isn't cut off: it
+        // lands on `qrw`. Marking it trunk meant `vyk` was no longer a fork, so the branch
+        // was never lifted and its lane ran from the top of the log down across every agent.
+        let mut revs = vec![
+            rev("vtvt", &["owq"], false, false, "Runtime liveness"), // #261
+            rev("qlpw", &["owq"], false, false, "myrmic --version"), // #267
+            rev("zlv", &["uqu"], false, false, "Identify runtimes"), // #263, floats
+            rev("uqu", &["xst"], false, false, "Replica messages block"),
+            rev("ynrw", &["owq"], true, true, ""), // @
+            rev("owq", &["qvz", "wlm"], false, true, "fix: timer ticks (#74)"),
+            rev("wlm", &["lpp"], false, false, "fix(myrmic-cli)"),
+            rev("lpp", &["qvz"], false, false, "fix(esp-hal)"),
+            rev("qvz", &["qrw", "ktl"], false, true, "Ignore advisories (#73)"),
+            rev("ktl", &["qrw"], false, false, "Ignore advisories"),
+            rev("xst", &["vyk"], false, false, "CLI connects as a client"),
+            rev("vyk", &["qrw"], false, false, "Add zone option"),
+            rev("qrw", &[], false, false, "swarm: supervise plugins"),
+        ];
+        let workspaces: Vec<Workspace> = [("261", "vtvt"), ("263", "zlv"), ("267", "qlpw")]
+            .iter()
+            .map(|(id, cid)| Workspace {
+                name: format!("faf-task-{id}"),
+                change_id: (*cid).into(),
+            })
+            .collect();
+        let tasks = vec![
+            task(261, "faf-task-261", TaskStatus::Idle),
+            task(263, "faf-task-263", TaskStatus::Idle),
+            task(267, "faf-task-267", TaskStatus::Idle),
+        ];
+
+        order_by_fork_point(&mut revs, &workspaces, &tasks);
+        let m = build(&revs, &workspaces, &tasks);
+        let gutters: Vec<String> = crate::graph::render(&m.nodes)
+            .iter()
+            .map(|r| r.gutter.clone())
+            .collect();
+        assert_eq!(
+            gutters,
+            vec![
+                "@", "├─●", "├─●", "◆─╮", "│ ◻", "├─◻", "◻─╮", "├─◻", "│ ╭─●", "│ ◻", "│ ◻",
+                "├─◻", "◻",
+            ],
+            "the uqu branch, #263 included, is lifted whole onto qrw; nothing crosses a lane"
+        );
+    }
+
+    #[test]
+    fn a_branch_merged_by_the_trunk_sits_first_among_its_siblings() {
+        // `qvz` merges `zkt` in, so its row opens a lane for `zkt`. Any sibling branch slotted
+        // between `qvz` and `zkt` runs alongside that lane and has to cross it to fold back
+        // into the trunk. The merged-in branch goes first, whatever its id, so it closes the
+        // lane on the very next row.
+        let mut revs = vec![
+            rev("head", &["qvz"], true, false, "head"),
+            rev("qvz", &["base", "zkt"], false, true, "merge"),
+            rev("side", &["base"], false, false, "side"),
+            rev("zkt", &["base"], false, false, "merged in"),
+            rev("base", &[], false, false, "base"),
+        ];
+        order_by_fork_point(&mut revs, &[], &[]);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(order, vec!["head", "qvz", "zkt", "side", "base"]);
+        let m = build(&revs, &[], &[]);
+        let gutters: Vec<String> = crate::graph::render(&m.nodes)
+            .iter()
+            .map(|r| r.gutter.clone())
+            .collect();
+        assert_eq!(gutters, vec!["@", "◻─╮", "├─◻", "├─◻", "◻"]);
+    }
+
+
+    #[test]
+    fn prs_merged_in_a_run_close_in_reverse_so_their_lanes_nest() {
+        // Three PRs off `base`, merged one after another (`m3` on top). Each merge opens a
+        // lane; for none to cross, the lanes must close in the reverse of the order they
+        // opened — the PR merged lowest (`c1`, by `m1`) folds back first. Stacked by id
+        // instead (`a3`, `b2`, `c1`) every closing lane crossed the ones still open.
+        let mut revs = vec![
+            rev("head", &["m3"], true, false, "head"),
+            rev("m3", &["m2", "a3"], false, true, "merge a3"),
+            rev("m2", &["m1", "b2"], false, true, "merge b2"),
+            rev("m1", &["base", "c1"], false, true, "merge c1"),
+            rev("a3", &["base"], false, false, "a3"),
+            rev("b2", &["base"], false, false, "b2"),
+            rev("c1", &["base"], false, false, "c1"),
+            rev("base", &[], false, false, "base"),
+        ];
+        order_by_fork_point(&mut revs, &[], &[]);
+        let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
+        assert_eq!(order, vec!["head", "m3", "m2", "m1", "c1", "b2", "a3", "base"]);
+        let m = build(&revs, &[], &[]);
+        let gutters: Vec<String> = crate::graph::render(&m.nodes)
+            .iter()
+            .map(|r| r.gutter.clone())
+            .collect();
+        assert_eq!(
+            gutters,
+            vec!["@", "◻─────╮", "◻───╮ │", "◻─╮ │ │", "├─◻ │ │", "├───◻ │", "├─────◻", "◻"],
+        );
+    }
 
     fn rev(id: &str, parents: &[&str], cwc: bool, empty: bool, desc: &str) -> RevInfo {
         RevInfo {
@@ -1036,19 +1199,19 @@ mod tests {
     }
 
     #[test]
-    fn order_by_fork_point_falls_back_when_a_branch_is_not_off_the_trunk() {
-        // `a2` forked off another agent (`a1`), not a trunk node: the flat anchoring
-        // doesn't apply, so it falls back to the conservative pin (HEAD's line first,
-        // everything else left in place).
+    fn a_revision_forked_off_a_branch_is_lifted_with_it() {
+        // `a2` forked off `a1`, not a trunk node. Its line still lands on the trunk (via
+        // `a1`), so it isn't a line of its own: `a1`'s branch is lifted whole, `a2` riding
+        // on top of it, child above parent.
         let mut revs = vec![
             rev("head", &["base"], true, true, ""),
+            rev("a2", &["a1"], false, true, ""), // off `a1`, not the trunk
             rev("a1", &["base"], false, true, ""),
-            rev("a2", &["a1"], false, true, ""), // off an agent, not the trunk
             rev("base", &[], false, false, "base"),
         ];
         order_by_fork_point(&mut revs, &[], &[]);
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
-        assert_eq!(order, vec!["head", "a1", "a2", "base"]);
+        assert_eq!(order, vec!["head", "a2", "a1", "base"]);
     }
 
     #[test]
@@ -1486,3 +1649,4 @@ mod tests {
 
 
 }
+
