@@ -20,6 +20,6 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Tui { repo } => faff::tui::run(repo),
-        Command::Logs { revisions, repo } => faff::tui::run_logs(repo, revisions),
+        Command::Logs { repo } => faff::tui::run_logs(repo),
     }
 }

@@ -8,9 +8,10 @@
 //! hanging off it: the "fork, then merge back" shape a merge-based workflow leaves behind.
 //! Folded, the whole pair reads as the merge alone, with a `(+N)` for the side commits.
 
+use super::revops::Found;
 use crate::domain::TaskId;
 use crate::graph::{self, GraphNode, GraphRow};
-use crate::jj::{RevInfo, Workspace};
+use crate::jj::{MatchKind, RevInfo, Workspace};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Matcher, Utf32Str};
 use std::cell::RefCell;
@@ -39,6 +40,10 @@ pub enum Field {
     Email,
     /// The whole description, body included.
     Description,
+    /// A path the revision changed (found by jj, not the fuzzy match).
+    File,
+    /// A line the revision added or removed (likewise).
+    Line,
 }
 
 impl Field {
@@ -52,8 +57,35 @@ impl Field {
             Field::CommitId => "commit",
             Field::Email => "email",
             Field::Description => "desc",
+            Field::File => "file",
+            Field::Line => "line",
         }
     }
+
+    /// The icon a row found in its files carries, before its description.
+    pub fn icon(self) -> Option<char> {
+        match self {
+            Field::File => Some('▤'),
+            Field::Line => Some('±'),
+            _ => None,
+        }
+    }
+}
+
+/// Shortest query searched for in the files: shorter ones match nearly every revision.
+pub const FILE_QUERY_MIN: usize = 3;
+
+/// What a search query asks jj to find in the files: the query without the fuzzy
+/// matcher's own syntax (a leading `'` or `^`, a trailing `$`), once it's long enough and
+/// not a negation.
+pub fn file_query(query: &str) -> Option<String> {
+    let q = query.trim();
+    let q = q
+        .strip_prefix('\'')
+        .or_else(|| q.strip_prefix('^'))
+        .unwrap_or(q);
+    let q = q.strip_suffix('$').unwrap_or(q);
+    (q.chars().count() >= FILE_QUERY_MIN && !q.starts_with('!')).then(|| q.to_string())
 }
 
 /// Where a hit matched: per field, its text and the matched character positions in it.
@@ -118,6 +150,12 @@ pub struct LogView {
     /// Merges opened with `→`.
     expanded: HashSet<String>,
     pub selected: Option<String>,
+    /// What jj found in the files for a search: hits alongside the fuzzy ones while its
+    /// query is the search's.
+    pub found: Option<Found>,
+    /// Older history is left to load, so `↓` on the last row stays put rather than
+    /// wrapping to the top.
+    pub more: bool,
     search: Option<Search>,
     matcher: RefCell<Matcher>,
 
@@ -253,7 +291,12 @@ impl LogView {
         }
         let n = ids.len() as isize;
         let cur = self.selected_pos().unwrap_or(0) as isize;
-        self.selected = Some(ids[(cur + delta).rem_euclid(n) as usize].to_string());
+        let to = if self.more && cur + delta >= n {
+            n - 1
+        } else {
+            (cur + delta).rem_euclid(n)
+        };
+        self.selected = Some(ids[to as usize].to_string());
     }
 
     fn step_hits(&mut self, delta: isize) {
@@ -466,6 +509,18 @@ impl LogView {
                     *s = None;
                 }
             }
+            // jj's finds are hits too, below every fuzzy one for where a new query lands.
+            for (i, part) in self.file_parts() {
+                if scores[i].is_none() {
+                    // Not a fuzzy hit: drop whatever it matched below the bar.
+                    scores[i] = Some(0);
+                    found[i] = None;
+                }
+                found[i]
+                    .get_or_insert_with(|| Hit { parts: Vec::new() })
+                    .parts
+                    .push(part);
+            }
         }
         self.matched = self
             .nodes
@@ -575,6 +630,57 @@ impl LogView {
         self.row_task = row_task;
         self.gaps = gaps;
     }
+}
+
+impl LogView {
+    /// The hit part each loaded node gets from what jj found in the files, when that's for
+    /// the current query.
+    fn file_parts(&self) -> Vec<(usize, HitPart)> {
+        let (Some(found), Some(query)) = (
+            &self.found,
+            self.search.as_ref().and_then(|s| file_query(&s.query)),
+        ) else {
+            return Vec::new();
+        };
+        if found.query != query {
+            return Vec::new();
+        }
+        let lower: Vec<char> = query.to_lowercase().chars().collect();
+        let mut parts = Vec::new();
+        for m in &found.matches {
+            let Some(i) = self.nodes.iter().position(|n| n.change_id == m.change_id) else {
+                continue;
+            };
+            let field = match m.kind {
+                MatchKind::Path => Field::File,
+                MatchKind::Line => Field::Line,
+            };
+            parts.push((
+                i,
+                HitPart {
+                    field,
+                    indices: find_ignoring_case(&m.text, &lower),
+                    text: m.text.clone(),
+                },
+            ));
+        }
+        parts
+    }
+}
+
+/// The character positions of the first place `text` contains `lower` (a lowercase
+/// needle), ignoring case.
+fn find_ignoring_case(text: &str, lower: &[char]) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    // Lowercasing can change a character's length; fall back to no highlight then.
+    if chars.len() != text.chars().count() || lower.is_empty() {
+        return Vec::new();
+    }
+    chars
+        .windows(lower.len())
+        .position(|w| w == lower)
+        .map(|at| (at..at + lower.len()).collect())
+        .unwrap_or_default()
 }
 
 /// Everything a revision is searched by, field by field: its row text, bookmarks and the
@@ -1067,6 +1173,50 @@ mod tests {
         // A negated word rules a revision out if any field has it.
         v.set_query("typo !hamish".into());
         assert!(v.hits().is_empty());
+    }
+
+    #[test]
+    fn only_a_long_enough_plain_query_is_searched_for_in_the_files() {
+        assert_eq!(file_query("ab"), None);
+        assert_eq!(file_query(" revops "), Some("revops".into()));
+        assert_eq!(file_query("'fn main"), Some("fn main".into()));
+        assert_eq!(file_query("^src$"), Some("src".into()));
+        assert_eq!(file_query("!lanes"), None);
+    }
+
+    #[test]
+    fn what_jj_found_in_the_files_are_hits_for_their_own_query_alone() {
+        let found = |kind, text: &str, cid: &str| crate::jj::FileMatch {
+            change_id: cid.into(),
+            commit_id: format!("c-{cid}"),
+            kind,
+            text: text.into(),
+        };
+        let mut v = view(history(), &[]);
+        v.found = Some(Found {
+            query: "lanes".into(),
+            matches: vec![
+                found(MatchKind::Path, "src/LANES.rs", "m1"),
+                found(MatchKind::Line, "fn lanes()", "m0"),
+            ],
+        });
+        v.open_search();
+        v.set_query("lanes".into());
+        // The fuzzy hits (the rows saying "lanes") and jj's finds.
+        assert_eq!(v.hits(), ["m2", "s2", "s1", "m1", "m0"]);
+        assert_eq!(
+            v.selected.as_deref(),
+            Some("m2"),
+            "lands on the best fuzzy hit"
+        );
+        let part = &v.hit("m1").unwrap().parts[0];
+        assert_eq!((part.field, part.field.icon()), (Field::File, Some('▤')));
+        assert_eq!(part.indices, (4..9).collect::<Vec<_>>(), "case ignored");
+        assert_eq!(v.hit("m0").unwrap().parts[0].field, Field::Line);
+
+        // A query the finds weren't for doesn't show them.
+        v.set_query("lanes!".into());
+        assert!(v.hit("m1").is_none() && v.hit("m0").is_none());
     }
 
     #[test]

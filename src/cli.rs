@@ -30,12 +30,9 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// The live log view alone: no agents, no database. Reloads as jj records operations
-    /// and snapshots this checkout when its files change.
+    /// The live log view alone, over your `revsets.log`: no agents, no database. Reloads
+    /// as jj records operations and snapshots this checkout when its files change.
     Logs {
-        /// Revisions to show. Defaults to your `revsets.log`.
-        #[arg(short = 'r', long = "revisions")]
-        revisions: Option<String>,
         /// Path to the jj checkout. Defaults to the current directory's.
         #[arg(long)]
         repo: Option<PathBuf>,

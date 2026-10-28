@@ -75,13 +75,18 @@ pub struct Workspace {
 
 /// Run `jj -R <repo> --no-pager <args>` and return stdout, erroring with stderr.
 fn run_jj(repo: &Path, args: &[&str]) -> Result<String> {
+    run_jj_for(repo, args, JJ_TIMEOUT)
+}
+
+/// [`run_jj`], given up on after `timeout`.
+fn run_jj_for(repo: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String> {
     let out = crate::proc::output(
         Command::new("jj")
             .arg("-R")
             .arg(repo)
             .arg("--no-pager")
             .args(args),
-        JJ_TIMEOUT,
+        timeout,
     )
     .map_err(|e| crate::proc::failure(format!("jj {args:?}"), "is jj on PATH?", e))?;
     if !out.status.success() {
@@ -220,20 +225,6 @@ pub fn log(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
 /// [`log`] without snapshotting or importing git refs (see [`peek_jj`]).
 pub fn log_peek(repo: &Path, revset: &str) -> Result<Vec<RevInfo>> {
     Ok(parse_log(&peek_jj(repo, &log_args(revset))?))
-}
-
-/// The revset for the revision graph: `ancestors(<each workspace's @> | @, limit)`.
-///
-/// Each workspace is named by its `<name>@` working-copy reference, **not** by its
-/// change_id. A change_id that has gone *divergent* (two visible commits share it) is
-/// ambiguous as a bare revset symbol, so `jj log` errors out ("Change ID … is divergent")
-/// and takes the whole graph down with it — every task then falls into the detached list.
-/// `<name>@` names the one commit each workspace actually sits on, so a divergent agent
-/// still resolves to a single node. `@` (your own working copy) is included unconditionally.
-pub fn workspace_ancestors_revset(workspaces: &[Workspace], limit: usize) -> String {
-    let mut heads: Vec<String> = workspaces.iter().map(|w| format!("{}@", w.name)).collect();
-    heads.push("@".to_string());
-    format!("ancestors({}, {})", heads.join(" | "), limit)
 }
 
 /// All workspaces attached to the repo and the change_id each is checked out at.
@@ -475,6 +466,120 @@ pub fn revset_str(s: &str) -> String {
     out
 }
 
+/// What a file search matched in a revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchKind {
+    /// A path the revision changed.
+    Path,
+    /// A line the revision added or removed.
+    Line,
+}
+
+/// A revision a file search found: its change, its commit (which names it unambiguously,
+/// even divergent, for loading it), and the path or line that matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileMatch {
+    pub change_id: String,
+    pub commit_id: String,
+    pub kind: MatchKind,
+    pub text: String,
+}
+
+/// Most revisions one file search returns, of each kind.
+pub const FILE_MATCH_MAX: usize = 50;
+
+/// How long a file search may walk history before it's given up on.
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`peek_jj`] for a file search, given up on after [`SEARCH_TIMEOUT`].
+fn peek_search(repo: &Path, args: &[&str]) -> Result<String> {
+    let mut full = vec!["--ignore-working-copy"];
+    full.extend_from_slice(args);
+    run_jj_for(repo, &full, SEARCH_TIMEOUT)
+}
+
+/// `jj log` arguments listing up to [`FILE_MATCH_MAX`] of `revset`, newest first, one
+/// `\x1e`-terminated record of `template` each.
+fn search_args<'a>(revset: &'a str, template: &'a str, max: &'a str) -> [&'a str; 8] {
+    ["log", "--no-graph", "-n", max, "-r", revset, "-T", template]
+}
+
+/// A glob matching any path with `needle` in it, its own glob characters taken literally.
+fn path_glob(needle: &str) -> String {
+    let mut glob = String::from("**/*");
+    for c in needle.chars() {
+        match c {
+            '*' | '?' | '[' | ']' | '{' | '}' => {
+                glob.push('[');
+                glob.push(c);
+                glob.push(']');
+            }
+            // No literal backslash in a glob: any one character will do.
+            '\\' => glob.push('?'),
+            c => glob.push(c),
+        }
+    }
+    glob.push('*');
+    glob
+}
+
+/// Revisions that changed a path containing `needle` (ignoring case), each with the
+/// first such path. Without snapshotting.
+pub fn search_paths(repo: &Path, needle: &str) -> Result<Vec<FileMatch>> {
+    let fileset = format!("root-glob-i:{}", revset_str(&path_glob(needle)));
+    let revset = format!("files({fileset})");
+    let template = format!(
+        r#"change_id ++ "\x1f" ++ commit_id ++ "\x1f" ++ self.diff({}).files().map(|f| f.path()).join("\x1d") ++ "\x1e""#,
+        revset_str(&fileset)
+    );
+    let max = FILE_MATCH_MAX.to_string();
+    let out = peek_search(repo, &search_args(&revset, &template, &max))?;
+    Ok(parse_matches(&out, MatchKind::Path, |paths| {
+        paths.split(GS).next().unwrap_or("").to_string()
+    }))
+}
+
+/// Revisions that added or removed a line containing `needle` (ignoring case), each with
+/// the first such line. Without snapshotting.
+pub fn search_lines(repo: &Path, needle: &str) -> Result<Vec<FileMatch>> {
+    let revset = format!("diff_lines(substring-i:{})", revset_str(needle));
+    let template = r#"change_id ++ "\x1f" ++ commit_id ++ "\x1f" ++ self.diff().git() ++ "\x1e""#;
+    let max = FILE_MATCH_MAX.to_string();
+    let out = peek_search(repo, &search_args(&revset, template, &max))?;
+    let lower = needle.to_lowercase();
+    Ok(parse_matches(&out, MatchKind::Line, |diff| {
+        changed_line(diff, &lower).unwrap_or_default()
+    }))
+}
+
+/// The first line a git diff adds or removes that contains `lower` (lowercase), trimmed.
+fn changed_line(diff: &str, lower: &str) -> Option<String> {
+    diff.lines()
+        .filter(|l| !l.starts_with("+++") && !l.starts_with("---"))
+        .filter_map(|l| l.strip_prefix('+').or_else(|| l.strip_prefix('-')))
+        .find(|l| l.to_lowercase().contains(lower))
+        .map(|l| l.trim().to_string())
+}
+
+/// Split [`search_args`] records into matches, `text` picking what matched out of each
+/// record's last field.
+fn parse_matches(out: &str, kind: MatchKind, text: impl Fn(&str) -> String) -> Vec<FileMatch> {
+    out.split(RS)
+        .filter_map(|record| {
+            let mut f = record.splitn(3, US);
+            let change_id = f.next()?.trim_start_matches('\n').to_string();
+            let commit_id = f.next()?.to_string();
+            Some(FileMatch {
+                change_id,
+                commit_id,
+                kind,
+                text: text(f.next().unwrap_or("")),
+            })
+        })
+        .filter(|m| !m.change_id.is_empty())
+        .collect()
+}
+
 /// `jj new --no-edit <parent> -m <message>`: a new empty revision on `parent` that no
 /// working copy moves to. Returns its change id.
 pub fn new_no_edit(repo: &Path, parent: &str, message: &str) -> Result<String> {
@@ -559,25 +664,16 @@ mod tests {
     }
 
     #[test]
-    fn workspace_ancestors_revset_names_workspaces_by_at_ref() {
-        // Heads are `<name>@` refs, never change_ids — so a divergent change can't make the
-        // revset ambiguous. `@` (your own working copy) is always included.
-        let ws = vec![
-            Workspace {
-                name: "default".into(),
-                change_id: "aaaaaaaa".into(),
-            },
-            Workspace {
-                name: "faf-task-1".into(),
-                change_id: "bbbbbbbb".into(),
-            },
-        ];
-        let r = workspace_ancestors_revset(&ws, 25);
-        assert_eq!(r, "ancestors(default@ | faf-task-1@ | @, 25)");
-        assert!(
-            !r.contains("aaaaaaaa") && !r.contains("bbbbbbbb"),
-            "must reference workspaces by name, not by (divergence-prone) change_id"
-        );
+    fn a_path_glob_takes_the_needles_own_glob_characters_literally() {
+        assert_eq!(path_glob("tui/rev"), "**/*tui/rev*");
+        assert_eq!(path_glob("a*b?[c]{d}"), "**/*a[*]b[?][[]c[]][{]d[}]*");
+    }
+
+    #[test]
+    fn the_changed_line_is_the_first_added_or_removed_one_holding_the_needle() {
+        let diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n kept Foo\n-  old foo here\n+new FOO\n";
+        assert_eq!(changed_line(diff, "foo").as_deref(), Some("old foo here"));
+        assert_eq!(changed_line(diff, "a/f"), None, "not the file headers");
     }
 
     // --- Integration: run real jj against a scratch repo (jj must be installed) ---
@@ -838,8 +934,8 @@ mod tests {
         // Regression: when an agent's workspace change goes *divergent* (two visible commits
         // share its change_id), a revset that names the workspace by its bare change_id makes
         // `jj log` error ("Change ID … is divergent"). That error blanked faff's whole graph
-        // and dropped every task into the detached list. `workspace_ancestors_revset` names
-        // each workspace by `<name>@`, which resolves to the single commit it sits on.
+        // and dropped every task into the detached list. faff's revset takes the working
+        // copies as `working_copies()`, which resolves each to the single commit it sits on.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -905,10 +1001,10 @@ mod tests {
             "a bare divergent change_id in the revset must error (this is what broke the graph)"
         );
 
-        // The `<name>@` revset survives, and the divergent workspace resolves to exactly one
+        // `working_copies()` survives, and the divergent workspace resolves to exactly one
         // node — not duplicated, not dropped.
-        let revs = log(&repo, &workspace_ancestors_revset(&workspaces, 25))
-            .expect("name@ revset must survive a divergent workspace");
+        let revs = log(&repo, "ancestors(working_copies(), 25)")
+            .expect("working_copies() must survive a divergent workspace");
         let count = revs.iter().filter(|r| r.change_id == task_cid).count();
         assert_eq!(
             count, 1,

@@ -70,7 +70,7 @@ faff logs                        # just the live log view (see `faff logs` below
 | `c` | copy the selected revision's change id to the clipboard |
 | `/` | search (in the agent view, switches to the log view first) |
 | `e` | log view: `jj edit` the selected revision (moves your `@` onto it) |
-| `v` | log view: the selected branch as one diff, from where it forked, in your pager |
+| `v` | what the selected agent added, as one diff in your pager: from its task's fork point to its workspace's `@` (in the log view, the selected branch from where it forked) |
 | `→`/`←` | log view: open / fold a folded merge |
 | `q` | quit |
 
@@ -90,7 +90,7 @@ revisions                                                │ ┃   from postcard
 · #5 Add OAuth login ✓                                   │ ┃
                                                          │ ┃ >
  · ready                                                   ┃
- new nN │ open ↵ │ rev sSrRdc │ train aA │ del xX │ /⇥ q ? !┃
+ new nN │ open ↵ │ rev sSrRdcv │ train aA │ del xX │ /⇥ q?!┃
 ```
 
 When the merge train is non-empty a panel appears below the toolbar, one row per queued
@@ -314,8 +314,9 @@ Two constraints worth knowing, both from `claude` itself:
 
 ### The revision view
 
-The body is one graph, built from `jj log` over `ancestors(<all workspace heads> | @, 25)`.
-HEAD's line is pinned to the top lane, agent branches below it. Glyphs:
+The body is one graph of every workspace's working copy (yours and the agents') and their
+ancestors, 25 generations deep, whatever your `revsets.log` reaches. HEAD's line is pinned
+to the top lane, agent branches below it. Glyphs:
 
 - `@` your working copy — drawn green (like jj log), labelled with its description
   (or `(no description set)`)
@@ -372,10 +373,12 @@ removable there.
 ### The log view
 
 `Tab` switches the body between the agent view above and the log view; the header names
-the active one (`agents` or `log`) at its far right. The agent view loads every workspace's
-`@` and its ancestors; the log view loads your own `revsets.log` instead (plus every
-workspace's `@`, so agents always show). faff reloads both whenever jj records an operation
-— yours, an agent's, anyone's — so switching is instant. The log isn't curated the way the
+the active one (`agents` or `log`) at its far right. faff loads both views' revisions
+together, side by side: the log view's are your own `revsets.log` plus every workspace's
+working copy (`working_copies()`), so agents always show. Scrolling the log view to within a screen of
+the bottom loads the next 50 generations of older history before you get there; `↓` on the
+last row waits for it rather than wrapping to the top, until the root is loaded. faff reloads whenever jj records an operation — yours, an agent's,
+anyone's — keeping whatever you've scrolled into, so switching views is instant. The log isn't curated the way the
 agent view is: empty commits get a row of their own (`(empty) (no description set)`,
 as jj labels them), agent branches stay in jj's order instead of being lifted onto their
 fork points, and the glyphs are jj's (`◆` immutable, `○` mutable, `@`, `×` conflicted).
@@ -416,6 +419,14 @@ Search reaches past the revset: when the query matches bookmarks (local or remot
 aren't loaded, the best few are pulled in once typing pauses, with their branch from its
 fork point off trunk, so a contributor's PR branch shows up where it sits. They drop out
 when the search does.
+
+Search reaches into files too. Once typing pauses on a query of three or more characters,
+jj looks through all of history for revisions that changed a path containing it, or added
+or removed a line containing it, ignoring case (up to 50 of each). Those are hits as well,
+pulled in where they sit if they weren't loaded: the row carries `▤` for a path, `±` for a
+line, and the snippet shows the path or the line (`line: fn holds_repo(path: &Path) …`). `v`
+on one shows its diff. The fuzzy matcher's own syntax is dropped for this (`'`, `^`, `$`),
+and a negated query (`!word`) doesn't search the files.
 
 `j`/`k` move over revisions rather than tasks (over hits while searching), and the log
 scrolls exactly like the agent view (same `↑ N more` / `↓ N more` markers). Each view keeps
@@ -475,7 +486,6 @@ so it doesn't show them; `Tab` back to the agent view to use them.
 
 ```sh
 faff logs                        # your `revsets.log`, in the cwd's checkout
-faff logs -r 'trunk()::@'        # any revset
 ```
 
 faff's log view on its own, meant to replace `watch jj peek` in a spare pane: the same
@@ -533,7 +543,7 @@ faff is docked beside a session and the pane is too narrow for the full labels, 
 drops to its compact form — same groups, same order, just the letters:
 
 ```
- new nN │ open ↵ │ rev sSrRdc │ train aA │ del xX │ /⇥ q ? !
+ new nN │ open ↵ │ rev sSrRdcv │ train aA │ del xX │ /⇥ q?!
 ```
 
 While searching, the toolbar leads with the search's own keys.

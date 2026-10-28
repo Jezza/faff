@@ -2,39 +2,162 @@
 //! loads, and the log view's writes (`e`, `z`, `f`, `F`, `x`, `X`), each made only once no jj command that
 //! could rewrite commits is running in the checkout (see [`crate::watch`]).
 
-use super::engine::Outbox;
+use super::engine::{Cmd, Outbox};
 use crate::domain::Task;
 use crate::watch::{self, Aliases};
 use crate::{config, jj, workspace};
 use std::path::Path;
+use std::sync::mpsc::Sender;
 
 /// The log view's own revisions: the user's `revsets.log` (jj's default when unset).
 pub fn base_revset(root: &Path) -> String {
     jj::config_get(root, "revsets.log").unwrap_or_else(|| "builtin_log()".to_string())
 }
 
-/// Everything the log view loads: `base`, every workspace's working copy (so agents show
+/// Older ancestors each [`super::engine::Cmd::LoadMore`] adds, in generations.
+pub const PAGE: usize = 50;
+
+/// The log view's revisions: `base`, every workspace's working copy (so agents show
 /// whatever `base` says), each branch a search pulled in from its fork point off trunk,
-/// and each squash made here.
-pub fn log_revset(
-    base: &str,
-    workspaces: &[jj::Workspace],
-    pulled: &[String],
-    pinned: &[String],
-) -> String {
-    let mut parts = vec![format!("({base})"), "present(@)".to_string()];
-    parts.extend(
-        workspaces
-            .iter()
-            .map(|w| format!("present({}@)", jj::revset_str(&w.name))),
-    );
+/// each squash made here, and `depth` generations of their ancestors (what scrolling down
+/// has loaded so far).
+pub fn log_revset(base: &str, pulled: &[String], pinned: &[String], depth: usize) -> String {
+    let mut parts = vec![format!("({base})"), "working_copies()".to_string()];
     parts.extend(
         pulled
             .iter()
             .map(|b| format!("fork_point(trunk() | {b})::{b}")),
     );
     parts.extend(pinned.iter().map(|p| format!("present({p})")));
-    parts.join(" | ")
+    let all = parts.join(" | ");
+    if depth == 0 {
+        all
+    } else {
+        // `ancestors(x, 1)` is `x` itself.
+        format!("ancestors({all}, {})", depth + 1)
+    }
+}
+
+/// What one load from jj says: the revisions, the workspaces and the bookmarks, asked for
+/// side by side so the first screen waits on the slowest of them, not on all of them.
+pub struct Loaded {
+    pub revs: anyhow::Result<Vec<jj::RevInfo>>,
+    /// `also`'s revisions, when asked for.
+    pub also: Option<anyhow::Result<Vec<jj::RevInfo>>>,
+    pub workspaces: anyhow::Result<Vec<jj::Workspace>>,
+    pub bookmarks: anyhow::Result<Vec<jj::BookmarkRef>>,
+}
+
+/// Load `revset` and, beside it, `also`: a `jj log` of its own rather than part of
+/// `revset`'s, since jj groups a revset's branches by its heads and `revset`'s would
+/// reorder `also`'s.
+pub fn load(root: &Path, revset: &str, also: Option<&str>) -> Loaded {
+    std::thread::scope(|s| {
+        let workspaces = s.spawn(|| jj::workspace_list_peek(root));
+        let bookmarks = s.spawn(|| jj::bookmark_list_peek(root));
+        let also = also.map(|also| s.spawn(move || jj::log_peek(root, also)));
+        let revs = jj::log_peek(root, revset);
+        fn joined<T>(r: std::thread::Result<anyhow::Result<T>>) -> anyhow::Result<T> {
+            r.unwrap_or_else(|_| Err(anyhow::anyhow!("jj reader panicked")))
+        }
+        Loaded {
+            revs,
+            also: also.map(|h| joined(h.join())),
+            workspaces: joined(workspaces.join()),
+            bookmarks: joined(bookmarks.join()),
+        }
+    })
+}
+
+/// What a search found in the repo's files (see [`super::engine::Cmd::SearchFiles`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Found {
+    /// The text searched for, so a stale answer is told from a fresh one.
+    pub query: String,
+    pub matches: Vec<jj::FileMatch>,
+}
+
+impl Found {
+    /// The found revisions, by commit, for the revset to load.
+    pub fn revisions(found: &Option<Found>) -> Vec<String> {
+        found
+            .iter()
+            .flat_map(|f| &f.matches)
+            .map(|m| m.commit_id.clone())
+            .collect()
+    }
+}
+
+/// Ask jj, side by side, for the revisions whose changed paths or lines contain `query`:
+/// what it found, and why either search failed.
+pub fn search_files(root: &Path, query: &str) -> (Found, Vec<String>) {
+    let (paths, lines) = std::thread::scope(|s| {
+        let lines = s.spawn(|| jj::search_lines(root, query));
+        (jj::search_paths(root, query), lines.join())
+    });
+    let lines = lines.unwrap_or_else(|_| Err(anyhow::anyhow!("jj reader panicked")));
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    for found in [paths, lines] {
+        match found {
+            Ok(m) => matches.extend(m),
+            Err(e) => errors.push(format!("searching files failed: {e:#}")),
+        }
+    }
+    let found = Found {
+        query: query.to_string(),
+        matches,
+    };
+    (found, errors)
+}
+
+/// Where a file search stands, in an engine: what was last asked for, and what was found.
+/// Searches run off the engine thread, so a slow one never holds up a key; an answer for
+/// anything but the latest query is dropped.
+#[derive(Default)]
+pub struct FileSearch {
+    asked: String,
+    pub found: Option<Found>,
+}
+
+impl FileSearch {
+    /// [`super::engine::Cmd::SearchFiles`]: start searching for `query`, reporting back
+    /// on `wake` as [`super::engine::Cmd::FilesFound`]. Returns whether `found` changed
+    /// now (an empty query clears it).
+    pub fn ask(&mut self, root: &Path, query: String, wake: &Sender<Cmd>) -> bool {
+        self.asked = query.clone();
+        if query.is_empty() {
+            return self.found.take().is_some();
+        }
+        let (root, wake) = (root.to_path_buf(), wake.clone());
+        std::thread::spawn(move || {
+            let (found, errors) = search_files(&root, &query);
+            let _ = wake.send(Cmd::FilesFound { found, errors });
+        });
+        false
+    }
+
+    /// [`super::engine::Cmd::FilesFound`]: keep `found` if it's for the latest query.
+    /// Returns whether it was.
+    pub fn answer(&mut self, found: Found, errors: Vec<String>, notices: &Outbox) -> bool {
+        if found.query != self.asked {
+            return false;
+        }
+        for e in errors {
+            notices.err(e);
+        }
+        self.found = Some(found);
+        true
+    }
+}
+
+/// Whether scrolling down could load more: some loaded revision has a parent that isn't.
+pub fn more_below(revs: &[jj::RevInfo]) -> bool {
+    let loaded: std::collections::HashSet<&str> =
+        revs.iter().map(|r| r.change_id.as_str()).collect();
+    revs.iter()
+        .flat_map(|r| &r.parents)
+        .any(|p| !loaded.contains(p.as_str()))
 }
 
 /// A command line cut to fit a notice or the header.
@@ -300,19 +423,59 @@ mod tests {
 
     #[test]
     fn the_log_revset_adds_working_copies_pulls_and_pins_to_the_base() {
-        let ws = vec![jj::Workspace {
-            name: "faf-task-3".into(),
-            change_id: "x".into(),
-        }];
         assert_eq!(
             log_revset(
                 "trunk()..@",
-                &ws,
                 &["bookmarks(exact:\"b\")".into()],
-                &["sq".into()]
+                &["sq".into()],
+                0
             ),
-            "(trunk()..@) | present(@) | present(\"faf-task-3\"@) \
+            "(trunk()..@) | working_copies() \
              | fork_point(trunk() | bookmarks(exact:\"b\"))::bookmarks(exact:\"b\") | present(sq)"
         );
+    }
+
+    #[test]
+    fn scrolling_down_adds_generations_of_ancestors() {
+        assert_eq!(
+            log_revset("trunk()..@", &[], &[], 50),
+            "ancestors((trunk()..@) | working_copies(), 51)"
+        );
+    }
+
+    #[test]
+    fn a_file_search_keeps_only_the_answer_to_the_latest_query() {
+        let (wake, _queued) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let notices = Outbox::new(tx);
+        let root = Path::new("/nonexistent");
+        let mut s = FileSearch::default();
+        let found = |q: &str| Found {
+            query: q.into(),
+            matches: Vec::new(),
+        };
+        assert!(!s.ask(root, "lanes".into(), &wake), "nothing yet");
+        assert!(!s.ask(root, "lanes!".into(), &wake));
+        assert!(!s.answer(found("lanes"), Vec::new(), &notices), "stale");
+        assert_eq!(s.found, None);
+        assert!(s.answer(found("lanes!"), Vec::new(), &notices));
+        assert_eq!(s.found, Some(found("lanes!")));
+        assert!(s.ask(root, String::new(), &wake), "cleared");
+        assert_eq!(s.found, None);
+    }
+
+    #[test]
+    fn more_is_below_while_a_parent_is_unloaded() {
+        let rev = |id: &str, parents: &[&str]| jj::RevInfo {
+            change_id: id.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(more_below(&[rev("b", &["a"])]));
+        assert!(!more_below(&[
+            rev("b", &["a"]),
+            rev("a", &["root"]),
+            rev("root", &[])
+        ]));
     }
 }

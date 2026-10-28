@@ -111,6 +111,19 @@ pub enum Cmd {
     /// `faff logs`: a file in the checkout changed, so snapshot once things go quiet.
     /// Queued by the file watcher, so no [`Msg::Done`].
     FilesChanged,
+    /// The log view's search query, once typing pauses: find the revisions whose changed
+    /// paths or lines contain it, and load them. Empty clears. Not a user command: no
+    /// [`Msg::Done`].
+    SearchFiles(String),
+    /// A [`Cmd::SearchFiles`] finished, with what it found and why any of it failed.
+    /// Queued by the search's thread, so no [`Msg::Done`].
+    FilesFound {
+        found: revops::Found,
+        errors: Vec<String>,
+    },
+    /// The log view's selection is near the bottom: load [`revops::PAGE`] more generations
+    /// of history. Not a user command: no [`Msg::Done`].
+    LoadMore,
     /// jj recorded an operation (anyone's): reload from jj soon. Queued by the operation
     /// watcher, so no [`Msg::Done`].
     OpChanged,
@@ -176,6 +189,10 @@ pub struct View {
     pub select_rev: Option<String>,
     /// What the engine is quietly up to (`faff logs`' snapshots), for the header.
     pub activity: Option<String>,
+    /// Older history is left to load (see [`Cmd::LoadMore`]).
+    pub more: bool,
+    /// What the last [`Cmd::SearchFiles`] found.
+    pub found: Option<revops::Found>,
 }
 
 /// The log view's input: every loaded revision as an uncurated graph node in jj's order,
@@ -279,14 +296,19 @@ pub struct Engine {
     /// What jj last said, kept between operations so a tick that only changes task state
     /// rebuilds the graphs without asking jj again.
     revs: Vec<jj::RevInfo>,
-    log_revs: Vec<jj::RevInfo>,
+    /// The agent view's: [`AGENT_REVSET`], loaded beside the log view's.
+    agent_revs: Vec<jj::RevInfo>,
     workspaces: Option<Vec<jj::Workspace>>,
     bookmarks: Vec<jj::BookmarkRef>,
     /// jj recorded an operation since the last load.
     jj_stale: bool,
     last_jj: Instant,
-    /// The log view's revset: the user's `revsets.log`.
+    /// The user's `revsets.log`, which both views load.
     log_base: String,
+    /// Generations of older history scrolling down has loaded (see [`Cmd::LoadMore`]).
+    depth: usize,
+    /// What the search found in the files, kept loaded while it stands.
+    files: revops::FileSearch,
     /// Branches a search pulled into the log view (see [`Cmd::PullIn`]).
     pulled: Vec<String>,
     /// Squashes made from the log view, kept loaded.
@@ -310,11 +332,6 @@ impl Engine {
         let socket = events::socket_path(&repo);
         let events_rx = events::spawn_listener(&socket)?;
         let wake = nudge.clone();
-        // Finish deleting any workspace dirs a previous run renamed aside but exited
-        // before clearing.
-        if let Ok(root) = config::workspace_root(&repo) {
-            workspace::sweep_trash(&root);
-        }
         std::thread::spawn(move || {
             // report-event already wrote the store; each event is only a refresh nudge.
             while events_rx.recv().is_ok() {
@@ -327,8 +344,6 @@ impl Engine {
         let faff_pane = std::env::var("WEZTERM_PANE")
             .ok()
             .and_then(|s| s.parse().ok());
-        let aliases = crate::watch::load_aliases(&repo);
-        let log_base = revops::base_revset(&repo);
         let ops = wake.clone();
         let watcher = crate::watch::watch_ops(&repo, move || {
             let _ = ops.send(Cmd::OpChanged);
@@ -344,8 +359,6 @@ impl Engine {
             tx,
             wake,
         );
-        engine.aliases = aliases;
-        engine.log_base = log_base;
         match watcher {
             Ok(w) => engine._watcher = Some(w),
             Err(e) => engine
@@ -394,12 +407,14 @@ impl Engine {
             wake,
             aliases: crate::watch::Aliases::new(),
             revs: Vec::new(),
-            log_revs: Vec::new(),
+            agent_revs: Vec::new(),
             workspaces: None,
             bookmarks: Vec::new(),
             jj_stale: true,
             last_jj: Instant::now(),
             log_base: "builtin_log()".to_string(),
+            depth: 0,
+            files: revops::FileSearch::default(),
             pulled: Vec::new(),
             pinned: Vec::new(),
             select_rev: None,
@@ -412,8 +427,7 @@ impl Engine {
     /// soon after a hook nudge, and publish a fresh view after either. Returns once every
     /// sender is gone.
     pub fn run(mut self, rx: Receiver<Cmd>) {
-        self.refresh();
-        self.publish();
+        self.start();
         let mut nudged = false;
         loop {
             let gap = if nudged {
@@ -431,6 +445,26 @@ impl Engine {
                     self.pulled = revsets;
                     self.refresh();
                     self.publish();
+                    continue;
+                }
+                Ok(Cmd::LoadMore) => {
+                    self.depth += revops::PAGE;
+                    self.refresh();
+                    self.publish();
+                    continue;
+                }
+                Ok(Cmd::SearchFiles(query)) => {
+                    if self.files.ask(&self.repo, query, &self.wake) {
+                        self.refresh();
+                        self.publish();
+                    }
+                    continue;
+                }
+                Ok(Cmd::FilesFound { found, errors }) => {
+                    if self.files.answer(found, errors, &self.notices) {
+                        self.refresh();
+                        self.publish();
+                    }
                     continue;
                 }
                 Ok(cmd @ Cmd::Described { .. }) => {
@@ -499,12 +533,37 @@ impl Engine {
                 }
             }
             // Handled by the run loop, or `faff logs`' alone.
-            Cmd::PullIn(_) | Cmd::FilesChanged | Cmd::OpChanged => {}
+            Cmd::PullIn(_)
+            | Cmd::SearchFiles(_)
+            | Cmd::FilesFound { .. }
+            | Cmd::LoadMore
+            | Cmd::FilesChanged
+            | Cmd::OpChanged => {}
             Cmd::Described { rev, result } => self.described(rev, result),
             Cmd::Accept(id) => self.accept(id),
             Cmd::AbortTrain => self.abort_train(),
             Cmd::Nudge => {}
         }
+    }
+
+    /// Show the first screen as soon as jj has said what's there: from one load and the
+    /// store, before asking wezterm anything or reconciling tasks with the workspaces.
+    /// Then do the rest of a refresh, and the housekeeping nothing on screen waits on.
+    fn start(&mut self) {
+        self.log_base = revops::base_revset(&self.repo);
+        self.tasks = self.store.list_tasks().unwrap_or_default();
+        let fresh = self.load_jj();
+        self.build_graphs();
+        self.order_tasks();
+        self.publish();
+        self.aliases = crate::watch::load_aliases(&self.repo);
+        // Finish deleting any workspace dirs a previous run renamed aside but exited
+        // before clearing.
+        if let Ok(root) = config::workspace_root(&self.repo) {
+            workspace::sweep_trash(&root);
+        }
+        self.settle(fresh);
+        self.publish();
     }
 
     /// Snapshot the derived state for the UI. The revive/resume checks stat transcript
@@ -540,6 +599,8 @@ impl Engine {
             describing: self.describing.clone(),
             bookmarks: self.bookmarks.clone(),
             select_rev: self.select_rev.take(),
+            more: revops::more_below(&self.revs),
+            found: self.files.found.clone(),
             ..View::default()
         }
     }
@@ -1350,14 +1411,18 @@ impl Engine {
     /// (or the fallback has passed); otherwise the graphs are rebuilt from what it last
     /// said, so task state (a status, a new pane) still shows within the tick.
     fn reload(&mut self) {
+        // The tasks are read *before* the workspace list, so a task another faff creates
+        // meanwhile is never judged against a list from before its workspace existed.
         self.tasks = self.store.list_tasks().unwrap_or_default();
-
-        // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
         // Every read peeks (no snapshot, no git import) so it never records an operation
         // that could race your own `jj git fetch`/rebase into a divergent op log.
-        // The list is read *after* the tasks, so a task another faff creates meanwhile is
-        // never judged against a list from before its workspace existed.
         let fresh = (self.jj_stale || self.last_jj.elapsed() >= JJ_FALLBACK) && self.load_jj();
+        self.settle(fresh);
+    }
+
+    /// Reconcile the tasks (as read before the last load) with what wezterm and jj say,
+    /// and rebuild the view. `fresh`: the workspace list was read from jj just now.
+    fn settle(&mut self, fresh: bool) {
         let mut ws_list = self.workspaces.clone();
 
         // Heal orphans so stale rows don't linger forever or misreport their status.
@@ -1390,9 +1455,15 @@ impl Engine {
             self.open_pane = self.detect_open_pane(p);
         }
 
-        // Build both graphs from what jj last said and the tasks as they are now.
-        if let Some(ws) = &ws_list {
-            let g = Graphs::build(self.revs.clone(), &self.log_revs, ws, &self.tasks);
+        self.build_graphs();
+        self.order_tasks();
+        self.last_refresh = Instant::now();
+    }
+
+    /// Build both graphs from what jj last said and the tasks as they are now.
+    fn build_graphs(&mut self) {
+        if let Some(ws) = &self.workspaces {
+            let g = Graphs::build(&self.revs, &self.agent_revs, ws, &self.tasks);
             self.rows = g.rows;
             self.task_of_node = g.task_of_node;
             self.log = g.log;
@@ -1400,11 +1471,13 @@ impl Engine {
             self.id_display = g.id_display;
             self.fork_point = g.fork_point;
         }
+    }
 
-        // Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
-        // appear as graph nodes first (in graph order), then any detached tasks
-        // (workspace inlined into HEAD, or otherwise not a distinct node). This keeps
-        // every task selectable/removable even after its change is integrated.
+    /// Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
+    /// appear as graph nodes first (in graph order), then any detached tasks
+    /// (workspace inlined into HEAD, or otherwise not a distinct node). This keeps
+    /// every task selectable/removable even after its change is integrated.
+    fn order_tasks(&mut self) {
         let graph_tasks: Vec<TaskId> = self.task_of_node.iter().flatten().copied().collect();
         let in_graph: std::collections::HashSet<TaskId> = graph_tasks.iter().copied().collect();
         self.detached = self
@@ -1415,30 +1488,35 @@ impl Engine {
             .collect();
         self.task_order = graph_tasks;
         self.task_order.extend(self.detached.iter().copied());
-
-        self.last_refresh = Instant::now();
     }
 
-    /// Ask jj for the workspaces, both views' revisions and the bookmarks. The agent view
-    /// loads every workspace's ancestors; the log view, the user's own `revsets.log` plus
-    /// every working copy (and whatever a search pulled in).
-    /// Returns whether the workspace list is fresh; anything that failed stays stale, so
-    /// the next tick tries again.
+    /// Ask jj for the workspaces, the revisions both views show and the bookmarks, side
+    /// by side. Returns whether the workspace list is fresh; anything that failed stays
+    /// stale, so the next tick tries again.
     fn load_jj(&mut self) -> bool {
         self.last_jj = Instant::now();
-        let Ok(ws) = jj::workspace_list_peek(&self.repo) else {
+        let pinned = [
+            self.pinned.clone(),
+            revops::Found::revisions(&self.files.found),
+        ]
+        .concat();
+        let revset = revops::log_revset(&self.log_base, &self.pulled, &pinned, self.depth);
+        let loaded = revops::load(&self.repo, &revset, Some(AGENT_REVSET));
+        let Ok(ws) = loaded.workspaces else {
             self.jj_stale = true;
             return false;
         };
         let mut error = None;
-        match jj::log_peek(&self.repo, &jj::workspace_ancestors_revset(&ws, 25)) {
+        match loaded.revs {
             Ok(revs) => self.revs = revs,
             Err(e) => error = Some(format!("jj error: {e}")),
         }
-        let revset = revops::log_revset(&self.log_base, &ws, &self.pulled, &self.pinned);
-        match jj::log_peek(&self.repo, &revset) {
-            Ok(revs) => self.log_revs = revs,
-            Err(e) => error = Some(format!("jj error in the log view's revset: {e}")),
+        match loaded.also {
+            Some(Ok(revs)) => self.agent_revs = revs,
+            Some(Err(e)) => {
+                error.get_or_insert(format!("jj error: {e}"));
+            }
+            None => {}
         }
         let mut ok = error.is_none();
         if let Some(e) = &error
@@ -1447,7 +1525,7 @@ impl Engine {
             self.notices.err(e.clone());
         }
         self.last_jj_error = error;
-        match jj::bookmark_list_peek(&self.repo) {
+        match loaded.bookmarks {
             Ok(b) => self.bookmarks = b,
             Err(_) => ok = false,
         }
@@ -1557,7 +1635,8 @@ impl Engine {
     }
 }
 
-/// Both graph views, built from one `jj log` result. Pure (no jj), so the UI's tests can
+/// Both graph views, built from one `jj log` result: the log view shows all of it, the
+/// agent view the workspaces' share. Pure (no jj), so the UI's tests can
 /// build a view from hand-written revisions.
 pub struct Graphs {
     pub rows: Vec<GraphRow>,
@@ -1568,18 +1647,23 @@ pub struct Graphs {
     pub fork_point: Option<String>,
 }
 
+/// The agent view's revisions: every working copy (yours and each workspace's) and 25
+/// generations of their ancestors. What else `revsets.log` loads (other branches, old
+/// bookmarks) is the log view's alone.
+const AGENT_REVSET: &str = "ancestors(working_copies(), 25)";
+
 impl Graphs {
-    /// `revs` feed the agent view, `log_revs` the log view (each from its own revset).
+    /// `revs` are the log view's, `agent_revs` the agent view's.
     pub fn build(
-        mut revs: Vec<jj::RevInfo>,
-        log_revs: &[jj::RevInfo],
+        revs: &[jj::RevInfo],
+        agent_revs: &[jj::RevInfo],
         workspaces: &[jj::Workspace],
         tasks: &[Task],
     ) -> Graphs {
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
             .iter()
-            .chain(log_revs)
+            .chain(agent_revs)
             .map(|r| {
                 (
                     r.change_id.clone(),
@@ -1593,8 +1677,9 @@ impl Graphs {
             .map(|r| r.change_id.clone());
 
         // The log view takes jj's order as-is.
-        let log = LogModel::build(log_revs, workspaces, tasks);
+        let log = LogModel::build(revs, workspaces, tasks);
 
+        let mut revs = agent_revs.to_vec();
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
         // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
         model::order_by_fork_point(&mut revs, workspaces, tasks);
@@ -1705,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn each_view_is_built_from_its_own_revset() {
+    fn each_view_shows_its_own_revisions() {
         let rev = |id: &str, parents: &[&str], wc: bool| jj::RevInfo {
             change_id: id.into(),
             parents: parents.iter().map(|s| s.to_string()).collect(),
@@ -1713,16 +1798,42 @@ mod tests {
             description: id.into(),
             ..Default::default()
         };
-        let agents = vec![rev("wc", &["base"], true), rev("base", &[], false)];
-        let log = vec![
+        let revs = vec![
             rev("pr", &["base"], false),
+            rev("agent", &["base"], false),
             rev("wc", &["base"], true),
-            rev("base", &[], false),
+            rev("base", &["old"], false),
         ];
-        let g = Graphs::build(agents, &log, &[], &[]);
-        assert!(g.rows.iter().all(|r| r.change_id.as_deref() != Some("pr")));
-        assert_eq!(g.log.nodes.len(), 3, "the log view has its own, wider set");
-        assert!(g.id_display.contains_key("pr"), "and ids for all of it");
+        let agent_revs = vec![
+            rev("agent", &["base"], false),
+            rev("wc", &["base"], true),
+            rev("base", &["old"], false),
+            rev("old", &[], false),
+        ];
+        let ws = vec![jj::Workspace {
+            name: "faf-task-1".into(),
+            change_id: "agent".into(),
+        }];
+        let g = Graphs::build(&revs, &agent_revs, &ws, &[]);
+        let shown = |id: &str| g.rows.iter().any(|r| r.change_id.as_deref() == Some(id));
+        assert!(shown("agent") && shown("wc") && shown("base") && shown("old"));
+        assert!(!shown("pr"));
+        assert_eq!(g.log.nodes.len(), 4);
+        assert!(g.id_display.contains_key("pr") && g.id_display.contains_key("old"));
+    }
+
+    #[test]
+    fn the_agent_view_loads_the_ancestry_revsets_log_leaves_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, x) = repo_with_commit(tmp.path());
+        let (mut e, _rx, _wake) = test_engine_at(repo);
+        e.log_base = "none()".into();
+
+        assert!(e.load_jj());
+        e.build_graphs();
+        let shown = |id: &str| e.rows.iter().any(|r| r.change_id.as_deref() == Some(id));
+        assert!(shown(&x), "the agent view shows @'s parent");
+        assert_eq!(e.log.nodes.len(), 1, "the log view shows only @");
     }
 
     #[test]

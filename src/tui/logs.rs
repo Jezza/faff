@@ -40,8 +40,12 @@ const MIN_REFRESH_GAP: Duration = Duration::from_millis(150);
 pub struct LogsEngine {
     /// The checkout `faff logs` runs in: what it snapshots and edits.
     root: PathBuf,
-    /// The revset shown: the user's `revsets.log`, or `-r`.
+    /// The user's `revsets.log`.
     base: String,
+    /// Generations of older history scrolling down has loaded (see [`Cmd::LoadMore`]).
+    depth: usize,
+    /// What the search found in the files, kept loaded while it stands.
+    files: revops::FileSearch,
     /// Branches a search reached past `base` (see [`Cmd::PullIn`]).
     pulled: Vec<String>,
     /// Squashes made here, kept loaded even when `base` wouldn't show them.
@@ -70,42 +74,22 @@ pub struct LogsEngine {
 }
 
 impl LogsEngine {
-    /// Set up for the checkout at `root`, watching it and its repo's operations. Watch
-    /// failures are reported and leave the view polling.
-    pub fn open(
-        root: PathBuf,
-        revset: Option<String>,
-        tx: Sender<Msg>,
-        wake: Sender<Cmd>,
-    ) -> LogsEngine {
-        let notices = Outbox::new(tx);
-        let base = revset.unwrap_or_else(|| revops::base_revset(&root));
+    /// Set up for the checkout at `root`. Nothing here asks jj or watches anything yet:
+    /// [`LogsEngine::start`] does, so the UI draws meanwhile.
+    pub fn open(root: PathBuf, tx: Sender<Msg>, wake: Sender<Cmd>) -> LogsEngine {
         let store = config::db_path(&root)
             .ok()
             .filter(|p| p.exists())
             .and_then(|p| Store::open_readonly(&p).ok());
-        let mut watchers = Vec::new();
-        let ops = wake.clone();
-        match watch::watch_ops(&root, move || {
-            let _ = ops.send(Cmd::OpChanged);
-        }) {
-            Ok(w) => watchers.push(w),
-            Err(e) => notices.warn(format!("not watching jj's operations: {e:#}")),
-        }
-        let files = wake.clone();
-        match watch::watch_files(&root, move || {
-            let _ = files.send(Cmd::FilesChanged);
-        }) {
-            Ok(w) => watchers.push(w),
-            Err(e) => notices.warn(format!("not watching files, so not snapshotting: {e:#}")),
-        }
         LogsEngine {
-            aliases: watch::load_aliases(&root),
+            aliases: Aliases::new(),
             root,
-            base,
+            base: String::new(),
+            depth: 0,
+            files: revops::FileSearch::default(),
             pulled: Vec::new(),
             pinned: Vec::new(),
-            notices,
+            notices: Outbox::new(tx),
             describing: HashSet::new(),
             describer: describe::ask_claude,
             wake,
@@ -118,13 +102,39 @@ impl LogsEngine {
             revs: Vec::new(),
             workspaces: Vec::new(),
             last_tasks: Instant::now(),
-            _watchers: watchers,
+            _watchers: Vec::new(),
         }
     }
 
-    pub fn run(mut self, rx: Receiver<Cmd>) {
+    /// Show the first screen as soon as jj has said what's there, then watch the checkout
+    /// and its repo's operations. Watch failures are reported and leave the view polling.
+    fn start(&mut self) {
+        self.base = revops::base_revset(&self.root);
         self.refresh();
         self.publish();
+        let ops = self.wake.clone();
+        match watch::watch_ops(&self.root, move || {
+            let _ = ops.send(Cmd::OpChanged);
+        }) {
+            Ok(w) => self._watchers.push(w),
+            Err(e) => self
+                .notices
+                .warn(format!("not watching jj's operations: {e:#}")),
+        }
+        let files = self.wake.clone();
+        match watch::watch_files(&self.root, move || {
+            let _ = files.send(Cmd::FilesChanged);
+        }) {
+            Ok(w) => self._watchers.push(w),
+            Err(e) => self
+                .notices
+                .warn(format!("not watching files, so not snapshotting: {e:#}")),
+        }
+        self.aliases = watch::load_aliases(&self.root);
+    }
+
+    pub fn run(mut self, rx: Receiver<Cmd>) {
+        self.start();
         loop {
             match rx.recv_timeout(self.next_wake()) {
                 Ok(Cmd::OpChanged) => self.refresh_due = true,
@@ -133,6 +143,22 @@ impl LogsEngine {
                     self.pulled = revsets;
                     self.refresh();
                     self.publish();
+                }
+                Ok(Cmd::LoadMore) => {
+                    self.load_more();
+                    self.publish();
+                }
+                Ok(Cmd::SearchFiles(query)) => {
+                    if self.files.ask(&self.root, query, &self.wake) {
+                        self.refresh();
+                        self.publish();
+                    }
+                }
+                Ok(Cmd::FilesFound { found, errors }) => {
+                    if self.files.answer(found, errors, &self.notices) {
+                        self.refresh();
+                        self.publish();
+                    }
                 }
                 Ok(cmd @ Cmd::Described { .. }) => {
                     self.handle(cmd);
@@ -158,6 +184,12 @@ impl LogsEngine {
                 self.retask();
             }
         }
+    }
+
+    /// [`Cmd::LoadMore`]: the next page of older history.
+    fn load_more(&mut self) {
+        self.depth += revops::PAGE;
+        self.refresh();
     }
 
     /// How long to wait for a command before there's something of our own to do.
@@ -252,10 +284,16 @@ impl LogsEngine {
         self.last_refresh = Instant::now();
         self.last_tasks = Instant::now();
         self.refresh_due = false;
-        let workspaces = jj::workspace_list_peek(&self.root).unwrap_or_default();
         let tasks = self.tasks();
-        let revset = revops::log_revset(&self.base, &workspaces, &self.pulled, &self.pinned);
-        match jj::log_peek(&self.root, &revset) {
+        let pinned = [
+            self.pinned.clone(),
+            revops::Found::revisions(&self.files.found),
+        ]
+        .concat();
+        let revset = revops::log_revset(&self.base, &self.pulled, &pinned, self.depth);
+        let loaded = revops::load(&self.root, &revset, None);
+        let workspaces = loaded.workspaces.unwrap_or_default();
+        match loaded.revs {
             Ok(revs) => {
                 self.last_error = None;
                 self.view.id_display = revs
@@ -273,6 +311,7 @@ impl LogsEngine {
                     .map(|r| r.change_id.clone());
                 self.view.fork_point = model::current_fork_point(&revs);
                 self.view.log = LogModel::build(&revs, &workspaces, &tasks);
+                self.view.more = revops::more_below(&revs);
                 self.revs = revs;
                 self.workspaces = workspaces;
             }
@@ -285,7 +324,8 @@ impl LogsEngine {
             }
         }
         self.view.tasks = tasks;
-        if let Ok(b) = jj::bookmark_list_peek(&self.root) {
+        self.view.found = self.files.found.clone();
+        if let Ok(b) = loaded.bookmarks {
             self.view.bookmarks = b;
         }
     }
@@ -438,6 +478,8 @@ mod tests {
             aliases: Aliases::new(),
             root,
             base: revset.to_string(),
+            depth: 0,
+            files: revops::FileSearch::default(),
             pulled: Vec::new(),
             pinned: Vec::new(),
             notices,
@@ -596,6 +638,87 @@ mod tests {
             notes.iter().any(|n| n.contains("already in trunk")),
             "{notes:?}"
         );
+    }
+
+    #[test]
+    fn older_history_loads_a_page_at_a_time_until_none_is_left() {
+        let (_tmp, root) = repo();
+        let (mut e, _rx) = engine(root.clone(), "@");
+        e.refresh();
+        assert_eq!(e.view.log.nodes.len(), 1, "just @");
+        assert!(e.view.more, "@'s parent is left to load");
+        e.load_more();
+        let descs: Vec<&str> = e
+            .view
+            .log
+            .nodes
+            .iter()
+            .map(|n| n.lines[0].as_str())
+            .collect();
+        assert!(descs.contains(&"base"), "@'s ancestors loaded: {descs:?}");
+        assert!(!descs.contains(&"b"), "but not other branches: {descs:?}");
+        assert!(!e.view.more, "down to the root: {descs:?}");
+    }
+
+    /// Search the files for `query` as the engine does, waiting for the answer.
+    fn search_files(e: &mut LogsEngine, query: &str) {
+        let (tx, rx) = mpsc::channel();
+        if !e.files.ask(&e.root.clone(), query.into(), &tx)
+            && let Ok(Cmd::FilesFound { found, errors }) = rx.recv_timeout(Duration::from_secs(60))
+        {
+            e.files.answer(found, errors, &e.notices);
+        }
+        e.refresh();
+    }
+
+    #[test]
+    fn a_file_search_finds_changed_paths_and_lines_and_loads_them() {
+        let (_tmp, root) = repo();
+        let (mut e, _rx) = engine(root.clone(), "@");
+        let found = |e: &LogsEngine, kind: jj::MatchKind| -> Vec<(String, String)> {
+            let mut m: Vec<(String, String)> = e
+                .view
+                .found
+                .iter()
+                .flat_map(|f| &f.matches)
+                .filter(|m| m.kind == kind)
+                .map(|m| (m.change_id.clone(), m.text.clone()))
+                .collect();
+            m.sort();
+            m
+        };
+        let loaded =
+            |e: &LogsEngine, cid: &str| e.view.log.nodes.iter().any(|n| n.change_id == cid);
+
+        // `base` added the line and `a` removed it; case doesn't matter.
+        search_files(&mut e, "BASE");
+        let mut want = vec![
+            (id(&root, "main"), "base".to_string()),
+            (id(&root, "feature-"), "base".to_string()),
+        ];
+        want.sort();
+        assert_eq!(found(&e, jj::MatchKind::Line), want);
+        assert!(found(&e, jj::MatchKind::Path).is_empty());
+        assert!(
+            loaded(&e, &id(&root, "feature-")),
+            "a found revision is loaded"
+        );
+
+        // Only `b` touched `g`.
+        search_files(&mut e, "g");
+        assert_eq!(
+            found(&e, jj::MatchKind::Path),
+            vec![(id(&root, "feature"), "g".to_string())]
+        );
+        assert!(loaded(&e, &id(&root, "feature")));
+        assert!(
+            !loaded(&e, &id(&root, "feature-")),
+            "the last search's are dropped"
+        );
+
+        search_files(&mut e, "");
+        assert_eq!(e.view.found, None);
+        assert!(!loaded(&e, &id(&root, "feature")));
     }
 
     #[test]

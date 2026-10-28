@@ -72,13 +72,13 @@ pub fn run(repo: Option<PathBuf>) -> Result<()> {
     result
 }
 
-/// Entry point for the `Logs` command: the log view alone, live, over `revset` (the
-/// user's `revsets.log` when `None`), in the checkout at `repo` (the cwd's by default).
-pub fn run_logs(repo: Option<PathBuf>, revset: Option<String>) -> Result<()> {
+/// Entry point for the `Logs` command: the log view alone, live, over the user's
+/// `revsets.log`, in the checkout at `repo` (the cwd's by default).
+pub fn run_logs(repo: Option<PathBuf>) -> Result<()> {
     let root = resolve_repo(repo)?;
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (msg_tx, msg_rx) = mpsc::channel();
-    let engine = logs::LogsEngine::open(root.clone(), revset, msg_tx, cmd_tx.clone());
+    let engine = logs::LogsEngine::open(root.clone(), msg_tx, cmd_tx.clone());
     std::thread::Builder::new()
         .name("faff-logs".into())
         .spawn(move || engine.run(cmd_rx))
@@ -105,10 +105,15 @@ fn install_panic_hook() {
     }));
 }
 
-/// Resolve the HEAD repo root: explicit path, else discover from the cwd via jj.
+/// Resolve the HEAD repo root: explicit path, else discover from the cwd.
 fn resolve_repo(repo: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(r) = repo {
         return Ok(r);
+    }
+    let cwd = std::env::current_dir().context("getting current dir")?;
+    // The nearest folder holding a `.jj`, as jj itself finds it — without waiting on jj.
+    if let Some(root) = cwd.ancestors().find(|d| d.join(".jj").is_dir()) {
+        return Ok(root.to_path_buf());
     }
     // `jj workspace root` from the cwd finds the repo root.
     let out = std::process::Command::new("jj")
@@ -284,6 +289,11 @@ struct App {
     pull_due: Option<Instant>,
     /// The revsets the log view last asked the engine to pull in.
     pulled: Vec<String>,
+    /// How many revisions were loaded when the log view last asked for more, so it asks
+    /// once per page.
+    asked_more: Option<usize>,
+    /// What the log view last asked the engine to find in the files.
+    searched: String,
     /// When the spinner started, so its frame follows the clock rather than redraws.
     spin_epoch: Instant,
     /// `q` pressed: quit as soon as the in-flight commands have finished.
@@ -460,7 +470,7 @@ const HINTS: &[Hint] = &[
         key: "v",
         verbose: "diff",
         grp: Grp::Rev,
-        ctx: LOG | LOGS,
+        ctx: ALL,
     },
     Hint {
         key: "z",
@@ -701,6 +711,8 @@ impl App {
             copy: None,
             pull_due: None,
             pulled: Vec::new(),
+            asked_more: None,
+            searched: String::new(),
             spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
@@ -751,6 +763,7 @@ impl App {
                 dirty = true;
             }
             self.pull_in();
+            self.load_ahead(term.size()?.height as usize);
         }
     }
 
@@ -793,6 +806,8 @@ impl App {
         // The log view follows its revision by change id. A vanished revision hands the
         // selection to whatever took its row; a first view starts on your working copy.
         let log = &self.view.log;
+        self.log.more = self.view.more;
+        self.log.found = self.view.found.clone();
         self.log.set_model(
             log.nodes.clone(),
             log.node_tasks.clone(),
@@ -1115,6 +1130,38 @@ impl App {
             // Quiet: it's not a user command, so it isn't tracked as in flight.
             let _ = self.cmd_tx.send(Cmd::PullIn(wanted));
         }
+        let files = self
+            .log
+            .search()
+            .filter(|_| self.log.filtering())
+            .and_then(|s| logview::file_query(&s.query))
+            .unwrap_or_default();
+        if files != self.searched {
+            self.searched = files.clone();
+            let _ = self.cmd_tx.send(Cmd::SearchFiles(files));
+        }
+    }
+
+    /// Ask for older history once the log view's selection is within a screen (`height`
+    /// rows) of the last loaded revision, so it's there before the selection gets there.
+    fn load_ahead(&mut self, height: usize) {
+        let loaded = self.view.log.nodes.len();
+        if self.body != Body::Log
+            || !self.view.more
+            || self.log.filtering()
+            || self.asked_more == Some(loaded)
+        {
+            return;
+        }
+        let near = self
+            .log
+            .position()
+            .is_some_and(|p| p + height >= self.log.ids().len());
+        if near {
+            self.asked_more = Some(loaded);
+            // Quiet: it's not a user command, so it isn't tracked as in flight.
+            let _ = self.cmd_tx.send(Cmd::LoadMore);
+        }
     }
 
     /// `c`: the selected revision's change id, to the clipboard.
@@ -1142,14 +1189,25 @@ impl App {
 
     /// `v`: the selected branch as one diff, from where it forked up to the selection, in
     /// the pager. A revision already in trunk is its own fork point, so it shows its own
-    /// diff instead. Read without snapshotting, like every read faff makes: a snapshot here
-    /// could land in the middle of your `jj git fetch`.
+    /// diff instead. In the agents view, what the selected agent added: from its task's
+    /// fork point to its workspace's `@`. Read without snapshotting, like every read faff
+    /// makes: a snapshot here could land in the middle of your `jj git fetch`.
     fn sq_diff_selected(&mut self) {
-        let Some(rev) = self.log.selected.clone() else {
-            return;
+        let (from, rev) = if self.body == Body::Agents {
+            let Some(t) = self.selected_task() else {
+                return;
+            };
+            let (Some(fork), Some(ws)) = (t.fork_point, t.ws_name) else {
+                return self.notices.warn("no workspace to diff for this task");
+            };
+            (fork, format!("{}@", crate::jj::revset_str(&ws)))
+        } else {
+            let Some(rev) = self.log.selected.clone() else {
+                return;
+            };
+            let base = self.squash_base(&rev);
+            (format!("coalesce(({base}) ~ {rev}, {rev}-)"), rev)
         };
-        let base = self.squash_base(&rev);
-        let from = format!("coalesce(({base}) ~ {rev}, {rev}-)");
         let repo = self.repo.to_string_lossy().into_owned();
         self.exec = Some(
             [
@@ -1820,6 +1878,21 @@ impl App {
                         ));
                         avail = avail.saturating_sub(2);
                     }
+                    // Found in its files: which way, before the description.
+                    let mut icons: Vec<char> = hit
+                        .into_iter()
+                        .flat_map(|h| &h.parts)
+                        .filter_map(|p| p.field.icon())
+                        .collect();
+                    icons.dedup();
+                    if !icons.is_empty() {
+                        let icons: String = icons.into_iter().chain([' ']).collect();
+                        avail = avail.saturating_sub(icons.chars().count());
+                        spans.push(Span::styled(
+                            icons,
+                            base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ));
+                    }
                     let fold = log
                         .and_then(|l| l.folded(cid))
                         .map(|n| format!(" (+{n})"))
@@ -2101,9 +2174,9 @@ impl App {
                 cur = Some(h.grp);
             } else if verbose {
                 spans.push(Span::raw("  "));
-            } else if h.grp == Grp::App && matches!(h.key, "q" | "?" | "!") {
-                // `q ? !` are unrelated to each other, unlike the `nN`/`xX` pairs (or the
-                // `/⇥` view keys), and the badge would otherwise jam into `?` as `q?!3`.
+            } else if h.grp == Grp::App && h.key == "q" {
+                // The view keys `/⇥`, then `q?!` run together so the agents view's compact
+                // row fits a docked pane.
                 spans.push(Span::raw(" "));
             }
             let key_text = if h.key == "!" && unseen > 0 {
@@ -2634,6 +2707,8 @@ mod tests {
             copy: None,
             pull_due: None,
             pulled: Vec::new(),
+            asked_more: None,
+            searched: String::new(),
             spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
@@ -3790,7 +3865,8 @@ mod tests {
 
     /// Hand the app the view the engine would publish for `revs`.
     fn apply_revs(app: &mut App, revs: Vec<jj::RevInfo>, ws: &[jj::Workspace]) {
-        let g = engine::Graphs::build(revs.clone(), &revs, ws, &app.view.tasks);
+        let more = revops::more_below(&revs);
+        let g = engine::Graphs::build(&revs, &revs, ws, &app.view.tasks);
         app.apply_view(View {
             tasks: app.view.tasks.clone(),
             task_order: app.view.task_order.clone(),
@@ -3800,6 +3876,7 @@ mod tests {
             working_copy: g.working_copy,
             id_display: g.id_display,
             fork_point: g.fork_point,
+            more,
             ..View::default()
         });
     }
@@ -4037,6 +4114,53 @@ mod tests {
         app.apply_view(view);
         let agents = buffer_text(&draw(&mut app, 80, 12));
         assert!(!spins(&line_with(&agents, "my work")), "{agents}");
+    }
+
+    /// `n` revisions in a line, `r00` (`@`) on top, the last one's parent not loaded.
+    fn app_with_more_below(n: usize) -> (App, Receiver<Cmd>) {
+        let (mut app, rx) = test_app_with_engine_rx();
+        let ids: Vec<String> = (0..=n).map(|i| format!("r{i:02}")).collect();
+        let revs: Vec<jj::RevInfo> = (0..n)
+            .map(|i| {
+                log_rev(
+                    &ids[i],
+                    &[&ids[i + 1]],
+                    i == 0,
+                    false,
+                    &format!("commit {i}"),
+                )
+            })
+            .collect();
+        apply_revs(&mut app, revs, &default_ws("r00"));
+        (app, rx)
+    }
+
+    #[test]
+    fn the_log_view_asks_for_more_history_once_within_a_screen_of_the_bottom() {
+        let (mut app, rx) = app_with_more_below(30);
+        press(&mut app, KeyCode::Tab);
+        app.load_ahead(20);
+        assert!(sent(&rx).is_empty(), "the top is more than a screen away");
+        for _ in 0..12 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        app.load_ahead(20);
+        app.load_ahead(20);
+        assert_eq!(sent(&rx), vec![Cmd::LoadMore], "asked once per page");
+    }
+
+    #[test]
+    fn down_stays_on_the_last_row_while_more_history_is_loading() {
+        let (mut app, _rx) = app_with_more_below(3);
+        press(&mut app, KeyCode::Tab);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        assert_eq!(
+            app.log.selected.as_deref(),
+            Some("r02"),
+            "no wrap to the top"
+        );
     }
 
     #[test]
@@ -4636,6 +4760,20 @@ mod tests {
     }
 
     #[test]
+    fn v_in_the_agents_view_diffs_what_the_agent_added() {
+        let (mut app, _rx) = test_app_with_engine_rx();
+        task_with_pane(&mut app, "do the thing");
+        press(&mut app, KeyCode::Char('v'));
+        let argv = app.exec.take().expect("a pager to run");
+        assert_eq!(argv[3], "--ignore-working-copy", "a read never snapshots");
+        assert_eq!(
+            argv[4..],
+            ["diff", "--from", "f1", "--to", "\"faf-task-1\"@"],
+            "from the task's fork point to its workspace's @"
+        );
+    }
+
+    #[test]
     fn v_diffs_a_merge_from_its_mainline_and_a_branch_from_its_fork_point() {
         let (mut app, _rx) = log_app(Mode::Faff);
         app.log.selected = Some("m".into());
@@ -4757,7 +4895,7 @@ mod tests {
     }
 
     #[test]
-    fn the_log_view_pulls_in_matching_bookmarks_once_typing_pauses() {
+    fn the_log_view_pulls_in_bookmarks_and_searches_files_once_typing_pauses() {
         let (mut app, rx) = log_app(Mode::Faff);
         app.view.bookmarks = vec![
             jj::BookmarkRef {
@@ -4778,13 +4916,16 @@ mod tests {
         app.pull_due = Some(Instant::now());
         app.pull_in();
         let want = r#"remote_bookmarks(exact:"pr-77", exact:"origin")"#.to_string();
-        assert_eq!(sent(&rx), vec![Cmd::PullIn(vec![want])]);
+        assert_eq!(
+            sent(&rx),
+            vec![Cmd::PullIn(vec![want]), Cmd::SearchFiles("pr-77".into())]
+        );
         press(&mut app, KeyCode::Esc);
         app.pull_due = Some(Instant::now());
         app.pull_in();
         assert_eq!(
             sent(&rx),
-            vec![Cmd::PullIn(Vec::new())],
+            vec![Cmd::PullIn(Vec::new()), Cmd::SearchFiles(String::new())],
             "dropped with the search"
         );
     }
