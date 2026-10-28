@@ -63,6 +63,12 @@ pub enum Action {
     /// `z` (`faff logs`): squash the selected branch into one new revision for review,
     /// without moving your working copy.
     Squash,
+    /// `f`: a workspace of your own forked from the selected revision (no agent). See
+    /// `workspace::fork`.
+    Fork,
+    /// `F` (Shift+f): a workspace that takes the selected revision itself; a workspace
+    /// sitting on it moves off. See `workspace::move_into`.
+    MoveInto,
     None,
 }
 
@@ -93,6 +99,8 @@ pub fn hint_key(action: Action) -> Option<&'static str> {
         Action::Edit => "e",
         Action::SqDiff => "v",
         Action::Squash => "z",
+        Action::Fork => "f",
+        Action::MoveInto => "F",
     })
 }
 
@@ -124,6 +132,8 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('e') => Action::Edit,
         KeyCode::Char('v') => Action::SqDiff,
         KeyCode::Char('z') => Action::Squash,
+        KeyCode::Char('f') => Action::Fork,
+        KeyCode::Char('F') => Action::MoveInto,
         _ => Action::None,
     }
 }
@@ -171,6 +181,8 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('e'))), Action::Edit);
         assert_eq!(map_key(k(KeyCode::Char('v'))), Action::SqDiff);
         assert_eq!(map_key(k(KeyCode::Char('z'))), Action::Squash);
+        assert_eq!(map_key(k(KeyCode::Char('f'))), Action::Fork);
+        assert_eq!(map_key(k(KeyCode::Char('F'))), Action::MoveInto);
         assert_eq!(map_key(k(KeyCode::Char('Z'))), Action::None);
     }
 }

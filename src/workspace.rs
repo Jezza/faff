@@ -192,6 +192,120 @@ pub fn continue_at(repo: &Path, name: &str, path: &Path, rev: &str) -> Result<Wo
     })
 }
 
+/// Whether faff created workspace `name` for a task (`faf-task-<id>`), as opposed to an
+/// agent spawned into a workspace that was already there.
+pub fn made_for_task(name: &str) -> bool {
+    name.strip_prefix("faf-task-")
+        .is_some_and(|id| id.parse::<i64>().is_ok())
+}
+
+/// The workspace whose `@` is `rev`, and where it lives, if any.
+pub fn holder(repo: &Path, rev: &str) -> Result<Option<(String, PathBuf)>> {
+    let Some(name) = jj::workspace_list(repo)?
+        .into_iter()
+        .find(|w| w.change_id == rev)
+        .map(|w| w.name)
+    else {
+        return Ok(None);
+    };
+    let dir = jj::workspace_root(repo, &name)?;
+    Ok(Some((name, dir)))
+}
+
+/// Where `f` / `F` note a workspace's fork point, as a task's row does for an agent
+/// workspace: inside its `.jj`, so it goes with the workspace and jj never snapshots it.
+const FORK_POINT_FILE: &str = "faff-fork-point";
+
+fn note_fork_point(ws: &WorkspaceInfo) {
+    // Best-effort: without it, removal falls back to `N`'s recipe.
+    let _ = fs::write(ws.path.join(".jj").join(FORK_POINT_FILE), &ws.fork_point);
+}
+
+/// The fork point of the workspace at `path`, whose `@` is `head`, for removing it when no
+/// task recorded one: the one `f` / `F` noted, else `N`'s (the newest revision with changes
+/// below `head`).
+pub fn fork_point_of(repo: &Path, path: &Path, head: &str) -> Result<String> {
+    if let Ok(noted) = fs::read_to_string(path.join(".jj").join(FORK_POINT_FILE)) {
+        let noted = noted.trim();
+        if !noted.is_empty() && jj::any_revision(repo, &format!("present({noted})"))? {
+            return Ok(noted.to_string());
+        }
+    }
+    jj::resolve_change_id(repo, &jj::fork_point_revset(&format!("{head}-")))
+        .context("no fork point below the workspace's @")
+}
+
+/// `f`: a workspace forked from `rev` by `n`'s recipe, applied to `rev` instead of your
+/// `@`. The fork point is the newest revision at or below `rev` with changes. When that is
+/// `rev` itself and a workspace sits on it, that workspace is advanced (`jj new`) first, so
+/// it carries on in a fresh revision and the fork point stays put. No agent.
+pub fn fork(repo: &Path, name: &str, path: &Path, rev: &str) -> Result<WorkspaceInfo> {
+    let r = jj::resolve_change_id(repo, rev).context("resolving the revision")?;
+    let holder = holder(repo, &r)?;
+    // The holder's edits belong in `r` before deciding whether `r` has changes.
+    if let Some((_, dir)) = &holder {
+        jj::snapshot_in(dir).context("snapshotting the workspace on it")?;
+    }
+    let fork_point =
+        jj::resolve_change_id(repo, &jj::fork_point_revset(&r)).unwrap_or_else(|_| r.clone());
+    if fork_point == r
+        && let Some((ws, dir)) = &holder
+    {
+        jj::new_in(dir, &r).with_context(|| format!("jj new (advancing {ws})"))?;
+    }
+    let ws = create_at(repo, name, path, &fork_point)?;
+    note_fork_point(&ws);
+    Ok(ws)
+}
+
+/// `F`: a workspace that takes `rev` itself rather than forking from it, as `N` does for
+/// an agent. A workspace sitting on `rev` moves off it onto a fresh empty revision on the
+/// fork point below, as your `@` does in [`handoff`]. Refuses an immutable revision.
+pub fn move_into(repo: &Path, name: &str, path: &Path, rev: &str) -> Result<WorkspaceInfo> {
+    let w = jj::resolve_change_id(repo, rev).context("resolving the revision")?;
+    if jj::any_revision(repo, &format!("{w} & immutable()"))? {
+        bail!("{w} is immutable");
+    }
+    let holder = holder(repo, &w)?;
+    // Its edits must be in `w` before `w` changes hands.
+    if let Some((_, dir)) = &holder {
+        jj::snapshot_in(dir).context("snapshotting the workspace on it")?;
+    }
+    let fork_point = jj::resolve_change_id(repo, &jj::fork_point_revset(&format!("{w}-")))
+        .context("no fork point below the revision")?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace root {}", parent.display()))?;
+    }
+    // Created as an empty child of `w`, then moved onto `w` itself (as in `handoff`).
+    jj::workspace_add(repo, name, &w, path).context("jj workspace add")?;
+    let taken = jj::edit_in(path, &w)
+        .context("moving the workspace onto the revision")
+        .and_then(|()| match &holder {
+            // The old holder moves off last, once `w` has its new workspace.
+            Some((ws, dir)) => {
+                jj::new_in(dir, &fork_point).with_context(|| format!("jj new (moving {ws} off)"))
+            }
+            None => Ok(()),
+        });
+    if let Err(e) = taken {
+        // Best-effort: don't leave a half-made workspace nothing will ever clean up.
+        let _ = jj::workspace_forget(repo, name);
+        let _ = discard_dir(path);
+        return Err(e);
+    }
+
+    let ws = WorkspaceInfo {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        change_id: w,
+        fork_point,
+    };
+    note_fork_point(&ws);
+    Ok(ws)
+}
+
 /// Outcome of computing a refresh (`r`/`R`) for an agent workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refresh {
@@ -260,8 +374,8 @@ pub fn take_over(repo: &Path, ws_name: &str, ws_path: &Path) -> Result<String> {
     Ok(head)
 }
 
-/// Retire a task workspace: forget it, delete its directory, and abandon its commits
-/// **only if they are all empty**.
+/// Retire a workspace — an agent's, or any other but the one holding the repo: forget it,
+/// delete its directory, and abandon its commits **only if they are all empty**.
 ///
 /// The task's own commits are `(fork_point..head) ~ ::@` — its branch, minus anything
 /// already integrated into HEAD's `@` (which must never be rewritten). Of that set:
@@ -294,7 +408,7 @@ pub fn teardown_discarding_revision(
 /// Shared teardown: forget the workspace, delete its directory, and abandon the task's
 /// own commits `(fork_point..head) ~ ::@`. `discard_revision` chooses *when*: normally
 /// only an all-empty branch (graph noise) is abandoned and real work is left as history;
-/// with `discard_revision` the whole branch goes.
+/// with `discard_revision` the whole branch goes. Refuses the workspace holding the repo.
 fn retire(
     repo: &Path,
     ws_name: &str,
@@ -302,6 +416,9 @@ fn retire(
     fork_point: &str,
     discard_revision: bool,
 ) -> Result<()> {
+    if holds_repo(ws_path) {
+        bail!("{ws_name} holds the repo itself");
+    }
     if let Some(head) = jj::workspace_list(repo)?
         .into_iter()
         .find(|w| w.name == ws_name)
@@ -325,6 +442,12 @@ fn retire(
     discard_dir(ws_path)
 }
 
+/// Whether the workspace at `path` is the one the repo lives in (its `.jj/repo` is the
+/// store itself, where any other workspace's is a file pointing at it). Never removed.
+fn holds_repo(path: &Path) -> bool {
+    path.join(".jj").join("repo").is_dir()
+}
+
 /// Prefix of a workspace directory renamed aside by [`discard_dir`] and not yet deleted.
 const TRASH_PREFIX: &str = ".trash-";
 
@@ -337,6 +460,9 @@ const TRASH_PREFIX: &str = ".trash-";
 pub fn discard_dir(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
+    }
+    if holds_repo(path) {
+        bail!("{} holds the repo itself", path.display());
     }
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let nanos = std::time::SystemTime::now()
@@ -1634,6 +1760,146 @@ mod tests {
             jj::resolve_change_id(&repo, "@").unwrap(),
             head_before,
             "your @ is untouched"
+        );
+    }
+
+    /// A second workspace `other` beside `repo`, its `@` an empty child of "base".
+    fn other_workspace(tmp: &Path, repo: &Path, cfg: &Path) -> PathBuf {
+        let dir = tmp.join("other");
+        let dir_s = dir.to_string_lossy();
+        jj(repo, cfg, &["workspace", "add", "--name", "other", &dir_s]);
+        dir
+    }
+
+    #[test]
+    fn integration_fork_advances_the_workspace_on_a_revision_with_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let other = other_workspace(tmp.path(), &repo, &cfg);
+        fs::write(other.join("theirs.txt"), "their work").unwrap();
+        jj_in(&other, &cfg, &["util", "snapshot"]);
+        let w = ws_head(&repo, "other");
+        let mine = jj::resolve_change_id(&repo, "@").unwrap();
+
+        let path = tmp.path().join("ws").join("brisk-amber-otter");
+        let info = fork(&repo, "brisk-amber-otter", &path, &w).unwrap();
+
+        assert_eq!(info.fork_point, w, "forks from the revision itself");
+        let advanced = ws_head(&repo, "other");
+        assert_ne!(advanced, w, "the workspace on it moved on");
+        let parent = jj::resolve_change_id(&repo, &format!("{advanced}-")).unwrap();
+        assert_eq!(parent, w);
+        assert_eq!(
+            jj::resolve_change_id(&repo, &format!("{}-", info.change_id)).unwrap(),
+            w,
+            "the new workspace's @ is an empty child of it"
+        );
+        assert!(path.join("theirs.txt").exists());
+        let at = jj::resolve_change_id(&repo, "@").unwrap();
+        assert_eq!(at, mine, "your @ is untouched");
+    }
+
+    #[test]
+    fn integration_fork_on_an_empty_revision_forks_below_and_moves_no_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        other_workspace(tmp.path(), &repo, &cfg);
+        let w = ws_head(&repo, "other");
+
+        let path = tmp.path().join("ws").join("calm-fuzzy-fern");
+        let info = fork(&repo, "calm-fuzzy-fern", &path, &w).unwrap();
+
+        assert_eq!(info.fork_point, base, "forks from changes below it");
+        assert_eq!(ws_head(&repo, "other"), w, "nothing to advance");
+    }
+
+    #[test]
+    fn integration_move_into_takes_the_revision_and_moves_its_workspace_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        let other = other_workspace(tmp.path(), &repo, &cfg);
+        // Not yet snapshotted: `F` must capture it before the revision changes hands.
+        fs::write(other.join("theirs.txt"), "their work").unwrap();
+        let w = ws_head(&repo, "other");
+
+        let path = tmp.path().join("ws").join("swift-tidy-wren");
+        let info = move_into(&repo, "swift-tidy-wren", &path, &w).unwrap();
+
+        assert_eq!(info.change_id, w);
+        assert_eq!(ws_head(&repo, "swift-tidy-wren"), w, "the new one is on it");
+        assert!(path.join("theirs.txt").exists(), "with the edits it held");
+        let moved = ws_head(&repo, "other");
+        assert_ne!(moved, w, "the old workspace moved off");
+        let parent = jj::resolve_change_id(&repo, &format!("{moved}-")).unwrap();
+        assert_eq!(parent, base);
+        assert!(!jj::any_revision(&repo, &format!("{moved} ~ empty()")).unwrap());
+    }
+
+    #[test]
+    fn integration_removal_retires_a_workspace_faff_did_not_create_alike() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        let other = other_workspace(tmp.path(), &repo, &cfg);
+        fs::write(other.join("theirs.txt"), "their work").unwrap();
+        jj_in(&other, &cfg, &["util", "snapshot"]);
+        let w = ws_head(&repo, "other");
+
+        teardown_discarding_revision(&repo, "other", &other, &base).unwrap();
+
+        assert!(!other.exists(), "its directory goes");
+        assert!(
+            !jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|ws| ws.name == "other"),
+            "jj forgets it"
+        );
+        assert!(
+            !jj::any_revision(&repo, &format!("present({w})")).unwrap(),
+            "its revision is abandoned"
+        );
+    }
+
+    #[test]
+    fn integration_removal_refuses_the_workspace_holding_the_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let other = other_workspace(tmp.path(), &repo, &cfg);
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+
+        assert!(teardown(&other, "default", &repo, &base).is_err());
+        assert!(discard_dir(&repo).is_err());
+
+        assert!(repo.join(".jj").join("repo").is_dir(), "the repo stays");
+        assert!(
+            jj::workspace_list(&repo)
+                .unwrap()
+                .iter()
+                .any(|ws| ws.name == "default"),
+            "still a workspace"
+        );
+    }
+
+    #[test]
+    fn integration_a_forked_workspace_keeps_its_fork_point_as_it_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, cfg) = scratch_repo(tmp.path());
+        let base = jj::resolve_change_id(&repo, "@-").unwrap();
+        let path = tmp.path().join("ws").join("calm-fuzzy-fern");
+        let info = fork(&repo, "calm-fuzzy-fern", &path, &base).unwrap();
+        fs::write(path.join("mine.txt"), "mine").unwrap();
+        jj_in(&path, &cfg, &["commit", "-m", "mine"]);
+        let head = ws_head(&repo, "calm-fuzzy-fern");
+
+        assert_eq!(fork_point_of(&repo, &path, &head).unwrap(), info.fork_point);
+        // Without the note, `N`'s recipe: the newest revision with changes below `@`.
+        fs::remove_file(path.join(".jj").join(FORK_POINT_FILE)).unwrap();
+        assert_eq!(
+            fork_point_of(&repo, &path, &head).unwrap(),
+            jj::resolve_change_id(&repo, &format!("{head}-")).unwrap()
         );
     }
 

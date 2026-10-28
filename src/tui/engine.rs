@@ -13,7 +13,7 @@ use crate::domain::{Autonomy, DESCRIBE_PROMPT, Task, TaskId, TaskStatus};
 use crate::graph::{self, GraphNode, GraphRow};
 use crate::store::Store;
 use crate::{config, events, jj, wezterm, workspace};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -79,6 +79,9 @@ pub enum Cmd {
     Toggle(Option<TaskId>),
     /// `x` / `X`.
     Remove { id: TaskId, discard: bool },
+    /// `x` / `X` in the log views: remove the workspace on `rev` (its agent's task with
+    /// it, in faff).
+    RemoveWorkspace { rev: String, discard: bool },
     /// `s`, already confirmed if the agent was working.
     Swap(TaskId),
     /// `S`.
@@ -99,6 +102,9 @@ pub enum Cmd {
         base: String,
         name: String,
     },
+    /// `f` / `F`: a workspace forked from `rev` (`f`) or taking `rev` itself (`F`). No
+    /// agent.
+    AddWorkspace { rev: String, take: bool },
     /// The log view: also load these revsets (branches a search reached), replacing the
     /// last set. Empty when the search is cleared. Not a user command: no [`Msg::Done`].
     PullIn(Vec<String>),
@@ -410,7 +416,11 @@ impl Engine {
         self.publish();
         let mut nudged = false;
         loop {
-            let gap = if nudged { MIN_REFRESH_GAP } else { IDLE_REFRESH };
+            let gap = if nudged {
+                MIN_REFRESH_GAP
+            } else {
+                IDLE_REFRESH
+            };
             match rx.recv_timeout(gap.saturating_sub(self.last_refresh.elapsed())) {
                 Ok(Cmd::Nudge) => nudged = true,
                 Ok(Cmd::OpChanged) => {
@@ -454,6 +464,7 @@ impl Engine {
             Cmd::New(base) => self.new_task(base),
             Cmd::Toggle(id) => self.toggle_session(id),
             Cmd::Remove { id, discard } => self.remove(id, discard),
+            Cmd::RemoveWorkspace { rev, discard } => self.remove_workspace(rev, discard),
             Cmd::Swap(id) => self.perform_swap(id),
             Cmd::Snapshot(id) => self.snapshot_task(id),
             Cmd::Rebase { id, freeze } => self.perform_rebase(id, freeze),
@@ -469,6 +480,20 @@ impl Engine {
                     revops::squash(&self.repo, &self.aliases, &rev, &base, &name, &self.notices)
                 {
                     self.pinned.push(id.clone());
+                    self.refresh();
+                    self.select_rev = Some(id);
+                }
+            }
+            Cmd::AddWorkspace { rev, take } => {
+                let tasks = self.store.list_tasks().unwrap_or_default();
+                if let Some(id) = revops::add_workspace(
+                    &self.repo,
+                    &self.aliases,
+                    &rev,
+                    take,
+                    &tasks,
+                    &self.notices,
+                ) {
                     self.refresh();
                     self.select_rev = Some(id);
                 }
@@ -527,7 +552,6 @@ impl Engine {
     fn task(&self, id: TaskId) -> Option<Task> {
         self.tasks.iter().find(|t| t.id == id).cloned()
     }
-
 
     /// `n`: create an empty task, fork its workspace, spawn a bare `claude`, and open
     /// it beside faff so the user types their task straight into the session. The task
@@ -600,7 +624,10 @@ impl Engine {
             Base::ForkPoint => workspace::create(&self.repo, &name, &path)?,
             Base::Handoff => workspace::handoff(&self.repo, &name, &path)?,
             Base::At(rev) => workspace::create_at(&self.repo, &name, &path, rev)?,
-            Base::Continue(rev) => workspace::continue_at(&self.repo, &name, &path, rev)?,
+            Base::Continue(rev) => match self.existing_workspace(rev)? {
+                Some(ws) => ws,
+                None => workspace::continue_at(&self.repo, &name, &path, rev)?,
+            },
         };
         // The workspace now exists on disk + in jj. If recording it fails, tear it
         // back down so we don't leak an untracked jj workspace (the DB row is rolled
@@ -629,6 +656,39 @@ impl Engine {
         );
         let _ = workspace::trust_workspace(&ws.path);
         Ok(())
+    }
+
+    /// The log view's `N` on a revision some workspace other than yours sits on: the agent
+    /// spawns in that workspace, which stays where it is. `None` when no workspace holds
+    /// the revision, or it's your own `@` (a hand-off). Refuses one an agent already has.
+    fn existing_workspace(&self, rev: &str) -> Result<Option<workspace::WorkspaceInfo>> {
+        let w = jj::resolve_change_id(&self.repo, rev).context("resolving the revision")?;
+        if jj::resolve_change_id(&self.repo, "@").context("resolving @")? == w {
+            return Ok(None);
+        }
+        let Some((name, path)) = workspace::holder(&self.repo, &w)? else {
+            return Ok(None);
+        };
+        if let Some(t) = self
+            .store
+            .list_tasks()?
+            .into_iter()
+            .find(|t| t.ws_name.as_deref() == Some(name.as_str()))
+        {
+            bail!("{name} is already #{}'s agent workspace", t.id.0);
+        }
+        if workspace::made_for_task(&name) {
+            bail!("{name} is an agent workspace");
+        }
+        let fork_point =
+            jj::resolve_change_id(&self.repo, &jj::fork_point_revset(&format!("{w}-")))
+                .context("no fork point below the revision")?;
+        Ok(Some(workspace::WorkspaceInfo {
+            name,
+            path,
+            change_id: w,
+            fork_point,
+        }))
     }
 
     /// Whether this task's conversation is already on disk, i.e. whether relaunching it
@@ -801,6 +861,33 @@ impl Engine {
         self.refresh();
     }
 
+    /// `x` / `X` in the log view: an agent's workspace goes with its task, pane and all, as
+    /// from the agents view; any other alone (see [`revops::remove_workspace`]).
+    fn remove_workspace(&mut self, rev: String, discard: bool) {
+        let owner = workspace::holder(&self.repo, &rev)
+            .ok()
+            .flatten()
+            .and_then(|(name, _)| {
+                self.tasks
+                    .iter()
+                    .find(|t| t.ws_name.as_deref() == Some(name.as_str()))
+                    .map(|t| t.id)
+            });
+        if let Some(id) = owner {
+            return self.remove(id, discard);
+        }
+        if revops::remove_workspace(
+            &self.repo,
+            &self.aliases,
+            &rev,
+            discard,
+            &self.tasks,
+            &self.notices,
+        ) {
+            self.refresh();
+        }
+    }
+
     /// Tear a task down by id: undock and kill its pane, retire its workspace (abandoning
     /// its revision only when `discard_revision`), drop the row, and drop it from the merge
     /// train. Sets no status and does not refresh — the caller owns both.
@@ -826,7 +913,6 @@ impl Engine {
         let _ = self.store.delete_task(id);
         self.merge_train.remove(id);
     }
-
 
     /// Run the swap for task `id` (already validated / confirmed) and refresh.
     fn perform_swap(&mut self, id: TaskId) {
@@ -865,7 +951,6 @@ impl Engine {
         self.refresh();
     }
 
-
     /// Compute the new base and inject the rebase prompt into the agent's pane (already
     /// validated / confirmed). No-op when the agent is already on the latest base.
     fn perform_rebase(&mut self, id: TaskId, freeze: bool) {
@@ -892,7 +977,6 @@ impl Engine {
         }
         self.refresh();
     }
-
 
     /// Inject the describe prompt into the agent's pane (already validated / confirmed).
     fn perform_describe(&mut self, id: TaskId) {
@@ -1851,6 +1935,41 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_deletes_any_gone_workspace_directory_but_the_repo() {
+        let (mut e, _rx) = test_engine();
+        let tmp = tempfile::tempdir().unwrap();
+        let (mine, theirs, repo) = (
+            tmp.path().join("0001-x"),
+            tmp.path().join("calm-tidy-fox"),
+            tmp.path().join("repo"),
+        );
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::create_dir_all(repo.join(".jj").join("repo")).unwrap();
+        for (i, (name, dir)) in [
+            ("faf-task-1", &mine),
+            ("calm-tidy-fox", &theirs),
+            ("default", &repo),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let t = e.store.create_task("t", 0, Autonomy::Inherit).unwrap();
+            e.store
+                .set_workspace(t.id, name, dir, &format!("c{i}"), "f")
+                .unwrap();
+        }
+        e.tasks = e.store.list_tasks().unwrap();
+
+        // All forgotten in jj: every task goes, and every directory but the repo's.
+        e.reconcile_workspaces(&[]);
+
+        assert!(e.store.list_tasks().unwrap().is_empty());
+        assert!(!mine.exists() && !theirs.exists());
+        assert!(repo.join(".jj").join("repo").is_dir(), "the repo stays");
+    }
+
+    #[test]
     fn orphaned_workspaces_flags_only_untracked_faff_workspaces() {
         use std::path::Path;
         let (mut e, _rx) = test_engine();
@@ -2035,7 +2154,10 @@ mod tests {
         e.store.set_pane(t.id, Some(42)).unwrap();
         e.tasks = e.store.list_tasks().unwrap();
         let v = e.view();
-        assert!(!v.revivable.contains(&t.id) && !v.resumable.contains(&t.id), "alive again");
+        assert!(
+            !v.revivable.contains(&t.id) && !v.resumable.contains(&t.id),
+            "alive again"
+        );
     }
 
     #[test]
@@ -2057,10 +2179,7 @@ mod tests {
     fn a_task_with_no_workspace_left_cannot_be_revived() {
         let tmp = tempfile::tempdir().unwrap();
         let e = engine_with_projects(tmp.path());
-        let t = e
-            .store
-            .create_task("orphan", 0, Autonomy::Inherit)
-            .unwrap();
+        let t = e.store.create_task("orphan", 0, Autonomy::Inherit).unwrap();
 
         assert!(!e.task_revivable(&t));
     }

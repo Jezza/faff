@@ -137,27 +137,42 @@ fn setup_terminal(title: &str) -> Result<Term> {
     // Title faff's own pane (and so its tab, while it's the active pane). An OSC title
     // rather than `wezterm cli set-tab-title`: the shell's next prompt replaces it, so it
     // can't outlive faff the way a sticky tab title would.
-    execute!(out, terminal::EnterAlternateScreen, terminal::SetTitle(title))?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        terminal::SetTitle(title)
+    )?;
     let term = Terminal::new(ratatui::backend::CrosstermBackend::new(out))?;
     Ok(term)
 }
 
+/// A command that took at least this long had someone reading it (a pager they quit, an
+/// editor they closed), so faff returns straight to the log.
+const READ_FOR: Duration = Duration::from_millis(200);
+
 /// Hand the terminal to `argv` (a pager, say) and take it back once it exits. The
-/// command's output stays on the main screen, so wait for a key before covering it again:
-/// a pager that exits by itself on short output would otherwise flash past unseen.
+/// command's output stays on the main screen. If it exited quickly or failed, wait for a
+/// key before covering it again: `less -F` exits by itself on short output, which would
+/// otherwise flash past unseen, as would an error.
 fn run_suspended(term: &mut Term, argv: &[String], dir: &Path) -> Result<()> {
     restore_terminal(term)?;
+    let started = Instant::now();
     let status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .current_dir(dir)
         .status();
-    println!("\n── press any key to return to the log ──");
+    let read = started.elapsed() >= READ_FOR && status.as_ref().is_ok_and(|s| s.success());
+    if !read {
+        println!("\n── press any key to return to the log ──");
+    }
     terminal::enable_raw_mode()?;
-    loop {
-        if let CtEvent::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-        {
-            break;
+    if !read {
+        loop {
+            if let CtEvent::Key(k) = event::read()?
+                && k.kind == KeyEventKind::Press
+            {
+                break;
+            }
         }
     }
     execute!(term.backend_mut(), terminal::EnterAlternateScreen)?;
@@ -183,7 +198,10 @@ fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
@@ -373,6 +391,18 @@ const HINTS: &[Hint] = &[
         ctx: AGENTS | LOG,
     },
     Hint {
+        key: "f",
+        verbose: "fork",
+        grp: Grp::New,
+        ctx: LOG | LOGS,
+    },
+    Hint {
+        key: "F",
+        verbose: "move",
+        grp: Grp::New,
+        ctx: LOG | LOGS,
+    },
+    Hint {
         key: "↵",
         verbose: "open",
         grp: Grp::Open,
@@ -454,13 +484,13 @@ const HINTS: &[Hint] = &[
         key: "x",
         verbose: "rm",
         grp: Grp::Del,
-        ctx: AGENTS,
+        ctx: ALL,
     },
     Hint {
         key: "X",
         verbose: "drop",
         grp: Grp::Del,
-        ctx: AGENTS,
+        ctx: ALL,
     },
     Hint {
         key: "/",
@@ -561,17 +591,32 @@ struct Viewport {
 /// plus [`SCROLL_CONTEXT`] rows beneath.
 fn graph_viewport(total: usize, height: usize, sel: Option<(usize, usize)>) -> Viewport {
     if total <= height {
-        return Viewport { skip: 0, body: total, up: false, down: false };
+        return Viewport {
+            skip: 0,
+            body: total,
+            up: false,
+            down: false,
+        };
     }
     // Too short for markers to leave room for anything: show a bare window.
     if height < 3 {
         let skip = sel.map_or(0, |(a, _)| a.min(total - height));
-        return Viewport { skip, body: height, up: false, down: false };
+        return Viewport {
+            skip,
+            body: height,
+            up: false,
+            down: false,
+        };
     }
     let end = sel.map_or(0, |(_, b)| (b + 1 + SCROLL_CONTEXT).min(total));
     // Pinned to the top: everything up to `end` fits above the `↓` marker.
     if end < height {
-        return Viewport { skip: 0, body: height - 1, up: false, down: true };
+        return Viewport {
+            skip: 0,
+            body: height - 1,
+            up: false,
+            down: true,
+        };
     }
     let first = sel.map_or(0, |(a, _)| a);
     if end == total {
@@ -580,12 +625,22 @@ fn graph_viewport(total: usize, height: usize, sel: Option<(usize, usize)>) -> V
         let skip = (total - body).min(first).max(1);
         let down = skip + body < total;
         let body = if down { body - 1 } else { body };
-        return Viewport { skip, body, up: true, down };
+        return Viewport {
+            skip,
+            body,
+            up: true,
+            down,
+        };
     }
     // Both markers. A selection taller than the body shows its top.
     let body = height - 2;
     let skip = (end - body).min(first).max(1);
-    Viewport { skip, body, up: true, down: true }
+    Viewport {
+        skip,
+        body,
+        up: true,
+        down: true,
+    }
 }
 
 /// A change id cut to the id column's width, for notices and busy labels.
@@ -795,7 +850,11 @@ impl App {
         }
         let id = self.view.task_order.get(self.selected)?;
         let rows = &self.view.rows;
-        let at = self.view.task_of_node.iter().position(|t| t.as_ref() == Some(id))?;
+        let at = self
+            .view
+            .task_of_node
+            .iter()
+            .position(|t| t.as_ref() == Some(id))?;
         rows[..=at].iter().rev().find_map(|r| r.change_id.clone())
     }
 
@@ -971,8 +1030,22 @@ impl App {
             }
             Action::SqDiff => self.sq_diff_selected(),
             Action::Squash => self.squash_selected(),
+            Action::Fork => self.add_workspace(false),
+            Action::MoveInto => self.add_workspace(true),
             Action::None => {}
         }
+    }
+
+    /// `f` / `F`: a workspace on the selected revision, named for you.
+    fn add_workspace(&mut self, take: bool) {
+        let Some(rev) = self.log.selected.clone() else {
+            return self.notices.warn("no revision selected");
+        };
+        let verb = if take { "moving" } else { "forking" };
+        self.send(
+            format!("{verb} {}", short_id(&rev)),
+            Cmd::AddWorkspace { rev, take },
+        );
     }
 
     /// A key while the search line is being typed into.
@@ -1102,10 +1175,7 @@ impl App {
         };
         let base = self.squash_base(&rev);
         let name = logview::squash_name(self.view.log.meta.get(&rev), &rev);
-        self.send(
-            format!("squashing {name}"),
-            Cmd::Squash { rev, base, name },
-        );
+        self.send(format!("squashing {name}"), Cmd::Squash { rev, base, name });
     }
 
     /// `q`: quit once the engine is idle, so a half-finished create or remove is never
@@ -1155,6 +1225,16 @@ impl App {
     /// `x` / `X`: remove the selected task. `x` keeps its real work as ordinary jj history;
     /// `X` discards the revision too (see `workspace::teardown_discarding_revision`).
     fn remove_selected(&mut self, discard: bool) {
+        // The log views remove the workspace on the selected revision instead.
+        if self.body == Body::Log {
+            let Some(rev) = self.log.selected.clone() else {
+                return self.notices.warn("no revision selected");
+            };
+            return self.send(
+                format!("removing the workspace on {}", short_id(&rev)),
+                Cmd::RemoveWorkspace { rev, discard },
+            );
+        }
         let Some(t) = self.selected_task() else {
             return;
         };
@@ -1396,7 +1476,12 @@ impl App {
             .and_then(|s| hits.iter().position(|h| h == s))
             .map_or(String::from("-"), |i| (i + 1).to_string());
         let mut spans = vec![
-            Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " / ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(search.query.clone()),
         ];
         if search.typing {
@@ -1405,7 +1490,12 @@ impl App {
         if !search.query.is_empty() {
             let noun = if hits.len() == 1 { "hit" } else { "hits" };
             spans.push(Span::styled(
-                format!("   {} {noun} · {at}/{} · ±{}", hits.len(), hits.len(), search.context),
+                format!(
+                    "   {} {noun} · {at}/{} · ±{}",
+                    hits.len(),
+                    hits.len(),
+                    search.context
+                ),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -1496,22 +1586,17 @@ impl App {
                     let (icon, _) = model::status_label(t.status);
                     let docked = open == Some(*id);
                     let style = if selected == Some(*id) {
-                        Style::default().add_modifier(Modifier::REVERSED)
+                        Style::default().bg(SELECTED_BG)
                     } else {
                         Style::default()
                     };
                     // A detached row has no revision brackets, so the docked session is
                     // shown by greening its `· #id` prefix instead — the same fixed
                     // left-column indicator, never crowded out by a truncated description.
-                    // Start from `Style::default()`, not `style`: on the highlighted row
-                    // `style` carries REVERSED, which would swap fg/bg into a green cell
-                    // background rather than green glyphs.
                     let prefix = format!("· #{}", t.id.0);
                     let rest = format!(" {} {icon}", t.label());
                     let prefix_style = if docked {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
+                        style.fg(Color::Green).add_modifier(Modifier::BOLD)
                     } else {
                         style
                     };
@@ -1645,11 +1730,16 @@ impl App {
         let mut sel_lines: Option<(usize, usize)> = None;
         for (i, row) in rows.iter().enumerate() {
             let row_task = task_of.get(i).copied().flatten();
-            let row_status =
-                row_task.and_then(|id| self.view.tasks.iter().find(|t| t.id == id).map(|t| t.status));
+            let row_status = row_task.and_then(|id| {
+                self.view
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.status)
+            });
             let is_sel = is_sel(i);
             let base = if is_sel {
-                Style::default().add_modifier(Modifier::REVERSED)
+                Style::default().bg(SELECTED_BG)
             } else {
                 Style::default()
             };
@@ -1696,23 +1786,30 @@ impl App {
                     // are easy to miss; the remainder gives the green some width. The
                     // unique prefix keeps its magenta either way — green and magenta inside
                     // one id would read as noise. A fixed left-column indicator survives
-                    // description truncation that a trailing marker would not. The docked
-                    // style starts from `Style::default()`, NOT `base`: on the highlighted
-                    // row `base` carries REVERSED, which would swap fg/bg and paint the
-                    // cell background green instead of the glyphs.
+                    // description truncation that a trailing marker would not.
                     let frame = if node_is_docked[i] {
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD)
+                        base.fg(Color::Green).add_modifier(Modifier::BOLD)
                     } else {
                         base.fg(Color::DarkGray)
                     };
+                    let hit = search.and_then(|l| l.hit(cid));
+                    let id_idx = hit
+                        .and_then(|h| h.indices_in(logview::Field::ChangeId, cid))
+                        .unwrap_or_default();
+                    let plen = prefix.chars().count();
+                    let rest_idx: Vec<usize> = id_idx
+                        .iter()
+                        .filter(|&&i| i >= plen)
+                        .map(|&i| i - plen)
+                        .collect();
                     spans.push(Span::styled("[", frame));
-                    spans.push(Span::styled(
-                        prefix,
+                    push_highlighted(
+                        &mut spans,
+                        &prefix,
                         base.fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(rest, frame));
+                        id_idx,
+                    );
+                    push_highlighted(&mut spans, &rest, frame, &rest_idx);
                     spans.push(Span::styled("] ", frame));
                     let desc_w = cols.desc_w(text_w.saturating_sub(gutter_w + id_w));
                     let mut avail = desc_w;
@@ -1728,21 +1825,72 @@ impl App {
                         .map(|n| format!(" (+{n})"))
                         .unwrap_or_default();
                     avail = avail.saturating_sub(fold.chars().count());
-                    let text = truncate_first_line(&row.content, avail);
-                    // The spinner and fold took `desc_w - avail` between them.
-                    let used = desc_w - avail + text.chars().count();
-                    match search {
-                        Some(l) if row_status.is_none() => {
-                            push_highlighted(&mut spans, &text, base, &l.highlight(&text));
+                    let mut text = truncate_first_line(&row.content, avail);
+                    // What the search matched, picked out where the row shows it. A match
+                    // the row doesn't show (an email, the description's body, a bookmark
+                    // the column has no room for) gets a snippet after the description.
+                    let row_idx: Vec<usize> = hit
+                        .filter(|_| row_status.is_none())
+                        .and_then(|h| h.indices_in(logview::Field::Row, &row.content))
+                        .unwrap_or_default()
+                        .to_vec();
+                    // The node's own lines: this row and the continuation rows under it
+                    // (an agent's title below a combined HEAD row).
+                    let own_lines: Vec<&str> = rows[i + 1..]
+                        .iter()
+                        .take_while(|r| r.change_id.is_none() && !r.content.is_empty())
+                        .map(|r| r.content.as_str())
+                        .collect();
+                    let shown = |part: &logview::HitPart, text: &str| match part.field {
+                        logview::Field::Row if part.text == row.content => {
+                            part.indices.iter().all(|&i| i < text.chars().count())
                         }
-                        _ => push_row_content(&mut spans, text, base, row_status),
+                        logview::Field::Row => own_lines.contains(&part.text.as_str()),
+                        logview::Field::ChangeId => part.indices.iter().all(|&i| i < ID_W),
+                        logview::Field::Mark => cols.shows_mark(self, cid, part),
+                        logview::Field::Author => part.indices.iter().all(|&i| i < cols.author_w),
+                        _ => false,
+                    };
+                    let unseen = hit.and_then(|h| h.parts.iter().find(|p| !shown(p, &text)));
+                    // The snippet gets at least its label and SNIPPET_MIN of text, taken
+                    // from the description, which is the less useful of the two here.
+                    let snip = unseen
+                        .map(|part| {
+                            let floor = part.field.label().len() + 2 + SNIPPET_MIN;
+                            let w = (avail / 2)
+                                .max(floor)
+                                .min(SNIPPET_MAX.max(floor))
+                                .min(avail.saturating_sub(2));
+                            logview::snippet(part, w)
+                        })
+                        .filter(|(s, _)| !s.is_empty());
+                    if let Some((snip, _)) = &snip {
+                        let room = avail - (snip.chars().count() + 2);
+                        text = truncate_first_line(&row.content, room);
+                        avail = room + snip.chars().count() + 2;
+                    }
+                    let row_idx: Vec<usize> = row_idx
+                        .into_iter()
+                        .filter(|&i| i < text.chars().count())
+                        .collect();
+                    match search {
+                        Some(_) if row_status.is_none() => {
+                            push_highlighted(&mut spans, &text, base, &row_idx);
+                        }
+                        _ => push_row_content(&mut spans, text.clone(), base, row_status),
+                    }
+                    let mut used = desc_w.saturating_sub(avail) + text.chars().count();
+                    if let Some((snip, idx)) = snip {
+                        spans.push(Span::styled("  ", base));
+                        used += 2 + snip.chars().count();
+                        push_highlighted(&mut spans, &snip, base.fg(Color::DarkGray), &idx);
                     }
                     if !fold.is_empty() {
                         spans.push(Span::styled(fold, base.fg(Color::DarkGray)));
                     }
                     if cols.any() {
                         spans.push(Span::styled(" ".repeat(desc_w.saturating_sub(used)), base));
-                        cols.push(self, &mut spans, cid, base, search);
+                        cols.push(self, &mut spans, cid, base, hit);
                     }
                 }
                 // Link row (no content): gutter only.
@@ -1825,7 +1973,9 @@ impl App {
             has_ws: t.as_ref().is_some_and(|t| t.ws_path.is_some()),
             has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
             train: !self.view.merge_train.is_empty(),
-            revivable: t.as_ref().is_some_and(|t| self.view.revivable.contains(&t.id)),
+            revivable: t
+                .as_ref()
+                .is_some_and(|t| self.view.revivable.contains(&t.id)),
         }
     }
 
@@ -1903,7 +2053,12 @@ impl App {
             let keys: &[(&str, &str)] = if search.typing {
                 &[("↑↓", "hits"), ("↵", "lock"), ("esc", "clear")]
             } else {
-                &[("↑↓", "hits"), ("+-", "context"), ("/", "edit"), ("esc", "clear")]
+                &[
+                    ("↑↓", "hits"),
+                    ("+-", "context"),
+                    ("/", "edit"),
+                    ("esc", "clear"),
+                ]
             };
             let style = Style::default().fg(Color::Yellow);
             spans.push(Span::raw(" "));
@@ -1911,7 +2066,10 @@ impl App {
                 if i > 0 {
                     spans.push(Span::raw(if verbose { "  " } else { " " }));
                 }
-                spans.push(Span::styled(k.to_string(), style.add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    k.to_string(),
+                    style.add_modifier(Modifier::BOLD),
+                ));
                 if verbose {
                     spans.push(Span::styled(format!(" {label}"), style));
                 }
@@ -2103,9 +2261,8 @@ impl App {
     }
 }
 
-/// Colour for a status glyph, layered onto the row's base style — which on the selected
-/// row carries REVERSED, so the tint lands on the cell background instead of the glyph,
-/// the same way the docked bracket's green does.
+/// Colour for a status glyph, layered onto the row's base style (on the selected row, its
+/// grey background stays under the tint).
 ///
 /// The glyphs are deliberately plain single-column marks (`⚙ ! ✓`), so colour is what
 /// tells the three modes apart at a glance: blue for the quiet steady state, bold magenta
@@ -2148,10 +2305,17 @@ fn push_row_content(
 
 /// The glyphs a node row's gutter can draw the node itself with — faff's (`◻`, `●`/`○`
 /// for agents) and jj's (`◆` immutable, `○` mutable), plus `@` and the conflict `×`.
-const NODE_GLYPHS: [char; 6] = ['@', '◆', '○', '●', '◻', '×'];
+/// The selected row's background: a dark grey, so the row stands out without the glare of
+/// reverse video, and every tint on it stays a foreground colour.
+const SELECTED_BG: Color = Color::Indexed(237);
+
+const NODE_GLYPHS: [char; 7] = ['@', '◆', '○', '●', '◻', '×', logview::FOLDED_GLYPH];
 
 /// Below this the description stops giving up width, and the columns give way instead.
 const DESC_MIN: usize = 20;
+/// Bounds on a search snippet's width, for a match the row doesn't show.
+const SNIPPET_MIN: usize = 16;
+const SNIPPET_MAX: usize = 40;
 
 /// Widest the bookmark column grows before a row's bookmarks shrink to `first +N`.
 const MARKS_MAX: usize = 32;
@@ -2218,6 +2382,27 @@ impl Columns {
         self.width() > 0
     }
 
+    /// Whether `cid`'s bookmark column shows the bookmark or workspace `part` matched, with
+    /// every matched character: the column is there, the mark isn't one a shrunk column
+    /// counts instead of naming, and the match is in its name rather than its `@remote`.
+    fn shows_mark(&self, app: &App, cid: &str, part: &logview::HitPart) -> bool {
+        if self.marks_w == 0 {
+            return false;
+        }
+        let Some(meta) = app.view.log.meta.get(cid) else {
+            return false;
+        };
+        let marks = logview::marks(meta, &app.view.log.workspaces);
+        let shown = if self.shrink {
+            &marks[..marks.len().min(1)]
+        } else {
+            &marks[..]
+        };
+        shown
+            .iter()
+            .any(|m| !mark_indices(Some(part), m).is_empty())
+    }
+
     /// Their total width, separators included.
     fn width(&self) -> usize {
         let col = |w: usize, sep: usize| if w > 0 { w + sep } else { 0 };
@@ -2236,7 +2421,7 @@ impl Columns {
         spans: &mut Vec<Span<'static>>,
         cid: &str,
         base: Style,
-        search: Option<&logview::LogView>,
+        hit: Option<&logview::Hit>,
     ) {
         let meta = app.view.log.meta.get(cid);
         if self.marks_w > 0 {
@@ -2244,17 +2429,24 @@ impl Columns {
             let marks = meta
                 .map(|m| logview::marks(m, &app.view.log.workspaces))
                 .unwrap_or_default();
-            let used = push_marks(spans, &marks, self.marks_w, self.shrink, base, search);
+            let used = push_marks(spans, &marks, self.marks_w, self.shrink, base, hit);
             spans.push(Span::styled(" ".repeat(self.marks_w - used), base));
         }
         let grey = base.fg(Color::Gray);
         if self.author_w > 0 {
             let who = meta.map(logview::author).unwrap_or_default();
+            let idx: Vec<usize> = hit
+                .and_then(|h| h.indices_in(logview::Field::Author, &who))
+                .unwrap_or_default()
+                .iter()
+                .copied()
+                .filter(|&i| i < self.author_w)
+                .collect();
             let who: String = who.chars().take(self.author_w).collect();
-            spans.push(Span::styled(
-                format!("  {who:<w$}", w = self.author_w),
-                grey,
-            ));
+            spans.push(Span::styled("  ", grey));
+            push_highlighted(spans, &who, grey, &idx);
+            let pad = self.author_w - who.chars().count();
+            spans.push(Span::styled(" ".repeat(pad), grey));
         }
         if self.age_w > 0 {
             let age = meta
@@ -2268,7 +2460,11 @@ impl Columns {
 
 /// Every bookmark on a row, space-separated.
 fn marks_width(marks: &[logview::Mark]) -> usize {
-    marks.iter().map(|m| m.width() + 1).sum::<usize>().saturating_sub(1)
+    marks
+        .iter()
+        .map(|m| m.width() + 1)
+        .sum::<usize>()
+        .saturating_sub(1)
 }
 
 /// A row's bookmarks shrunk to the first and a count of the rest.
@@ -2289,7 +2485,7 @@ fn push_marks(
     width: usize,
     shrink: bool,
     base: Style,
-    search: Option<&logview::LogView>,
+    hit: Option<&logview::Hit>,
 ) -> usize {
     let local = base.fg(Color::Blue).add_modifier(Modifier::BOLD);
     let remote = base.fg(Color::Blue).add_modifier(Modifier::DIM);
@@ -2312,13 +2508,12 @@ fn push_marks(
         }
         // Leave room for the count when the ones after this won't all fit.
         let after = &marks[i + 1..];
-        let reserve = if !after.is_empty()
-            && (shrink || used + m.width() + 1 + marks_width(after) > width)
-        {
-            count(after.len()).len()
-        } else {
-            0
-        };
+        let reserve =
+            if !after.is_empty() && (shrink || used + m.width() + 1 + marks_width(after) > width) {
+                count(after.len()).len()
+            } else {
+                0
+            };
         let room = width.saturating_sub(used + reserve);
         let (name, style, tail) = match m {
             logview::Mark::Local(n, rs) => (
@@ -2330,11 +2525,19 @@ fn push_marks(
             logview::Mark::Workspace(n) => (format!("{n}@"), workspace, String::new()),
         };
         let name: String = name.chars().take(room).collect();
-        let tail: String = tail
-            .chars()
-            .take(room - name.chars().count())
+        let tail: String = tail.chars().take(room - name.chars().count()).collect();
+        let idx: Vec<usize> = hit
+            .map(|h| {
+                h.parts
+                    .iter()
+                    .flat_map(|p| mark_indices(Some(p), m))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let idx: Vec<usize> = idx
+            .into_iter()
+            .filter(|&i| i < name.chars().count())
             .collect();
-        let idx = search.map(|l| l.highlight(&name)).unwrap_or_default();
         push_highlighted(spans, &name, style, &idx);
         if !tail.is_empty() {
             spans.push(Span::styled(tail.clone(), remote));
@@ -2344,19 +2547,49 @@ fn push_marks(
     used
 }
 
+/// Where `part` matched in mark `m`'s name: a bookmark or workspace match on that name, or
+/// on a remote bookmark agreeing with it (`main@origin` on `main`) when every matched
+/// character is in the name. Empty when it didn't match there.
+fn mark_indices(part: Option<&logview::HitPart>, m: &logview::Mark) -> Vec<usize> {
+    let Some(part) = part.filter(|p| p.field == logview::Field::Mark) else {
+        return Vec::new();
+    };
+    let name = match m {
+        logview::Mark::Local(n, _) | logview::Mark::Remote(n) | logview::Mark::Workspace(n) => n,
+    };
+    let len = name.chars().count();
+    let ours = part.text == *name
+        || (matches!(m, logview::Mark::Local(..))
+            && part
+                .text
+                .strip_prefix(name.as_str())
+                .is_some_and(|t| t.starts_with('@'))
+            && part.indices.iter().all(|&i| i < len));
+    if ours {
+        part.indices.clone()
+    } else {
+        Vec::new()
+    }
+}
+
 /// Push `text` in `style`, with the characters at `idx` (a search's matches) picked out.
 fn push_highlighted(spans: &mut Vec<Span<'static>>, text: &str, style: Style, idx: &[usize]) {
     if idx.is_empty() {
         spans.push(Span::styled(text.to_string(), style));
         return;
     }
-    let hit = style.fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let hit = style
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let mut run = String::new();
     let mut run_hit = false;
     for (i, c) in text.chars().enumerate() {
         let h = idx.binary_search(&i).is_ok();
         if h != run_hit && !run.is_empty() {
-            spans.push(Span::styled(std::mem::take(&mut run), if run_hit { hit } else { style }));
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if run_hit { hit } else { style },
+            ));
         }
         run_hit = h;
         run.push(c);
@@ -2530,8 +2763,8 @@ mod tests {
         // Guards against adding a binding to input.rs that never surfaces in the UI —
         // exactly how `R` went undocumented.
         for key in [
-            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "⇥", "q", "/", "←→",
-            "c", "e", "v", "z",
+            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "⇥", "q", "/", "←→", "c",
+            "e", "v", "z", "f", "F",
         ] {
             assert!(
                 HINTS.iter().any(|h| h.key == key),
@@ -2569,9 +2802,18 @@ mod tests {
         app.selected = 0;
         let c = app.caps();
         assert!(!c.has_ws, "fixture has no workspace");
-        assert!(!App::hint_available("s", &c, Ctx::Agents), "swap needs a workspace");
-        assert!(!App::hint_available("S", &c, Ctx::Agents), "snapshot needs a workspace");
-        assert!(App::hint_available("n", &c, Ctx::Agents), "new task is always available");
+        assert!(
+            !App::hint_available("s", &c, Ctx::Agents),
+            "swap needs a workspace"
+        );
+        assert!(
+            !App::hint_available("S", &c, Ctx::Agents),
+            "snapshot needs a workspace"
+        );
+        assert!(
+            App::hint_available("n", &c, Ctx::Agents),
+            "new task is always available"
+        );
         assert!(
             !App::hint_available("A", &c, Ctx::Agents),
             "abort needs a non-empty train"
@@ -2806,7 +3048,11 @@ mod tests {
         app.selected = 0;
 
         app.rebase_selected(true);
-        assert_eq!(app.pending_rebase, Some((t.id, true)), "arms without a prompt");
+        assert_eq!(
+            app.pending_rebase,
+            Some((t.id, true)),
+            "arms without a prompt"
+        );
     }
 
     #[test]
@@ -3191,9 +3437,7 @@ mod tests {
     fn focused_session_greens_its_whole_revision_id() {
         let (mut app, tid) = docked_node_app(true);
         // The docked node is also the highlighted (selected) row — the common case (you
-        // select a task, then dock it). A naive green foreground on the REVERSED selection
-        // style would swap fg/bg and paint the cell background green, not the id glyphs;
-        // the id must stay green *glyphs*.
+        // select a task, then dock it). The id's green glyphs sit on the selection's grey.
         app.view.task_order = vec![tid];
         app.selected = 0;
 
@@ -3211,7 +3455,10 @@ mod tests {
             .expect("graph node row rendered");
         // The docked session shows through its brackets, not a trailing marker that
         // would crowd the description off a narrow pane.
-        assert!(!row_text(gy).contains('▶'), "no trailing marker on node row");
+        assert!(
+            !row_text(gy).contains('▶'),
+            "no trailing marker on node row"
+        );
         // The brackets *and* the id's non-unique remainder are green — two thin bracket
         // glyphs on their own are too easy to miss.
         let x0 = row_text(gy).find('[').expect("bracket on node row");
@@ -3223,16 +3470,20 @@ mod tests {
                 cell.modifier.contains(Modifier::BOLD),
                 "docked id char {needle:?} is bold"
             );
-            assert!(
-                !cell.modifier.contains(Modifier::REVERSED),
-                "docked id char {needle:?} is a green glyph, not a reversed green cell"
+            assert_eq!(
+                cell.bg, SELECTED_BG,
+                "docked id char {needle:?} keeps the selection"
             );
         }
         // The unique prefix stays cyan: green and blue inside one id would read as noise.
         for (dx, needle) in "ab".chars().enumerate() {
             let cell = &buf.content[gy * w + x0 + 1 + dx];
             assert_eq!(cell.symbol(), needle.to_string(), "unique prefix at +{dx}");
-            assert_eq!(cell.fg, Color::Magenta, "unique prefix char {needle:?} stays magenta");
+            assert_eq!(
+                cell.fg,
+                Color::Magenta,
+                "unique prefix char {needle:?} stays magenta"
+            );
         }
     }
 
@@ -3312,8 +3563,14 @@ mod tests {
             .expect("agent line rendered");
         // No trailing marker rides the graph rows — the indicator moved to HEAD's
         // brackets. (The header bar keeps its own `▶ #id` status chip.)
-        assert!(!row_text(head_row).contains('▶'), "no marker on the HEAD row");
-        assert!(!row_text(agent_row).contains('▶'), "no marker on the agent line");
+        assert!(
+            !row_text(head_row).contains('▶'),
+            "no marker on the HEAD row"
+        );
+        assert!(
+            !row_text(agent_row).contains('▶'),
+            "no marker on the agent line"
+        );
         // HEAD's revision id is greened (bold), since its parked agent is docked.
         // The agent line itself carries no id column to colour.
         for needle in ["[", "]"] {
@@ -3327,14 +3584,13 @@ mod tests {
                 "HEAD bracket {needle} is bold"
             );
         }
-        // The agent line is the selected/highlighted one (reverse video), not HEAD.
-        let reversed =
-            |y: usize| (0..w).any(|x| buf.content[y * w + x].modifier.contains(Modifier::REVERSED));
+        // The agent line is the selected/highlighted one, not HEAD.
+        let selected = |y: usize| (0..w).any(|x| buf.content[y * w + x].bg == SELECTED_BG);
         assert!(
-            reversed(agent_row),
+            selected(agent_row),
             "agent line is highlighted when selected"
         );
-        assert!(!reversed(head_row), "HEAD header row is not highlighted");
+        assert!(!selected(head_row), "HEAD header row is not highlighted");
     }
 
     #[test]
@@ -3465,15 +3721,12 @@ mod tests {
         // indicator that a truncated description can never push off screen.
         let store = Store::open_memory().unwrap();
         let mut app = test_app();
-        let t = store
-            .create_task("cleanup", 0, Autonomy::Inherit)
-            .unwrap();
+        let t = store.create_task("cleanup", 0, Autonomy::Inherit).unwrap();
         store.set_pane(t.id, Some(88)).unwrap();
         app.view.tasks = store.list_tasks().unwrap();
         app.view.open_pane = Some(88); // docked, but this task has no graph node
         app.view.detached = vec![t.id];
-        // ...and it is the highlighted (selected) row too, so the green prefix must be a
-        // glyph colour, not a REVERSED swap that would paint the cell background green.
+        // ...and it is the highlighted (selected) row too: green glyphs on its grey.
         app.view.task_order = vec![t.id];
         app.selected = 0;
 
@@ -3501,9 +3754,9 @@ mod tests {
             cell.modifier.contains(Modifier::BOLD),
             "docked detached #id is bold"
         );
-        assert!(
-            !cell.modifier.contains(Modifier::REVERSED),
-            "docked detached #id is a green glyph, not a reversed green cell"
+        assert_eq!(
+            cell.bg, SELECTED_BG,
+            "docked detached #id keeps the selection"
         );
     }
 
@@ -3659,17 +3912,19 @@ mod tests {
         let (mut app, rx) = test_app_with_engine_rx();
         task_with_pane(&mut app, "do the thing");
         press(&mut app, KeyCode::Tab);
-        for k in ["↵", "s", "S", "r", "R", "a", "x", "X"] {
+        for k in ["↵", "s", "S", "r", "R", "a"] {
             assert!(!app.hint_in_ctx(k), "{k} isn't in the log view");
         }
-        for k in ["n", "N", "d", "c", "e", "v", "z", "←→", "/", "⇥", "q", "?", "!"] {
+        for k in [
+            "n", "N", "f", "F", "d", "c", "e", "v", "z", "x", "X", "←→", "/", "⇥", "q", "?", "!",
+        ] {
             assert!(app.hint_in_ctx(k), "{k} applies in the log view");
         }
         let keys = app.keys_line(true).to_string();
         assert!(!keys.contains("swap") && !keys.contains("snap"), "{keys}");
         assert!(keys.contains("N spawn"), "{keys}");
-        press(&mut app, KeyCode::Char('x'));
-        assert!(sent(&rx).is_empty(), "x asked the engine for nothing");
+        press(&mut app, KeyCode::Char('s'));
+        assert!(sent(&rx).is_empty(), "s asked the engine for nothing");
         assert_eq!(latest(&app).0, notify::Level::Warn);
     }
 
@@ -3827,7 +4082,10 @@ mod tests {
         app.view.task_order = vec![t.id];
         app.view.merge_train.add(t.id);
         app.notices.ok("snapshotted #7");
-        assert!(!app.view.merge_train.is_empty(), "fixture has a queued member");
+        assert!(
+            !app.view.merge_train.is_empty(),
+            "fixture has a queued member"
+        );
         assert!(app.merge_train_height() > 0, "the panel is drawn");
         let text = buffer_text(&draw(&mut app, 62, 14));
         assert!(
@@ -3864,7 +4122,10 @@ mod tests {
             }]
         );
         let text = buffer_text(&draw(&mut app, 80, 10));
-        assert!(text.contains(&format!("⋯ removing #{}", t.id.0)), "got:\n{text}");
+        assert!(
+            text.contains(&format!("⋯ removing #{}", t.id.0)),
+            "got:\n{text}"
+        );
     }
 
     #[test]
@@ -3896,7 +4157,10 @@ mod tests {
         let mut app = test_app();
         app.msg_rx = msg_rx;
         msg_tx
-            .send(Msg::Notice(notify::Level::Error, "swap failed: boom".into()))
+            .send(Msg::Notice(
+                notify::Level::Error,
+                "swap failed: boom".into(),
+            ))
             .unwrap();
         app.drain_messages().unwrap();
         assert_eq!(
@@ -3976,7 +4240,11 @@ mod tests {
         assert_eq!(app.enter_hint(), "open");
 
         app.view.revivable.insert(t.id);
-        assert_eq!(app.enter_hint(), "start", "workspace intact, no conversation yet");
+        assert_eq!(
+            app.enter_hint(),
+            "start",
+            "workspace intact, no conversation yet"
+        );
         app.view.resumable.insert(t.id);
         assert_eq!(app.enter_hint(), "revive", "pane gone, conversation kept");
 
@@ -4023,7 +4291,13 @@ mod tests {
         let (mut app, rx) = test_app_with_engine_rx();
         let t = store.create_task("x", 0, Autonomy::Inherit).unwrap();
         store
-            .set_workspace(t.id, "faf-task-1", std::path::Path::new("/nope/ws"), "c1", "f1")
+            .set_workspace(
+                t.id,
+                "faf-task-1",
+                std::path::Path::new("/nope/ws"),
+                "c1",
+                "f1",
+            )
             .unwrap();
         store.update_status(t.id, TaskStatus::Working).unwrap();
         app.view.tasks = store.list_tasks().unwrap();
@@ -4039,7 +4313,12 @@ mod tests {
     fn viewport_shows_everything_that_fits() {
         assert_eq!(
             graph_viewport(5, 10, Some((4, 4))),
-            Viewport { skip: 0, body: 5, up: false, down: false }
+            Viewport {
+                skip: 0,
+                body: 5,
+                up: false,
+                down: false
+            }
         );
     }
 
@@ -4049,11 +4328,21 @@ mod tests {
         // (+2 context rows) still fits above it.
         assert_eq!(
             graph_viewport(30, 10, Some((6, 6))),
-            Viewport { skip: 0, body: 9, up: false, down: true }
+            Viewport {
+                skip: 0,
+                body: 9,
+                up: false,
+                down: true
+            }
         );
         assert_eq!(
             graph_viewport(30, 10, None),
-            Viewport { skip: 0, body: 9, up: false, down: true }
+            Viewport {
+                skip: 0,
+                body: 9,
+                up: false,
+                down: true
+            }
         );
     }
 
@@ -4062,7 +4351,15 @@ mod tests {
         // Line 15 selected: show through line 17 (two context rows) with markers top and
         // bottom, so the body is 8 rows ending at 17.
         let vp = graph_viewport(30, 10, Some((15, 15)));
-        assert_eq!(vp, Viewport { skip: 10, body: 8, up: true, down: true });
+        assert_eq!(
+            vp,
+            Viewport {
+                skip: 10,
+                body: 8,
+                up: true,
+                down: true
+            }
+        );
         assert!((vp.skip..vp.skip + vp.body).contains(&15));
     }
 
@@ -4070,7 +4367,12 @@ mod tests {
     fn viewport_at_the_bottom_drops_the_down_marker() {
         assert_eq!(
             graph_viewport(30, 10, Some((29, 29))),
-            Viewport { skip: 21, body: 9, up: true, down: false }
+            Viewport {
+                skip: 21,
+                body: 9,
+                up: true,
+                down: false
+            }
         );
     }
 
@@ -4108,8 +4410,14 @@ mod tests {
         app.view.rows = rows;
 
         let text = buffer_text(&draw(&mut app, 70, 16));
-        assert!(text.contains("the deep agent"), "selection visible:\n{text}");
-        assert!(text.contains("↑ ") && text.contains(" more"), "up marker:\n{text}");
+        assert!(
+            text.contains("the deep agent"),
+            "selection visible:\n{text}"
+        );
+        assert!(
+            text.contains("↑ ") && text.contains(" more"),
+            "up marker:\n{text}"
+        );
         assert!(!text.contains("history 0 "), "top scrolled off:\n{text}");
         assert!(!text.contains("↓ "), "nothing hidden below:\n{text}");
     }
@@ -4128,7 +4436,10 @@ mod tests {
         app.view.task_of_node = vec![None; 40];
         let text = buffer_text(&draw(&mut app, 70, 16));
         assert!(text.contains("history 0"), "pinned to the top:\n{text}");
-        assert!(text.contains("↓ ") && text.contains(" more"), "down marker:\n{text}");
+        assert!(
+            text.contains("↓ ") && text.contains(" more"),
+            "down marker:\n{text}"
+        );
     }
 
     /// A merged PR (`m` = main `p` + side `s1`) above `p`, with `@` (`wc`) on top; the
@@ -4166,15 +4477,72 @@ mod tests {
     }
 
     #[test]
+    fn a_match_the_row_does_not_show_gets_a_snippet_even_at_80_columns() {
+        let (mut app, _rx) = test_app_with_engine_rx();
+        app.body = Body::Log;
+        let mut revs = merged_history();
+        revs[3].full_description = "base\n\nwhere the lighthouse keeper starts".into();
+        apply_revs(&mut app, revs, &default_ws("wc"));
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "lighthouse");
+        let text = buffer_text(&draw(&mut app, 80, 12));
+        let row = line_with(&text, "[p");
+        assert!(row.contains("desc: "), "{row}");
+        assert!(row.contains("lighthouse"), "{row}");
+        // Down to a docked pane's width: never a panic, never past the edge.
+        for w in 20..=80 {
+            let text = buffer_text(&draw(&mut app, w, 12));
+            assert!(
+                text.lines().all(|l| l.chars().count() <= w as usize),
+                "{w}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_on_an_agents_title_is_not_shown_twice() {
+        let (mut app, _rx) = test_app_with_engine_rx();
+        task_with_pane(&mut app, "do the thing");
+        let revs = vec![
+            log_rev("mp", &["base"], true, false, "my work"),
+            log_rev("ag", &["base"], false, false, "agent work"),
+            log_rev("base", &[], false, false, "base commit"),
+        ];
+        let ws = vec![
+            jj::Workspace {
+                name: "default".into(),
+                change_id: "mp".into(),
+            },
+            jj::Workspace {
+                name: "faf-task-1".into(),
+                change_id: "ag".into(),
+            },
+        ];
+        apply_revs(&mut app, revs, &ws);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "agent");
+        assert_eq!(app.log.hits(), ["ag"]);
+        let text = buffer_text(&draw(&mut app, 100, 12));
+        assert!(!text.contains("row: "), "{text}");
+    }
+
+    #[test]
     fn log_rows_show_bookmarks_author_and_age_in_columns() {
         let (mut app, _rx) = log_app(Mode::Faff);
         let text = buffer_text(&draw(&mut app, 100, 12));
-        let row = text.lines().find(|l| l.contains("Merge #4")).expect("merge row");
+        let row = text
+            .lines()
+            .find(|l| l.contains("Merge #4"))
+            .expect("merge row");
         assert!(row.contains("(+1)"), "the PR folds to its merge: {row}");
         assert!(row.contains("main @origin"), "{row}");
         assert!(row.contains("Jezza"), "{row}");
         assert!(row.trim_end_matches(['│', ' ']).ends_with("2h"), "{row}");
-        assert!(!text.contains("add a nix flake"), "the side commit is folded away");
+        assert!(
+            !text.contains("add a nix flake"),
+            "the side commit is folded away"
+        );
         // Opened, the side commit's author lines up under the merge's.
         app.log.selected = Some("m".into());
         press(&mut app, KeyCode::Right);
@@ -4190,7 +4558,10 @@ mod tests {
     fn narrow_panes_drop_age_then_author_before_the_description() {
         let (mut app, _rx) = log_app(Mode::Faff);
         let text = buffer_text(&draw(&mut app, 52, 12));
-        let row = text.lines().find(|l| l.contains("Merge")).expect("merge row");
+        let row = text
+            .lines()
+            .find(|l| l.contains("Merge"))
+            .expect("merge row");
         assert!(!row.contains("2h") && !row.contains("Jezza"), "{row}");
         assert!(row.contains("main"), "bookmarks hold on longest: {row}");
     }
@@ -4234,7 +4605,10 @@ mod tests {
         assert_eq!(app.log.search().unwrap().query, "nix-flake");
         assert_eq!(app.log.selected.as_deref(), Some("s1"), "lands on the hit");
         let text = buffer_text(&draw(&mut app, 100, 14));
-        assert!(text.contains("add a nix flake"), "the hit opens its pair:\n{text}");
+        assert!(
+            text.contains("add a nix flake"),
+            "the hit opens its pair:\n{text}"
+        );
         assert!(text.contains("1 hit · 1/1 · ±1"), "{text}");
         assert!(text.contains("~ 1 hidden ~"), "{text}");
         // Enter locks it; `+`/`-` steer the context, the view's keys act on the hit.
@@ -4306,10 +4680,75 @@ mod tests {
     }
 
     #[test]
+    fn f_and_shift_f_make_a_workspace_on_the_selection_in_both_log_views() {
+        for mode in [Mode::Logs, Mode::Faff] {
+            let (mut app, rx) = log_app(mode);
+            app.log.selected = Some("wc".into());
+            press(&mut app, KeyCode::Char('f'));
+            press(&mut app, KeyCode::Char('F'));
+            assert_eq!(
+                sent(&rx),
+                vec![
+                    Cmd::AddWorkspace {
+                        rev: "wc".into(),
+                        take: false
+                    },
+                    Cmd::AddWorkspace {
+                        rev: "wc".into(),
+                        take: true
+                    },
+                ]
+            );
+        }
+        let (mut app, rx) = log_app(Mode::Faff);
+        app.body = Body::Agents;
+        press(&mut app, KeyCode::Char('f'));
+        assert!(
+            sent(&rx).is_empty(),
+            "the agents view has no revision to fork"
+        );
+    }
+
+    #[test]
+    fn x_and_shift_x_remove_the_workspace_on_the_selection_in_both_log_views() {
+        for mode in [Mode::Logs, Mode::Faff] {
+            let (mut app, rx) = log_app(mode);
+            app.log.selected = Some("wc".into());
+            press(&mut app, KeyCode::Char('x'));
+            press(&mut app, KeyCode::Char('X'));
+            assert_eq!(
+                sent(&rx),
+                vec![
+                    Cmd::RemoveWorkspace {
+                        rev: "wc".into(),
+                        discard: false
+                    },
+                    Cmd::RemoveWorkspace {
+                        rev: "wc".into(),
+                        discard: true
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn faff_logs_shows_only_its_own_keys() {
         let (app, _rx) = log_app(Mode::Logs);
         let keys = app.keys_line(true).to_string();
-        for k in ["d desc", "c copy", "e edit", "v diff", "z squash", "/ find", "←→ fold"] {
+        for k in [
+            "f fork",
+            "F move",
+            "d desc",
+            "c copy",
+            "e edit",
+            "v diff",
+            "z squash",
+            "x rm",
+            "X drop",
+            "/ find",
+            "←→ fold",
+        ] {
             assert!(keys.contains(k), "{k} in {keys}");
         }
         for k in ["new", "spawn", "view", "abort"] {
@@ -4343,7 +4782,11 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         app.pull_due = Some(Instant::now());
         app.pull_in();
-        assert_eq!(sent(&rx), vec![Cmd::PullIn(Vec::new())], "dropped with the search");
+        assert_eq!(
+            sent(&rx),
+            vec![Cmd::PullIn(Vec::new())],
+            "dropped with the search"
+        );
     }
 
     #[test]

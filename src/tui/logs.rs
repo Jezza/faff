@@ -192,6 +192,35 @@ impl LogsEngine {
                     self.view.select_rev = Some(id);
                 }
             }
+            Cmd::AddWorkspace { rev, take } => {
+                let tasks = self.tasks();
+                if let Some(id) = revops::add_workspace(
+                    &self.root,
+                    &self.aliases,
+                    &rev,
+                    take,
+                    &tasks,
+                    &self.notices,
+                ) {
+                    self.refresh();
+                    self.view.select_rev = Some(id);
+                }
+            }
+            // An agent's task and pane are faff's: faff drops the task once it sees the
+            // workspace gone.
+            Cmd::RemoveWorkspace { rev, discard } => {
+                let tasks = self.tasks();
+                if revops::remove_workspace(
+                    &self.root,
+                    &self.aliases,
+                    &rev,
+                    discard,
+                    &tasks,
+                    &self.notices,
+                ) {
+                    self.refresh();
+                }
+            }
             Cmd::Describe(id) => self.describe_task(id),
             Cmd::DescribeRev(rev) => self.describe_rev(rev),
             Cmd::Described { rev, result } => self.described(rev, result),
@@ -491,6 +520,58 @@ mod tests {
             diff.trim().is_empty(),
             "same files as the branch tip: {diff}"
         );
+    }
+
+    #[test]
+    fn x_removes_a_workspace_keeping_its_work_and_shift_x_discards_it() {
+        let (tmp, root) = repo();
+        let mut heads = Vec::new();
+        for name in ["kept", "dropped"] {
+            let dir = tmp.path().join(name);
+            let dir_s = dir.to_string_lossy();
+            jj(
+                &root,
+                &["workspace", "add", "--name", name, "-r", "feature", &dir_s],
+            );
+            std::fs::write(dir.join(name), "work\n").unwrap();
+            jj(&dir, &["util", "snapshot"]);
+            heads.push((dir, id(&root, &format!("{name}@"))));
+        }
+        let (mut e, _rx) = engine(root.clone(), "all()");
+        e.handle(Cmd::RemoveWorkspace {
+            rev: heads[0].1.clone(),
+            discard: false,
+        });
+        e.handle(Cmd::RemoveWorkspace {
+            rev: heads[1].1.clone(),
+            discard: true,
+        });
+        let list = jj(&root, &["workspace", "list"]);
+        assert!(
+            !list.contains("kept") && !list.contains("dropped"),
+            "{list}"
+        );
+        assert!(!heads[0].0.exists() && !heads[1].0.exists());
+        let live = |rev: &str| !id(&root, &format!("present({rev})")).trim().is_empty();
+        assert!(live(&heads[0].1), "x keeps a revision with changes");
+        assert!(!live(&heads[1].1), "X discards it");
+    }
+
+    #[test]
+    fn x_refuses_the_workspace_it_runs_in() {
+        let (_tmp, root) = repo();
+        let at = id(&root, "@");
+        let (mut e, rx) = engine(root.clone(), "all()");
+        e.handle(Cmd::RemoveWorkspace {
+            rev: at,
+            discard: true,
+        });
+        assert!(root.join(".jj").exists());
+        assert!(jj(&root, &["workspace", "list"]).contains("default"));
+        assert!(rx.try_iter().any(|m| matches!(
+            m,
+            Msg::Notice(_, t) if t.contains("the workspace this runs in")
+        )));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! them. See spec §3 and the fork recipe in §5.
 
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Field separator emitted by our templates (ASCII Unit Separator, 0x1f).
@@ -306,6 +306,19 @@ pub fn new(repo: &Path) -> Result<()> {
 pub fn new_at(repo: &Path, rev: &str) -> Result<()> {
     run_jj(repo, &["new", rev])?;
     Ok(())
+}
+
+/// `jj new <rev>` run inside a workspace directory (no `-R`): that workspace's `@` becomes
+/// a fresh empty child of `rev`. Advances or retreats any workspace, not just the default.
+pub fn new_in(ws_dir: &Path, rev: &str) -> Result<()> {
+    run_jj_in(ws_dir, &["new", rev])?;
+    Ok(())
+}
+
+/// `jj workspace root --name <name>`: where that workspace's working copy lives.
+pub fn workspace_root(repo: &Path, name: &str) -> Result<PathBuf> {
+    let out = run_jj(repo, &["workspace", "root", "--name", name])?;
+    Ok(PathBuf::from(out.trim_end_matches('\n')))
 }
 
 /// `jj workspace add --name <name> -r <revset> <path>`.

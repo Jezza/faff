@@ -112,11 +112,15 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     let lands_on_trunk = |on_trunk: &std::collections::HashSet<String>, start: &RevInfo| {
         let mut cur = start;
         for _ in 0..revs.len() {
-            let Some(p) = cur.parents.first() else { return false };
+            let Some(p) = cur.parents.first() else {
+                return false;
+            };
             if on_trunk.contains(p) {
                 return true;
             }
-            let Some(&r) = by_id.get(p.as_str()) else { return false };
+            let Some(&r) = by_id.get(p.as_str()) else {
+                return false;
+            };
             cur = r;
         }
         false // cycle guard — never on a DAG
@@ -124,7 +128,9 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     let mut cur = Some(head_id.clone());
     loop {
         while let Some(id) = cur.take() {
-            let Some(r) = by_id.get(id.as_str()) else { break };
+            let Some(r) = by_id.get(id.as_str()) else {
+                break;
+            };
             if !on_trunk.insert(id) {
                 break; // cycle guard — never on a DAG
             }
@@ -177,7 +183,10 @@ pub fn order_by_fork_point(revs: &mut [RevInfo], workspaces: &[Workspace], tasks
     }
     for v in kids.values_mut() {
         v.sort_by(|&a, &b| {
-            let (ka, kb) = (task_id_of(&revs[a].change_id), task_id_of(&revs[b].change_id));
+            let (ka, kb) = (
+                task_id_of(&revs[a].change_id),
+                task_id_of(&revs[b].change_id),
+            );
             let (ma, mb) = (
                 merged_at.get(revs[a].change_id.as_str()),
                 merged_at.get(revs[b].change_id.as_str()),
@@ -485,7 +494,13 @@ fn build_view(
             let (icon, _) = status_label(t.status);
             (
                 g,
-                vec![format!("#{:<w$} {} :: {}", t.id.0, icon, label, w = id_width)],
+                vec![format!(
+                    "#{:<w$} {} :: {}",
+                    t.id.0,
+                    icon,
+                    label,
+                    w = id_width
+                )],
                 false,
                 Some(t.id),
             )
@@ -622,7 +637,9 @@ mod tests {
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
         assert_eq!(
             order,
-            vec!["head", "t1", "sb1", "sb2", "sb3", "t2", "t3", "a21", "a15", "fb", "root"],
+            vec![
+                "head", "t1", "sb1", "sb2", "sb3", "t2", "t3", "a21", "a15", "fb", "root"
+            ],
             "both agents drop to just above their shared fork base fb (newest id first)"
         );
         let m = build(&revs, &workspaces, &tasks);
@@ -630,7 +647,19 @@ mod tests {
         let gutters: Vec<&str> = rows.iter().map(|r| r.gutter.as_str()).collect();
         assert_eq!(
             gutters,
-            vec!["@", "◆", "│ ◻", "│ ◻", "│ ◻", "◻", "◻", "├─○", "├─○", "◻", "◻"],
+            vec![
+                "@",
+                "◆",
+                "│ ◻",
+                "│ ◻",
+                "│ ◻",
+                "◻",
+                "◻",
+                "├─○",
+                "├─○",
+                "◻",
+                "◻"
+            ],
             "each agent folds to one ├─○ above fb; the side branch keeps its own lane"
         );
     }
@@ -726,7 +755,9 @@ mod tests {
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
         assert_eq!(
             order,
-            vec!["head", "top", "a21", "c1", "c2", "c3", "a15", "a9", "c4", "a7", "c5"],
+            vec![
+                "head", "top", "a21", "c1", "c2", "c3", "a15", "a9", "c4", "a7", "c5"
+            ],
             "every agent is lifted to sit directly above its fork point, on both sides of \
              the window cut; agents sharing c4 stack newest-id first"
         );
@@ -738,12 +769,23 @@ mod tests {
             .collect();
         assert_eq!(
             gutters,
-            vec!["@", "◆", "╭─●", "◻", "◻", "◻", "├─●", "├─○", "◻", "├─●", "◻"],
+            vec![
+                "@",
+                "◆",
+                "╭─●",
+                "◻",
+                "◻",
+                "◻",
+                "├─●",
+                "├─○",
+                "◻",
+                "├─●",
+                "◻"
+            ],
             "#21 opens the second line's lane rather than taking it (`╭─●`, nothing above \
              belongs to that lane); #15 and #9 fold side by side above their shared base"
         );
     }
-
 
     #[test]
     fn a_side_branch_carrying_an_agent_is_lifted_whole_not_split_by_a_trunk_revision() {
@@ -765,29 +807,98 @@ mod tests {
         // Lifting the branch whole puts `sqntutps` and #175 back together below `wkovrsru`,
         // so #176 folds to a plain `├─○` and nothing crosses an unrelated lane.
         let mut revs = vec![
-            rev("onnosvup", &["rkrrupqn"], false, false, "benchmarks: warehouse benchmark"),
+            rev(
+                "onnosvup",
+                &["rkrrupqn"],
+                false,
+                false,
+                "benchmarks: warehouse benchmark",
+            ),
             rev("ymtvxlyn", &["wkovrsru"], false, true, ""), // #176, floats (recency order)
             rev("pnoounou", &["wkovrsru"], true, true, ""),  // @
-            rev("rkrrupqn", &["oztsompu"], false, false, "test-framework: rack orchestration"),
-            rev("oztsompu", &["poqnvpzq"], false, false, "telemetry: file export"),
-            rev("poqnvpzq", &["wotounsx"], false, false, "cell-mailbox: explicit settlement"),
-            rev("wotounsx", &["urzuyvvl"], false, false, "sorg-execution: cache send targets"),
-            rev("urzuyvvl", &["owpmrpwq"], false, false, "db-client: deterministic locate"),
-            rev("owpmrpwq", &["wkovrsru"], false, false, "db: write-batched tx_apply"),
+            rev(
+                "rkrrupqn",
+                &["oztsompu"],
+                false,
+                false,
+                "test-framework: rack orchestration",
+            ),
+            rev(
+                "oztsompu",
+                &["poqnvpzq"],
+                false,
+                false,
+                "telemetry: file export",
+            ),
+            rev(
+                "poqnvpzq",
+                &["wotounsx"],
+                false,
+                false,
+                "cell-mailbox: explicit settlement",
+            ),
+            rev(
+                "wotounsx",
+                &["urzuyvvl"],
+                false,
+                false,
+                "sorg-execution: cache send targets",
+            ),
+            rev(
+                "urzuyvvl",
+                &["owpmrpwq"],
+                false,
+                false,
+                "db-client: deterministic locate",
+            ),
+            rev(
+                "owpmrpwq",
+                &["wkovrsru"],
+                false,
+                false,
+                "db: write-batched tx_apply",
+            ),
             rev("uwpmoxsy", &["sqntutps"], false, true, ""), // #175, floats above wkovrsru
-            rev("wkovrsru", &["xxzzqsrp"], false, false, "Black Duck Security: Committed workflow"),
-            rev("sqntutps", &["xxzzqsrp"], false, false, "Label CLI and gateway nodes in listings"),
-            rev("xxzzqsrp", &["xunlwwqm"], false, false, "Provide the esp-common facade"),
-            rev("xunlwwqm", &[], false, false, "Describe the four undocumented steps"),
+            rev(
+                "wkovrsru",
+                &["xxzzqsrp"],
+                false,
+                false,
+                "Black Duck Security: Committed workflow",
+            ),
+            rev(
+                "sqntutps",
+                &["xxzzqsrp"],
+                false,
+                false,
+                "Label CLI and gateway nodes in listings",
+            ),
+            rev(
+                "xxzzqsrp",
+                &["xunlwwqm"],
+                false,
+                false,
+                "Provide the esp-common facade",
+            ),
+            rev(
+                "xunlwwqm",
+                &[],
+                false,
+                false,
+                "Describe the four undocumented steps",
+            ),
         ];
-        let workspaces: Vec<Workspace> =
-            [("174", "onnosvup"), ("175", "uwpmoxsy"), ("176", "ymtvxlyn")]
-                .iter()
-                .map(|(id, cid)| Workspace {
-                    name: format!("faf-task-{id}"),
-                    change_id: (*cid).into(),
-                })
-                .collect();
+        let workspaces: Vec<Workspace> = [
+            ("174", "onnosvup"),
+            ("175", "uwpmoxsy"),
+            ("176", "ymtvxlyn"),
+        ]
+        .iter()
+        .map(|(id, cid)| Workspace {
+            name: format!("faf-task-{id}"),
+            change_id: (*cid).into(),
+        })
+        .collect();
         let tasks = vec![
             task(174, "faf-task-174", TaskStatus::Working),
             task(175, "faf-task-175", TaskStatus::Working),
@@ -799,9 +910,8 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "pnoounou", "ymtvxlyn", "onnosvup", "rkrrupqn", "oztsompu", "poqnvpzq",
-                "wotounsx", "urzuyvvl", "owpmrpwq", "wkovrsru", "uwpmoxsy", "sqntutps",
-                "xxzzqsrp", "xunlwwqm",
+                "pnoounou", "ymtvxlyn", "onnosvup", "rkrrupqn", "oztsompu", "poqnvpzq", "wotounsx",
+                "urzuyvvl", "owpmrpwq", "wkovrsru", "uwpmoxsy", "sqntutps", "xxzzqsrp", "xunlwwqm",
             ],
             "the sqntutps branch (base + agent #175) moves as one, to just above the trunk \
              revision xxzzqsrp it forks from — below wkovrsru, not straddling it; the \
@@ -816,8 +926,20 @@ mod tests {
         assert_eq!(
             gutters,
             vec![
-                "@", "├─○", "│ ╭─●", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "│ ◻", "├─◻", "◆", "│ ╭─○",
-                "├─◻", "◻", "◻",
+                "@",
+                "├─○",
+                "│ ╭─●",
+                "│ ◻",
+                "│ ◻",
+                "│ ◻",
+                "│ ◻",
+                "│ ◻",
+                "├─◻",
+                "◆",
+                "│ ╭─○",
+                "├─◻",
+                "◻",
+                "◻",
             ],
             "#176 folds onto the trunk as ├─○ and the ◆ fork point is a clean single lane; \
              #175 sits directly above its own base, which folds back at xxzzqsrp"
@@ -850,10 +972,22 @@ mod tests {
             rev("zlv", &["uqu"], false, false, "Identify runtimes"), // #263, floats
             rev("uqu", &["xst"], false, false, "Replica messages block"),
             rev("ynrw", &["owq"], true, true, ""), // @
-            rev("owq", &["qvz", "wlm"], false, true, "fix: timer ticks (#74)"),
+            rev(
+                "owq",
+                &["qvz", "wlm"],
+                false,
+                true,
+                "fix: timer ticks (#74)",
+            ),
             rev("wlm", &["lpp"], false, false, "fix(myrmic-cli)"),
             rev("lpp", &["qvz"], false, false, "fix(esp-hal)"),
-            rev("qvz", &["qrw", "ktl"], false, true, "Ignore advisories (#73)"),
+            rev(
+                "qvz",
+                &["qrw", "ktl"],
+                false,
+                true,
+                "Ignore advisories (#73)",
+            ),
             rev("ktl", &["qrw"], false, false, "Ignore advisories"),
             rev("xst", &["vyk"], false, false, "CLI connects as a client"),
             rev("vyk", &["qrw"], false, false, "Add zone option"),
@@ -881,8 +1015,19 @@ mod tests {
         assert_eq!(
             gutters,
             vec![
-                "@", "├─●", "├─●", "◆─╮", "│ ◻", "├─◻", "◻─╮", "├─◻", "│ ╭─●", "│ ◻", "│ ◻",
-                "├─◻", "◻",
+                "@",
+                "├─●",
+                "├─●",
+                "◆─╮",
+                "│ ◻",
+                "├─◻",
+                "◻─╮",
+                "├─◻",
+                "│ ╭─●",
+                "│ ◻",
+                "│ ◻",
+                "├─◻",
+                "◻",
             ],
             "the uqu branch, #263 included, is lifted whole onto qrw; nothing crosses a lane"
         );
@@ -912,7 +1057,6 @@ mod tests {
         assert_eq!(gutters, vec!["@", "◻─╮", "├─◻", "├─◻", "◻"]);
     }
 
-
     #[test]
     fn prs_merged_in_a_run_close_in_reverse_so_their_lanes_nest() {
         // Three PRs off `base`, merged one after another (`m3` on top). Each merge opens a
@@ -931,7 +1075,10 @@ mod tests {
         ];
         order_by_fork_point(&mut revs, &[], &[]);
         let order: Vec<&str> = revs.iter().map(|r| r.change_id.as_str()).collect();
-        assert_eq!(order, vec!["head", "m3", "m2", "m1", "c1", "b2", "a3", "base"]);
+        assert_eq!(
+            order,
+            vec!["head", "m3", "m2", "m1", "c1", "b2", "a3", "base"]
+        );
         let m = build(&revs, &[], &[]);
         let gutters: Vec<String> = crate::graph::render(&m.nodes)
             .iter()
@@ -939,7 +1086,16 @@ mod tests {
             .collect();
         assert_eq!(
             gutters,
-            vec!["@", "◻─────╮", "◻───╮ │", "◻─╮ │ │", "├─◻ │ │", "├───◻ │", "├─────◻", "◻"],
+            vec![
+                "@",
+                "◻─────╮",
+                "◻───╮ │",
+                "◻─╮ │ │",
+                "├─◻ │ │",
+                "├───◻ │",
+                "├─────◻",
+                "◻"
+            ],
         );
     }
 
@@ -1230,12 +1386,24 @@ mod tests {
         // (empty agents → hollow circle) sitting directly above its fork base, the trunk a
         // clean vertical column.
         let mut revs = vec![
-            rev("ymuz", &["pk"], true, true, ""), // @
+            rev("ymuz", &["pk"], true, true, ""),  // @
             rev("qoyp", &["pk"], false, true, ""), // #15
             rev("xwvs", &["ur"], false, true, ""), // #7
             rev("tztq", &["tp"], false, true, ""), // #9
-            rev("pk", &["ur"], false, false, "spawn: declare! child-class refs"),
-            rev("ur", &["tp"], false, false, "Generate bridge clients from JSON Schema"),
+            rev(
+                "pk",
+                &["ur"],
+                false,
+                false,
+                "spawn: declare! child-class refs",
+            ),
+            rev(
+                "ur",
+                &["tp"],
+                false,
+                false,
+                "Generate bridge clients from JSON Schema",
+            ),
             rev("tp", &["ts"], false, false, "add chatty to examples"),
             rev("ts", &[], false, false, "fix wasm lints"),
         ];
@@ -1655,7 +1823,4 @@ mod tests {
         // tinting its last letter would be worse than leaving the row alone.
         assert_eq!(split_status_icon("#7  working :: do a thing"), None);
     }
-
-
 }
-

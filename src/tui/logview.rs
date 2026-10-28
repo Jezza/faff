@@ -26,6 +26,64 @@ pub const DEFAULT_CONTEXT: usize = 1;
 /// query (nucleo's syntax) asks for it verbatim.
 const HIT_PERCENT: u32 = 60;
 
+/// Which part of a revision a search matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// The row's own text: the description's first line, or an agent's `#7 … :: title`.
+    Row,
+    /// A bookmark (local or remote) or a workspace name.
+    Mark,
+    Author,
+    ChangeId,
+    CommitId,
+    Email,
+    /// The whole description, body included.
+    Description,
+}
+
+impl Field {
+    /// What a snippet of this field is labelled with when the row doesn't show it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::Row => "row",
+            Field::Mark => "bookmark",
+            Field::Author => "author",
+            Field::ChangeId => "change",
+            Field::CommitId => "commit",
+            Field::Email => "email",
+            Field::Description => "desc",
+        }
+    }
+}
+
+/// Where a hit matched: per field, its text and the matched character positions in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub parts: Vec<HitPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitPart {
+    pub field: Field,
+    pub text: String,
+    /// Sorted, deduplicated character positions in `text`.
+    pub indices: Vec<usize>,
+}
+
+impl Hit {
+    /// The matched positions in `text` when the hit matched `field` with exactly that text.
+    pub fn indices_in(&self, field: Field, text: &str) -> Option<&[usize]> {
+        self.parts
+            .iter()
+            .find(|p| p.field == field && p.text == text)
+            .map(|p| p.indices.as_slice())
+    }
+}
+
+/// A folded merge's node glyph, so a fold reads at the node rather than only at the `(+N)`
+/// after its description. Your `@` and a conflict keep theirs.
+pub const FOLDED_GLYPH: char = '⊕';
+
 /// A fork/merge pair: the merge's index and its side commits' (newest first).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pair {
@@ -54,8 +112,8 @@ pub struct Gap {
 pub struct LogView {
     nodes: Vec<GraphNode>,
     node_task: Vec<Option<TaskId>>,
-    /// What each node is searched by, parallel to `nodes`.
-    haystacks: Vec<String>,
+    /// What each node is searched by, field by field, parallel to `nodes`.
+    haystacks: Vec<Vec<(Field, String)>>,
     pairs: Vec<Pair>,
     /// Merges opened with `→`.
     expanded: HashSet<String>,
@@ -71,6 +129,8 @@ pub struct LogView {
     hits: Vec<String>,
     /// The best-scoring hit, where a new query lands the selection.
     best: Option<String>,
+    /// What each hit matched, by change id.
+    matched: HashMap<String, Hit>,
     /// Folded merges and how many side commits each hides.
     folded: HashMap<String, usize>,
 }
@@ -359,22 +419,9 @@ impl LogView {
         ))
     }
 
-    /// Character positions in `text` the current query matches, for highlighting.
-    pub fn highlight(&self, text: &str) -> Vec<usize> {
-        let Some(p) = self.pattern() else {
-            return Vec::new();
-        };
-        let mut buf = Vec::new();
-        let mut idx = Vec::new();
-        p.indices(
-            Utf32Str::new(text, &mut buf),
-            &mut self.matcher.borrow_mut(),
-            &mut idx,
-        );
-        let mut out: Vec<usize> = idx.into_iter().map(|i| i as usize).collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+    /// What the search matched in revision `change_id`, when it's a hit.
+    pub fn hit(&self, change_id: &str) -> Option<&Hit> {
+        self.matched.get(change_id)
     }
 
     /// Score `items` against the current query, best first, keeping only those that match
@@ -404,11 +451,14 @@ impl LogView {
     fn layout(&mut self) {
         // Hits come first: a hit inside a pair holds that pair open.
         let mut scores: Vec<Option<u32>> = vec![None; self.nodes.len()];
+        let mut found: Vec<Option<Hit>> = vec![None; self.nodes.len()];
         if let Some(p) = self.pattern() {
             let mut matcher = self.matcher.borrow_mut();
-            let mut buf = Vec::new();
-            for (i, h) in self.haystacks.iter().enumerate() {
-                scores[i] = p.score(Utf32Str::new(h, &mut buf), &mut matcher);
+            for (i, fields) in self.haystacks.iter().enumerate() {
+                if let Some((score, hit)) = match_fields(&p, fields, &mut matcher) {
+                    scores[i] = Some(score);
+                    found[i] = Some(hit);
+                }
             }
             let best = scores.iter().flatten().copied().max().unwrap_or(0);
             for s in &mut scores {
@@ -417,6 +467,14 @@ impl LogView {
                 }
             }
         }
+        self.matched = self
+            .nodes
+            .iter()
+            .zip(found)
+            .zip(&scores)
+            .filter(|(_, s)| s.is_some())
+            .filter_map(|((n, h), _)| Some((n.change_id.clone(), h?)))
+            .collect();
         let is_hit = |i: usize| scores[i].is_some();
         let filtering = self.filtering();
 
@@ -463,6 +521,9 @@ impl LogView {
             let mut n = self.nodes[i].clone();
             if let Some(&k) = trim.get(&i) {
                 n.parents.truncate(k);
+                if !matches!(n.glyph, '@' | '×') {
+                    n.glyph = FOLDED_GLYPH;
+                }
             }
             n.collapse = !shown[i];
             nodes.push(n);
@@ -516,26 +577,143 @@ impl LogView {
     }
 }
 
-/// Everything a revision is searched by: its ids, description, author, bookmarks, the
-/// workspaces sitting on it, and its row text (an agent's `#7 … :: title`).
-fn haystack(node: &GraphNode, rev: Option<&RevInfo>, workspaces: &[Workspace]) -> String {
-    let mut parts: Vec<&str> = vec![&node.change_id];
+/// Everything a revision is searched by, field by field: its row text, bookmarks and the
+/// workspaces sitting on it, author, ids, email and whole description. The fields the row
+/// shows come first, so a tie goes to one the user can see.
+fn haystack(
+    node: &GraphNode,
+    rev: Option<&RevInfo>,
+    workspaces: &[Workspace],
+) -> Vec<(Field, String)> {
+    let mut fields: Vec<(Field, String)> =
+        node.lines.iter().map(|l| (Field::Row, l.clone())).collect();
     if let Some(r) = rev {
-        parts.push(&r.commit_id);
-        parts.extend(r.bookmarks.iter().map(String::as_str));
-        parts.extend(r.remote_bookmarks.iter().map(String::as_str));
-        parts.push(&r.author);
-        parts.push(&r.email);
-        parts.push(&r.full_description);
+        fields.extend(r.bookmarks.iter().map(|b| (Field::Mark, b.clone())));
+        fields.extend(r.remote_bookmarks.iter().map(|b| (Field::Mark, b.clone())));
     }
-    parts.extend(
+    fields.extend(
         workspaces
             .iter()
             .filter(|w| w.change_id == node.change_id)
-            .map(|w| w.name.as_str()),
+            .map(|w| (Field::Mark, w.name.clone())),
     );
-    parts.extend(node.lines.iter().map(String::as_str));
-    parts.join(" ")
+    if let Some(r) = rev {
+        fields.push((Field::Author, author(r)));
+    }
+    fields.push((Field::ChangeId, node.change_id.clone()));
+    if let Some(r) = rev {
+        fields.push((Field::CommitId, r.commit_id.clone()));
+        fields.push((Field::Email, r.email.clone()));
+        fields.push((Field::Description, r.full_description.clone()));
+    }
+    fields.retain(|(_, t)| !t.is_empty());
+    fields
+}
+
+/// Match `pattern` against a revision's fields. Each word of the query matches within one
+/// field — the best-scoring one, the first among equals — so a fuzzy match never strings
+/// letters together across fields. Every word must match somewhere, and a negated word
+/// (`!foo`) nowhere. The score is the words' total.
+fn match_fields(
+    pattern: &Pattern,
+    fields: &[(Field, String)],
+    matcher: &mut Matcher,
+) -> Option<(u32, Hit)> {
+    let mut buf = Vec::new();
+    let mut idx = Vec::new();
+    let mut total = 0u32;
+    let mut parts: Vec<HitPart> = Vec::new();
+    for atom in &pattern.atoms {
+        if atom.negative {
+            let clear = fields
+                .iter()
+                .all(|(_, t)| atom.score(Utf32Str::new(t, &mut buf), matcher).is_some());
+            if !clear {
+                return None;
+            }
+            continue;
+        }
+        let mut best: Option<(u16, usize, Vec<u32>)> = None;
+        for (f, (_, text)) in fields.iter().enumerate() {
+            idx.clear();
+            if let Some(score) = atom.indices(Utf32Str::new(text, &mut buf), matcher, &mut idx)
+                && best.as_ref().is_none_or(|b| score > b.0)
+            {
+                best = Some((score, f, idx.clone()));
+            }
+        }
+        let (score, f, found) = best?;
+        total += u32::from(score);
+        let (field, text) = &fields[f];
+        let part = match parts
+            .iter_mut()
+            .find(|p| p.field == *field && p.text == *text)
+        {
+            Some(p) => p,
+            None => {
+                parts.push(HitPart {
+                    field: *field,
+                    text: text.clone(),
+                    indices: Vec::new(),
+                });
+                parts.last_mut().unwrap()
+            }
+        };
+        part.indices.extend(found.iter().map(|&i| i as usize));
+        part.indices.sort_unstable();
+        part.indices.dedup();
+    }
+    Some((total, Hit { parts }))
+}
+
+/// A one-line window onto `part`'s text around what matched, for a row that doesn't show
+/// that field: `label: …text…`, at most `width` characters (no label when it's too narrow
+/// for one). Returns the text and the matched positions within it.
+pub fn snippet(part: &HitPart, width: usize) -> (String, Vec<usize>) {
+    // Too narrow for the label and a useful window: the window alone.
+    let label = format!("{}: ", part.field.label());
+    let label = if width >= label.chars().count() + 8 {
+        label
+    } else {
+        String::new()
+    };
+    let chars: Vec<char> = part
+        .text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    let room = width.saturating_sub(label.chars().count());
+    let (Some(&first), Some(_)) = (part.indices.first(), part.indices.last()) else {
+        return (String::new(), Vec::new());
+    };
+    if room < 4 {
+        return (String::new(), Vec::new());
+    }
+    // A little lead-in before the first match, then as much as fits.
+    let start = first
+        .saturating_sub(room / 4)
+        .min(chars.len().saturating_sub(room));
+    let lead = usize::from(start > 0);
+    let tail_room = room - lead;
+    let end = (start + tail_room).min(chars.len());
+    let cut = end < chars.len();
+    let end = if cut { end - 1 } else { end };
+    let mut text = label.clone();
+    if lead == 1 {
+        text.push('…');
+    }
+    text.extend(&chars[start..end]);
+    if cut {
+        text.push('…');
+    }
+    let offset = label.chars().count() + lead;
+    let indices = part
+        .indices
+        .iter()
+        .filter(|&&i| i >= start && i < end)
+        .map(|&i| i - start + offset)
+        .collect();
+    (text, indices)
 }
 
 /// Every fork/merge pair among `nodes` (child→parent order). `protected` nodes — your `@`,
@@ -749,6 +927,19 @@ mod tests {
             .find(|r| r.change_id.as_deref() == Some("m2"))
             .unwrap();
         assert!(!merge_row.gutter.contains('╮'), "{:?}", merge_row.gutter);
+        assert!(
+            merge_row.gutter.contains(FOLDED_GLYPH),
+            "{:?}",
+            merge_row.gutter
+        );
+        let opened = v
+            .rows()
+            .iter()
+            .find(|r| r.change_id.as_deref() == Some("m1"));
+        assert!(
+            !opened.unwrap().gutter.contains(FOLDED_GLYPH),
+            "only folds get it"
+        );
     }
 
     #[test]
@@ -833,6 +1024,75 @@ mod tests {
         assert_eq!(v.hits(), ["m0"]);
         v.set_query("typo".into());
         assert_eq!(v.hits(), ["m1"]);
+    }
+
+    #[test]
+    fn a_fuzzy_match_never_strings_letters_across_fields() {
+        // "master": `m`, `a` from the email, then `s t e r` from "Set … terminal". Joined
+        // into one string that matched; field by field it can't.
+        let mut a = rev("m1");
+        a.email = "jezza@gmail.com".into();
+        a.full_description = "Set faff's own terminal title".into();
+        let mut nodes = history();
+        nodes[5].lines = vec!["Set faff's own terminal title".into()];
+        let mut v = view(nodes, &[a]);
+        v.open_search();
+        v.set_query("master".into());
+        assert!(v.hits().is_empty(), "{:?}", v.hits());
+    }
+
+    #[test]
+    fn a_hit_says_which_field_matched_and_where() {
+        let mut a = rev("m1");
+        a.email = "hamish@example.com".into();
+        a.author = "Jezza".into();
+        let mut v = view(history(), &[a]);
+        v.open_search();
+        v.set_query("example".into());
+        let hit = v.hit("m1").unwrap();
+        assert_eq!(hit.parts.len(), 1);
+        assert_eq!(hit.parts[0].field, Field::Email);
+        assert_eq!(hit.parts[0].indices, (7..14).collect::<Vec<_>>());
+
+        // Each word finds its own field, and must find one.
+        v.set_query("jezza typo".into());
+        let fields: Vec<Field> = v.hit("m1").unwrap().parts.iter().map(|p| p.field).collect();
+        assert_eq!(fields, [Field::Author, Field::Row]);
+        v.set_query("jezza zebra".into());
+        assert!(v.hits().is_empty());
+
+        // A tie goes to the field the row shows: the first line is in both.
+        v.set_query("typo".into());
+        assert_eq!(v.hit("m1").unwrap().parts[0].field, Field::Row);
+        // A negated word rules a revision out if any field has it.
+        v.set_query("typo !hamish".into());
+        assert!(v.hits().is_empty());
+    }
+
+    #[test]
+    fn a_snippet_frames_the_match_and_maps_its_positions() {
+        let part = HitPart {
+            field: Field::Email,
+            text: "someone.with.a.long.name@example.com".into(),
+            indices: vec![25, 26, 27],
+        };
+        let (text, idx) = snippet(&part, 24);
+        assert_eq!(text.chars().count(), 24, "{text}");
+        assert!(text.starts_with("email: …"), "{text}");
+        let picked: String = idx.iter().map(|&i| text.chars().nth(i).unwrap()).collect();
+        assert_eq!(picked, "exa", "{text} {idx:?}");
+
+        let part = HitPart {
+            field: Field::Description,
+            text: "fix\nthe typo".into(),
+            indices: vec![0],
+        };
+        let (text, idx) = snippet(&part, 40);
+        assert_eq!(text, "desc: fix the typo", "whitespace flattens");
+        assert_eq!(idx, [6]);
+        let (text, idx) = snippet(&part, 10);
+        assert_eq!(text, "fix the t…", "too narrow for the label");
+        assert_eq!(idx, [0]);
     }
 
     #[test]
