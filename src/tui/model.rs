@@ -542,8 +542,16 @@ fn build_view(
         // Mark the current fork point — where new agents branch from — with a diamond. The
         // `@` you-are-here glyph wins when `@` itself is the fork point (the view tints it
         // instead), and a conflict `×` is never masked.
+        // The log view stands in for `jj log`, so it draws jj's glyphs instead: `◆` for an
+        // immutable revision, `○` for a mutable one. There the fork point is only tinted.
         let is_fork = fork_point.as_deref() == Some(rev.change_id.as_str());
-        let glyph = if is_fork && glyph != '@' && glyph != '×' {
+        let glyph = if !curated {
+            match glyph {
+                '@' | '×' => glyph,
+                _ if rev.immutable => '◆',
+                _ => '○',
+            }
+        } else if is_fork && glyph != '@' && glyph != '×' {
             '◆'
         } else {
             glyph
@@ -945,6 +953,7 @@ mod tests {
             id_prefix: id.chars().take(1).collect(),
             id_rest: id.chars().skip(1).collect(),
             description: desc.into(),
+            ..Default::default()
         }
     }
 

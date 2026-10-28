@@ -8,9 +8,9 @@
 //! can never observe a task half-way through being created or removed.
 
 use super::notify::Level;
-use super::{describe, model, session, train};
+use super::{describe, model, revops, session, train};
 use crate::domain::{Autonomy, DESCRIBE_PROMPT, Task, TaskId, TaskStatus};
-use crate::graph::{self, GraphRow};
+use crate::graph::{self, GraphNode, GraphRow};
 use crate::store::Store;
 use crate::{config, events, jj, wezterm, workspace};
 use anyhow::{Context, Result};
@@ -19,8 +19,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-/// Idle refresh cadence: with nothing happening the view is rebuilt about once a second.
+/// Idle refresh cadence: with nothing happening the view is rebuilt about once a second —
+/// from the store and wezterm. jj is only asked again once it records an operation (see
+/// [`Cmd::OpChanged`]), or after [`JJ_FALLBACK`] in case the watcher missed one.
 const IDLE_REFRESH: Duration = Duration::from_millis(1000);
+
+/// Reload from jj at least this often, even with no operation seen.
+const JJ_FALLBACK: Duration = Duration::from_secs(10);
 
 /// Floor between refreshes driven by hook events, so a chatty agent can't drive
 /// unbounded subprocess churn.
@@ -85,6 +90,24 @@ pub enum Cmd {
     /// `d` in the log view on a revision no agent sits on: describe it with a headless
     /// claude, off the engine thread.
     DescribeRev(String),
+    /// `e`: move your working copy onto this revision (`jj edit`).
+    Edit(String),
+    /// `z`: squash `base..rev` into one new revision on `base`, called
+    /// `squashed: <name>`, without moving any working copy.
+    Squash {
+        rev: String,
+        base: String,
+        name: String,
+    },
+    /// The log view: also load these revsets (branches a search reached), replacing the
+    /// last set. Empty when the search is cleared. Not a user command: no [`Msg::Done`].
+    PullIn(Vec<String>),
+    /// `faff logs`: a file in the checkout changed, so snapshot once things go quiet.
+    /// Queued by the file watcher, so no [`Msg::Done`].
+    FilesChanged,
+    /// jj recorded an operation (anyone's): reload from jj soon. Queued by the operation
+    /// watcher, so no [`Msg::Done`].
+    OpChanged,
     /// A [`Cmd::DescribeRev`]'s claude finished, with the description or why it failed.
     /// Queued by the engine for itself, so like [`Cmd::Nudge`] it gets no [`Msg::Done`].
     Described {
@@ -116,10 +139,8 @@ pub struct View {
     pub rows: Vec<GraphRow>,
     /// Parallel to `rows`: which task (if any) each row represents.
     pub task_of_node: Vec<Option<TaskId>>,
-    /// The log view's rows and their tasks, parallel like `rows`/`task_of_node`: every
-    /// loaded revision in jj's order, nothing collapsed or lifted.
-    pub log_rows: Vec<GraphRow>,
-    pub log_task_of: Vec<Option<TaskId>>,
+    /// What the log view lays out (it folds and filters for itself).
+    pub log: LogModel,
     /// Your working copy's change id, where the log view's selection starts.
     pub working_copy: Option<String>,
     /// The current fork point (`heads(::@ ~ empty())`) — the revision new agents branch
@@ -143,6 +164,39 @@ pub struct View {
     pub select: Option<TaskId>,
     /// Revisions (change ids) a headless claude is describing, so their rows can spin.
     pub describing: HashSet<String>,
+    /// Every bookmark, local and remote, for a search to reach past what's loaded.
+    pub bookmarks: Vec<jj::BookmarkRef>,
+    /// A revision the UI should move the log view's selection onto (a fresh squash).
+    pub select_rev: Option<String>,
+    /// What the engine is quietly up to (`faff logs`' snapshots), for the header.
+    pub activity: Option<String>,
+}
+
+/// The log view's input: every loaded revision as an uncurated graph node in jj's order,
+/// the task on each, and the details its columns and search draw on.
+#[derive(Debug, Clone, Default)]
+pub struct LogModel {
+    pub nodes: Vec<GraphNode>,
+    /// Parallel to `nodes`.
+    pub node_tasks: Vec<Option<TaskId>>,
+    /// Every loaded revision by change id.
+    pub meta: HashMap<String, jj::RevInfo>,
+    pub workspaces: Vec<jj::Workspace>,
+}
+
+impl LogModel {
+    pub fn build(revs: &[jj::RevInfo], workspaces: &[jj::Workspace], tasks: &[Task]) -> LogModel {
+        let m = model::build_log(revs, workspaces, tasks);
+        LogModel {
+            nodes: m.nodes,
+            node_tasks: m.task_of,
+            meta: revs
+                .iter()
+                .map(|r| (r.change_id.clone(), r.clone()))
+                .collect(),
+            workspaces: workspaces.to_vec(),
+        }
+    }
 }
 
 /// The engine's notice sink: the same `ok`/`warn`/… surface as `notify::Notices`, but each
@@ -153,6 +207,10 @@ pub struct Outbox {
 }
 
 impl Outbox {
+    pub fn new(tx: Sender<Msg>) -> Outbox {
+        Outbox { tx }
+    }
+
     fn push(&self, level: Level, text: impl Into<String>) {
         let _ = self.tx.send(Msg::Notice(level, text.into()));
     }
@@ -169,7 +227,7 @@ impl Outbox {
         self.push(Level::Error, text);
     }
 
-    fn send(&self, msg: Msg) {
+    pub fn send(&self, msg: Msg) {
         let _ = self.tx.send(msg);
     }
 }
@@ -190,8 +248,7 @@ pub struct Engine {
     tasks: Vec<Task>,
     rows: Vec<GraphRow>,
     task_of_node: Vec<Option<TaskId>>,
-    log_rows: Vec<GraphRow>,
-    log_task_of: Vec<Option<TaskId>>,
+    log: LogModel,
     working_copy: Option<String>,
     fork_point: Option<String>,
     task_order: Vec<TaskId>,
@@ -211,6 +268,30 @@ pub struct Engine {
     describer: fn(&str) -> Result<String>,
     /// The engine's own command queue, for background work to report back on.
     wake: Sender<Cmd>,
+    /// The user's jj aliases, so `e` can tell what a running `jj <alias>` really does.
+    aliases: crate::watch::Aliases,
+    /// What jj last said, kept between operations so a tick that only changes task state
+    /// rebuilds the graphs without asking jj again.
+    revs: Vec<jj::RevInfo>,
+    log_revs: Vec<jj::RevInfo>,
+    workspaces: Option<Vec<jj::Workspace>>,
+    bookmarks: Vec<jj::BookmarkRef>,
+    /// jj recorded an operation since the last load.
+    jj_stale: bool,
+    last_jj: Instant,
+    /// The log view's revset: the user's `revsets.log`.
+    log_base: String,
+    /// Branches a search pulled into the log view (see [`Cmd::PullIn`]).
+    pulled: Vec<String>,
+    /// Squashes made from the log view, kept loaded.
+    pinned: Vec<String>,
+    /// A fresh squash for the UI to select, handed over with the next view.
+    select_rev: Option<String>,
+    /// The last jj read error, so a broken revset that's retried every tick is reported
+    /// once, not every second.
+    last_jj_error: Option<String>,
+    /// Keeps the operation watcher alive.
+    _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl Engine {
@@ -240,7 +321,13 @@ impl Engine {
         let faff_pane = std::env::var("WEZTERM_PANE")
             .ok()
             .and_then(|s| s.parse().ok());
-        Ok(Engine::new(
+        let aliases = crate::watch::load_aliases(&repo);
+        let log_base = revops::base_revset(&repo);
+        let ops = wake.clone();
+        let watcher = crate::watch::watch_ops(&repo, move || {
+            let _ = ops.send(Cmd::OpChanged);
+        });
+        let mut engine = Engine::new(
             repo,
             faff_exe,
             socket,
@@ -250,7 +337,16 @@ impl Engine {
             faff_pane,
             tx,
             wake,
-        ))
+        );
+        engine.aliases = aliases;
+        engine.log_base = log_base;
+        match watcher {
+            Ok(w) => engine._watcher = Some(w),
+            Err(e) => engine
+                .notices
+                .warn(format!("not watching jj's operations, so polling: {e:#}")),
+        }
+        Ok(engine)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -277,8 +373,7 @@ impl Engine {
             tasks: Vec::new(),
             rows: Vec::new(),
             task_of_node: Vec::new(),
-            log_rows: Vec::new(),
-            log_task_of: Vec::new(),
+            log: LogModel::default(),
             working_copy: None,
             fork_point: None,
             task_order: Vec::new(),
@@ -291,6 +386,19 @@ impl Engine {
             describing: HashSet::new(),
             describer: describe::ask_claude,
             wake,
+            aliases: crate::watch::Aliases::new(),
+            revs: Vec::new(),
+            log_revs: Vec::new(),
+            workspaces: None,
+            bookmarks: Vec::new(),
+            jj_stale: true,
+            last_jj: Instant::now(),
+            log_base: "builtin_log()".to_string(),
+            pulled: Vec::new(),
+            pinned: Vec::new(),
+            select_rev: None,
+            last_jj_error: None,
+            _watcher: None,
         }
     }
 
@@ -305,6 +413,16 @@ impl Engine {
             let gap = if nudged { MIN_REFRESH_GAP } else { IDLE_REFRESH };
             match rx.recv_timeout(gap.saturating_sub(self.last_refresh.elapsed())) {
                 Ok(Cmd::Nudge) => nudged = true,
+                Ok(Cmd::OpChanged) => {
+                    self.jj_stale = true;
+                    nudged = true;
+                }
+                Ok(Cmd::PullIn(revsets)) => {
+                    self.pulled = revsets;
+                    self.refresh();
+                    self.publish();
+                    continue;
+                }
                 Ok(cmd @ Cmd::Described { .. }) => {
                     self.handle(cmd);
                     self.publish();
@@ -322,7 +440,7 @@ impl Engine {
             let elapsed = self.last_refresh.elapsed();
             if elapsed >= IDLE_REFRESH || (nudged && elapsed >= MIN_REFRESH_GAP) {
                 nudged = false;
-                self.refresh();
+                self.reload();
                 // Advance the merge train on the freshly reconciled task state. Runs on the
                 // refresh cadence so it never adds subprocess churn beyond the throttle.
                 self.tick_merge_train();
@@ -341,6 +459,22 @@ impl Engine {
             Cmd::Rebase { id, freeze } => self.perform_rebase(id, freeze),
             Cmd::Describe(id) => self.perform_describe(id),
             Cmd::DescribeRev(rev) => self.describe_rev(rev),
+            Cmd::Edit(rev) => {
+                if revops::edit(&self.repo, &self.aliases, &rev, &self.notices) {
+                    self.refresh();
+                }
+            }
+            Cmd::Squash { rev, base, name } => {
+                if let Some(id) =
+                    revops::squash(&self.repo, &self.aliases, &rev, &base, &name, &self.notices)
+                {
+                    self.pinned.push(id.clone());
+                    self.refresh();
+                    self.select_rev = Some(id);
+                }
+            }
+            // Handled by the run loop, or `faff logs`' alone.
+            Cmd::PullIn(_) | Cmd::FilesChanged | Cmd::OpChanged => {}
             Cmd::Described { rev, result } => self.described(rev, result),
             Cmd::Accept(id) => self.accept(id),
             Cmd::AbortTrain => self.abort_train(),
@@ -367,8 +501,7 @@ impl Engine {
             tasks: self.tasks.clone(),
             rows: self.rows.clone(),
             task_of_node: self.task_of_node.clone(),
-            log_rows: self.log_rows.clone(),
-            log_task_of: self.log_task_of.clone(),
+            log: self.log.clone(),
             working_copy: self.working_copy.clone(),
             fork_point: self.fork_point.clone(),
             task_order: self.task_order.clone(),
@@ -380,6 +513,9 @@ impl Engine {
             resumable,
             select: self.pending_select.take(),
             describing: self.describing.clone(),
+            bookmarks: self.bookmarks.clone(),
+            select_rev: self.select_rev.take(),
+            ..View::default()
         }
     }
 
@@ -1119,29 +1255,46 @@ impl Engine {
 
     // ---- refresh (recompute view from store + jj) ----
 
+    /// Rebuild everything, asking jj afresh: after faff's own commands, which have just
+    /// changed what jj would say.
     fn refresh(&mut self) {
+        self.jj_stale = true;
+        self.reload();
+    }
+
+    /// Rebuild the view. jj is only asked again when it has recorded an operation since
+    /// (or the fallback has passed); otherwise the graphs are rebuilt from what it last
+    /// said, so task state (a status, a new pane) still shows within the tick.
+    fn reload(&mut self) {
         self.tasks = self.store.list_tasks().unwrap_or_default();
 
         // Fetch the authoritative jj workspace list once (shared by reconcile + graph).
-        // The poll peeks (no snapshot, no git import) so it never records an operation
+        // Every read peeks (no snapshot, no git import) so it never records an operation
         // that could race your own `jj git fetch`/rebase into a divergent op log.
-        let mut ws_list = jj::workspace_list_peek(&self.repo).ok();
+        // The list is read *after* the tasks, so a task another faff creates meanwhile is
+        // never judged against a list from before its workspace existed.
+        let fresh = (self.jj_stale || self.last_jj.elapsed() >= JJ_FALLBACK) && self.load_jj();
+        let mut ws_list = self.workspaces.clone();
 
         // Heal orphans so stale rows don't linger forever or misreport their status.
         let panes = wezterm::list().ok();
         if let Some(p) = &panes {
             self.reconcile_panes(p);
         }
-        if let Some(ws) = &ws_list {
+        // The workspace passes delete tasks and forget workspaces, so they only ever run
+        // on a list jj gave us just now — never the cached one, which can predate a
+        // workspace another faff added.
+        if let Some(ws) = ws_list.as_ref().filter(|_| fresh) {
             self.reconcile_workspaces(ws);
         }
         // Forget faff workspaces no task tracks — ghosts from a remove/swap that didn't
         // fully unregister — and drop them from the list so the graph doesn't redraw a
         // workspace we just forgot. This is what stops a stale `faf-task-N` registration
         // from blocking the next `n` with a workspace-name collision.
-        if let Some(ws) = &mut ws_list {
+        if let Some(ws) = ws_list.as_mut().filter(|_| fresh) {
             let forgotten = self.reconcile_orphan_workspaces(ws);
             ws.retain(|w| !forgotten.contains(&w.name));
+            self.workspaces = Some(ws.clone());
         }
         // Reload to reflect any status changes the reconcile passes made.
         self.tasks = self.store.list_tasks().unwrap_or_default();
@@ -1153,22 +1306,15 @@ impl Engine {
             self.open_pane = self.detect_open_pane(p);
         }
 
-        // Build the revision graph from the (already-fetched) workspace list.
+        // Build both graphs from what jj last said and the tasks as they are now.
         if let Some(ws) = &ws_list {
-            let revset = jj::workspace_ancestors_revset(ws, 25);
-            match jj::log_peek(&self.repo, &revset) {
-                Ok(revs) => {
-                    let g = Graphs::build(revs, ws, &self.tasks);
-                    self.rows = g.rows;
-                    self.task_of_node = g.task_of_node;
-                    self.log_rows = g.log_rows;
-                    self.log_task_of = g.log_task_of;
-                    self.working_copy = g.working_copy;
-                    self.id_display = g.id_display;
-                    self.fork_point = g.fork_point;
-                }
-                Err(e) => self.notices.err(format!("jj error: {e}")),
-            }
+            let g = Graphs::build(self.revs.clone(), &self.log_revs, ws, &self.tasks);
+            self.rows = g.rows;
+            self.task_of_node = g.task_of_node;
+            self.log = g.log;
+            self.working_copy = g.working_copy;
+            self.id_display = g.id_display;
+            self.fork_point = g.fork_point;
         }
 
         // Navigable list = ALL live tasks (store-driven, not graph-driven): tasks that
@@ -1187,6 +1333,43 @@ impl Engine {
         self.task_order.extend(self.detached.iter().copied());
 
         self.last_refresh = Instant::now();
+    }
+
+    /// Ask jj for the workspaces, both views' revisions and the bookmarks. The agent view
+    /// loads every workspace's ancestors; the log view, the user's own `revsets.log` plus
+    /// every working copy (and whatever a search pulled in).
+    /// Returns whether the workspace list is fresh; anything that failed stays stale, so
+    /// the next tick tries again.
+    fn load_jj(&mut self) -> bool {
+        self.last_jj = Instant::now();
+        let Ok(ws) = jj::workspace_list_peek(&self.repo) else {
+            self.jj_stale = true;
+            return false;
+        };
+        let mut error = None;
+        match jj::log_peek(&self.repo, &jj::workspace_ancestors_revset(&ws, 25)) {
+            Ok(revs) => self.revs = revs,
+            Err(e) => error = Some(format!("jj error: {e}")),
+        }
+        let revset = revops::log_revset(&self.log_base, &ws, &self.pulled, &self.pinned);
+        match jj::log_peek(&self.repo, &revset) {
+            Ok(revs) => self.log_revs = revs,
+            Err(e) => error = Some(format!("jj error in the log view's revset: {e}")),
+        }
+        let mut ok = error.is_none();
+        if let Some(e) = &error
+            && self.last_jj_error.as_ref() != Some(e)
+        {
+            self.notices.err(e.clone());
+        }
+        self.last_jj_error = error;
+        match jj::bookmark_list_peek(&self.repo) {
+            Ok(b) => self.bookmarks = b,
+            Err(_) => ok = false,
+        }
+        self.jj_stale = !ok;
+        self.workspaces = Some(ws);
+        true
     }
 
     /// Heal orphaned tasks so their status stays honest. Both cases below are flipped
@@ -1295,22 +1478,24 @@ impl Engine {
 pub struct Graphs {
     pub rows: Vec<GraphRow>,
     pub task_of_node: Vec<Option<TaskId>>,
-    pub log_rows: Vec<GraphRow>,
-    pub log_task_of: Vec<Option<TaskId>>,
+    pub log: LogModel,
     pub working_copy: Option<String>,
     pub id_display: HashMap<String, (String, String)>,
     pub fork_point: Option<String>,
 }
 
 impl Graphs {
+    /// `revs` feed the agent view, `log_revs` the log view (each from its own revset).
     pub fn build(
         mut revs: Vec<jj::RevInfo>,
+        log_revs: &[jj::RevInfo],
         workspaces: &[jj::Workspace],
         tasks: &[Task],
     ) -> Graphs {
         // change_id -> (unique prefix, padding rest) for the id column.
         let id_display = revs
             .iter()
+            .chain(log_revs)
             .map(|r| {
                 (
                     r.change_id.clone(),
@@ -1323,10 +1508,8 @@ impl Graphs {
             .find(|r| r.is_current_wc)
             .map(|r| r.change_id.clone());
 
-        // The log view takes jj's order as-is, so build it before the agent view reorders.
-        let m = model::build_log(&revs, workspaces, tasks);
-        let log_rows = graph::render(&m.nodes);
-        let log_task_of = model::row_tasks(&log_rows, &m.nodes, &m.task_of);
+        // The log view takes jj's order as-is.
+        let log = LogModel::build(log_revs, workspaces, tasks);
 
         // HEAD's `@` leads the log on lane 0; every agent is lifted to sit directly above
         // the trunk revision it forked from, so each folds to a one-row `├─●` stub.
@@ -1339,8 +1522,7 @@ impl Graphs {
         Graphs {
             rows,
             task_of_node,
-            log_rows,
-            log_task_of,
+            log,
             working_copy,
             id_display,
             fork_point: m.fork_point,
@@ -1436,6 +1618,27 @@ mod tests {
             discard: false,
         });
         assert!(notices(&rx).is_empty());
+    }
+
+    #[test]
+    fn each_view_is_built_from_its_own_revset() {
+        let rev = |id: &str, parents: &[&str], wc: bool| jj::RevInfo {
+            change_id: id.into(),
+            parents: parents.iter().map(|s| s.to_string()).collect(),
+            is_current_wc: wc,
+            description: id.into(),
+            ..Default::default()
+        };
+        let agents = vec![rev("wc", &["base"], true), rev("base", &[], false)];
+        let log = vec![
+            rev("pr", &["base"], false),
+            rev("wc", &["base"], true),
+            rev("base", &[], false),
+        ];
+        let g = Graphs::build(agents, &log, &[], &[]);
+        assert!(g.rows.iter().all(|r| r.change_id.as_deref() != Some("pr")));
+        assert_eq!(g.log.nodes.len(), 3, "the log view has its own, wider set");
+        assert!(g.id_display.contains_key("pr"), "and ids for all of it");
     }
 
     #[test]

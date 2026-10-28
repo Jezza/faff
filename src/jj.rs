@@ -15,8 +15,14 @@ const US: char = '\u{1f}';
 const RS: char = '\u{1e}';
 
 /// One-line-per-commit record, after an RS: change_id, parents(comma), current_wc, empty,
-/// conflict, id_prefix (shortest unique), id_rest (padding to 8), description.
-const LOG_TEMPLATE: &str = r#""\x1e" ++ change_id ++ "\x1f" ++ parents.map(|c| c.change_id()).join(",") ++ "\x1f" ++ if(current_working_copy,"1","0") ++ "\x1f" ++ if(empty,"1","0") ++ "\x1f" ++ if(conflict,"1","0") ++ "\x1f" ++ change_id.shortest(8).prefix() ++ "\x1f" ++ change_id.shortest(8).rest() ++ "\x1f" ++ description.first_line() ++ "\n""#;
+/// conflict, id_prefix (shortest unique), id_rest (padding to 8), description (first line),
+/// then the log view's extras: immutable, author name, author email, committer time (unix
+/// seconds), local bookmarks and remote bookmarks (`name@remote`, each list GS-joined),
+/// commit id, and the full description as a JSON string (so its newlines stay on one line).
+const LOG_TEMPLATE: &str = r#""\x1e" ++ change_id ++ "\x1f" ++ parents.map(|c| c.change_id()).join(",") ++ "\x1f" ++ if(current_working_copy,"1","0") ++ "\x1f" ++ if(empty,"1","0") ++ "\x1f" ++ if(conflict,"1","0") ++ "\x1f" ++ change_id.shortest(8).prefix() ++ "\x1f" ++ change_id.shortest(8).rest() ++ "\x1f" ++ description.first_line() ++ "\x1f" ++ if(immutable,"1","0") ++ "\x1f" ++ author.name() ++ "\x1f" ++ author.email() ++ "\x1f" ++ committer.timestamp().format("%s") ++ "\x1f" ++ local_bookmarks.map(|b| b.name()).join("\x1d") ++ "\x1f" ++ remote_bookmarks.map(|b| b.name() ++ "@" ++ b.remote()).join("\x1d") ++ "\x1f" ++ commit_id.short(12) ++ "\x1f" ++ description.escape_json() ++ "\n""#;
+
+/// Separates the entries of a list field inside one record (ASCII Group Separator, 0x1d).
+const GS: char = '\u{1d}';
 
 /// name<US>change_id per workspace.
 const WS_TEMPLATE: &str = r#"name ++ "\x1f" ++ target.change_id() ++ "\n""#;
@@ -30,7 +36,7 @@ const JJ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const CHANGE_ID_TEMPLATE: &str = r#"change_id ++ "\n""#;
 
 /// Structured info about one revision.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RevInfo {
     pub change_id: String,
     pub parents: Vec<String>,
@@ -42,7 +48,22 @@ pub struct RevInfo {
     pub id_prefix: String,
     /// The remaining chars padding the id to 8 (jj's `shortest(8).rest()`).
     pub id_rest: String,
+    /// The description's first line.
     pub description: String,
+    /// In `immutable()`: jj draws these `◆`.
+    pub immutable: bool,
+    pub author: String,
+    pub email: String,
+    /// Committer timestamp, in unix seconds.
+    pub timestamp: i64,
+    /// Local bookmarks on this revision.
+    pub bookmarks: Vec<String>,
+    /// Remote bookmarks on this revision as `name@remote`, minus the `@git` mirrors a
+    /// colocated repo keeps of every local bookmark.
+    pub remote_bookmarks: Vec<String>,
+    pub commit_id: String,
+    /// The whole description, every line.
+    pub full_description: String,
 }
 
 /// (workspace name, change_id of its working-copy commit).
@@ -124,8 +145,28 @@ fn parse_log(stdout: &str) -> Vec<RevInfo> {
             let conflict = f.next().unwrap_or("0");
             let id_prefix = f.next().unwrap_or("").to_string();
             let id_rest = f.next().unwrap_or("").to_string();
-            // description is the remainder (rejoin in the unlikely event it held a US)
-            let description = f.collect::<Vec<_>>().join(&US.to_string());
+            let description = f.next().unwrap_or("").to_string();
+            let immutable = f.next().unwrap_or("0");
+            let author = f.next().unwrap_or("").to_string();
+            let email = f.next().unwrap_or("").to_string();
+            let timestamp = f.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+            let list = |s: Option<&str>| -> Vec<String> {
+                s.unwrap_or("")
+                    .split(GS)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            };
+            let bookmarks = list(f.next());
+            let remote_bookmarks = list(f.next())
+                .into_iter()
+                .filter(|b| !b.ends_with("@git"))
+                .collect();
+            let commit_id = f.next().unwrap_or("").to_string();
+            let full_description = f
+                .next()
+                .and_then(|j| serde_json::from_str::<String>(j).ok())
+                .unwrap_or_else(|| description.clone());
             if change_id.is_empty() {
                 return None;
             }
@@ -142,6 +183,14 @@ fn parse_log(stdout: &str) -> Vec<RevInfo> {
                 id_prefix,
                 id_rest,
                 description,
+                immutable: immutable == "1",
+                author,
+                email,
+                timestamp,
+                bookmarks,
+                remote_bookmarks,
+                commit_id,
+                full_description,
             })
         })
         .collect()
@@ -323,6 +372,112 @@ pub fn diff_git(repo: &Path, rev: &str) -> Result<String> {
 /// `jj describe -r <rev> -m <message>`, replacing any existing description.
 pub fn describe(repo: &Path, rev: &str, message: &str) -> Result<()> {
     run_jj(repo, &["describe", "-r", rev, "-m", message])?;
+    Ok(())
+}
+
+/// `jj config get <key>`, or `None` when it isn't set. A pure read.
+pub fn config_get(repo: &Path, key: &str) -> Option<String> {
+    peek_jj(repo, &["config", "get", key])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// A bookmark and the revision it points at. `remote` is `None` for a local bookmark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookmarkRef {
+    pub name: String,
+    pub remote: Option<String>,
+    pub change_id: String,
+}
+
+impl BookmarkRef {
+    /// How jj prints it: `name` or `name@remote`.
+    pub fn label(&self) -> String {
+        match &self.remote {
+            Some(r) => format!("{}@{r}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// A revset naming exactly this bookmark, however odd its name.
+    pub fn revset(&self) -> String {
+        match &self.remote {
+            Some(r) => format!(
+                "remote_bookmarks(exact:{}, exact:{})",
+                revset_str(&self.name),
+                revset_str(r)
+            ),
+            None => format!("bookmarks(exact:{})", revset_str(&self.name)),
+        }
+    }
+}
+
+/// name<US>remote (empty when local)<US>target change_id, for every bookmark and every
+/// remote's copy of it. A conflicted bookmark has no single target and is left out.
+const BOOKMARK_TEMPLATE: &str = r#"name ++ "\x1f" ++ if(remote, remote, "") ++ "\x1f" ++ if(normal_target, normal_target.change_id(), "") ++ "\n""#;
+
+/// Every bookmark, local and remote (`@git` mirrors excluded), without snapshotting.
+pub fn bookmark_list_peek(repo: &Path) -> Result<Vec<BookmarkRef>> {
+    let out = peek_jj(
+        repo,
+        &["bookmark", "list", "--all-remotes", "-T", BOOKMARK_TEMPLATE],
+    )?;
+    Ok(parse_bookmarks(&out))
+}
+
+fn parse_bookmarks(stdout: &str) -> Vec<BookmarkRef> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split(US);
+            let name = f.next()?.to_string();
+            let remote = f.next().unwrap_or("");
+            let change_id = f.next().unwrap_or("").to_string();
+            if name.is_empty() || change_id.is_empty() || remote == "git" {
+                return None;
+            }
+            Some(BookmarkRef {
+                name,
+                remote: (!remote.is_empty()).then(|| remote.to_string()),
+                change_id,
+            })
+        })
+        .collect()
+}
+
+/// `s` as a double-quoted revset string literal.
+pub fn revset_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `jj new --no-edit <parent> -m <message>`: a new empty revision on `parent` that no
+/// working copy moves to. Returns its change id.
+pub fn new_no_edit(repo: &Path, parent: &str, message: &str) -> Result<String> {
+    run_jj(repo, &["new", "--no-edit", parent, "-m", message])?;
+    // jj reports the new revision on stderr only, so find it: the newest child of `parent`
+    // carrying the message.
+    let revset = format!(
+        "latest(children({parent}) & description(substring:{}))",
+        revset_str(message)
+    );
+    resolve_change_id(repo, &revset)
+}
+
+/// `jj restore --from <from> --into <into>`: make `into`'s files exactly `from`'s.
+pub fn restore_into(repo: &Path, from: &str, into: &str) -> Result<()> {
+    run_jj(repo, &["restore", "--from", from, "--into", into])?;
     Ok(())
 }
 

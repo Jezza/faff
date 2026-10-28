@@ -76,6 +76,15 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Open an existing database for reading only: no schema, no writes, so a reader
+    /// (`faff logs`) never contends with the faff that owns it.
+    pub fn open_readonly(path: &Path) -> Result<Store> {
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {}", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Store { conn })
+    }
+
     /// In-memory database (tests).
     pub fn open_memory() -> Result<Store> {
         Self::init(Connection::open_in_memory()?)
@@ -336,6 +345,18 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_read_only_store_reads_but_never_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("faf.db");
+        let owner = Store::open(&path).unwrap();
+        let t = owner.create_task("x", 0, Autonomy::Inherit).unwrap();
+        let reader = Store::open_readonly(&path).unwrap();
+        assert_eq!(reader.list_tasks().unwrap()[0].id, t.id);
+        assert!(reader.create_task("y", 0, Autonomy::Inherit).is_err());
+        assert!(Store::open_readonly(&tmp.path().join("missing.db")).is_err());
+    }
 
     fn store() -> Store {
         Store::open_memory().unwrap()

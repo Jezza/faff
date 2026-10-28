@@ -6,8 +6,11 @@
 mod describe;
 mod engine;
 mod input;
+mod logs;
+mod logview;
 mod model;
 mod notify;
+mod revops;
 mod session;
 mod train;
 
@@ -16,7 +19,7 @@ use crate::graph::GraphRow;
 use anyhow::{Context, Result, bail};
 use engine::{Base, Cmd, Engine, Msg, View};
 use input::Action;
-use ratatui::crossterm::event::{self, Event as CtEvent, KeyEventKind};
+use ratatui::crossterm::event::{self, Event as CtEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{execute, terminal};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -44,6 +47,12 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// How long each spinner frame shows.
 const SPIN_FRAME: Duration = Duration::from_millis(100);
 
+/// How long typing must pause before `faff logs` reaches past its revset for bookmarks.
+const PULL_PAUSE: Duration = Duration::from_millis(300);
+
+/// Most unloaded bookmarks one search pulls in.
+const PULL_MAX: usize = 5;
+
 /// Entry point for the `Tui` command.
 pub fn run(repo: Option<PathBuf>) -> Result<()> {
     let repo = resolve_repo(repo)?;
@@ -56,6 +65,28 @@ pub fn run(repo: Option<PathBuf>) -> Result<()> {
         .context("spawning the engine thread")?;
     let title = format!("faff | {}", repo_name(&repo));
     let mut app = App::new(repo, cmd_tx, msg_rx);
+    install_panic_hook();
+    let mut term = setup_terminal(&title)?;
+    let result = app.event_loop(&mut term);
+    restore_terminal(&mut term)?;
+    result
+}
+
+/// Entry point for the `Logs` command: the log view alone, live, over `revset` (the
+/// user's `revsets.log` when `None`), in the checkout at `repo` (the cwd's by default).
+pub fn run_logs(repo: Option<PathBuf>, revset: Option<String>) -> Result<()> {
+    let root = resolve_repo(repo)?;
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (msg_tx, msg_rx) = mpsc::channel();
+    let engine = logs::LogsEngine::open(root.clone(), revset, msg_tx, cmd_tx.clone());
+    std::thread::Builder::new()
+        .name("faff-logs".into())
+        .spawn(move || engine.run(cmd_rx))
+        .context("spawning the log engine thread")?;
+    let title = format!("faff logs | {}", repo_name(&root));
+    let mut app = App::new(root, cmd_tx, msg_rx);
+    app.mode = Mode::Logs;
+    app.body = Body::Log;
     install_panic_hook();
     let mut term = setup_terminal(&title)?;
     let result = app.event_loop(&mut term);
@@ -111,6 +142,59 @@ fn setup_terminal(title: &str) -> Result<Term> {
     Ok(term)
 }
 
+/// Hand the terminal to `argv` (a pager, say) and take it back once it exits. The
+/// command's output stays on the main screen, so wait for a key before covering it again:
+/// a pager that exits by itself on short output would otherwise flash past unseen.
+fn run_suspended(term: &mut Term, argv: &[String], dir: &Path) -> Result<()> {
+    restore_terminal(term)?;
+    let status = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(dir)
+        .status();
+    println!("\n── press any key to return to the log ──");
+    terminal::enable_raw_mode()?;
+    loop {
+        if let CtEvent::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            break;
+        }
+    }
+    execute!(term.backend_mut(), terminal::EnterAlternateScreen)?;
+    term.clear()?;
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => bail!("exited with {s}"),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Put `text` on the clipboard with an OSC 52 escape, which the terminal (wezterm,
+/// and most others) acts on — over SSH too, where no local clipboard tool could.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let mut out = stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let _ = out.flush();
+}
+
+/// Standard base64, padded — all OSC 52 needs, without a crate for it.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 fn restore_terminal(term: &mut Term) -> Result<()> {
     terminal::disable_raw_mode()?;
     execute!(term.backend_mut(), terminal::LeaveAlternateScreen)?;
@@ -141,8 +225,17 @@ enum Body {
     Log,
 }
 
+/// Which program the UI is serving: faff's dashboard, or `faff logs` (the log view alone,
+/// with no tasks, store or agents behind it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Faff,
+    Logs,
+}
+
 struct App {
     repo: PathBuf,
+    mode: Mode,
     /// The engine's latest snapshot. Everything rendered comes from here.
     view: View,
     cmd_tx: Sender<Cmd>,
@@ -160,8 +253,19 @@ struct App {
     overlay: Overlay,
     /// Which graph the body shows. See [`Body`].
     body: Body,
-    /// The log view's selected revision, kept by change id so it survives a new view.
-    log_selected: Option<String>,
+    /// The log view: its selection (kept by change id, so it survives a new view), folds
+    /// and search.
+    log: logview::LogView,
+    /// A command to run with the terminal handed over to it (`v`'s pager), taken by the
+    /// event loop, which owns the terminal.
+    exec: Option<Vec<String>>,
+    /// Text to put on the clipboard (`c`), written by the event loop.
+    copy: Option<String>,
+    /// When the search query last changed, so the log view reaches for unloaded bookmarks
+    /// only once typing pauses.
+    pull_due: Option<Instant>,
+    /// The revsets the log view last asked the engine to pull in.
+    pulled: Vec<String>,
     /// When the spinner started, so its frame follows the clock rather than redraws.
     spin_epoch: Instant,
     /// `q` pressed: quit as soon as the in-flight commands have finished.
@@ -218,97 +322,175 @@ impl Grp {
     }
 }
 
+/// Where a key applies, as a bitmask over the three contexts: faff's agents view, faff's
+/// log view, and `faff logs`. A key is only on the toolbar (and only acts) where it applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    Agents,
+    Log,
+    Logs,
+}
+
+impl Ctx {
+    fn bit(self) -> u8 {
+        match self {
+            Ctx::Agents => AGENTS,
+            Ctx::Log => LOG,
+            Ctx::Logs => LOGS,
+        }
+    }
+}
+
+const AGENTS: u8 = 1;
+const LOG: u8 = 2;
+const LOGS: u8 = 4;
+const ALL: u8 = AGENTS | LOG | LOGS;
+
 struct Hint {
     key: &'static str,
     /// Label used in the verbose form and in the `?` overlay.
     verbose: &'static str,
     grp: Grp,
+    /// The contexts it applies in (see [`Ctx`]).
+    ctx: u8,
 }
 
 /// Every binding the toolbar advertises, in display order. `↵`'s label is overridden at
-/// render time by [`App::enter_hint`] (open / detach / revive / start). Keep in sync
-/// with `input::map_key` — the test
+/// render time by [`App::enter_hint`] (open / detach / revive / start), and `N`'s by
+/// [`App::hint_label`] in the log view. Keep in sync with `input::map_key` — the test
 /// `every_action_key_appears_in_the_toolbar_data` enforces it.
 const HINTS: &[Hint] = &[
     Hint {
         key: "n",
         verbose: "new",
         grp: Grp::New,
+        ctx: AGENTS | LOG,
     },
     Hint {
         key: "N",
         verbose: "handoff",
         grp: Grp::New,
+        ctx: AGENTS | LOG,
     },
     Hint {
         key: "↵",
         verbose: "open",
         grp: Grp::Open,
+        ctx: AGENTS,
+    },
+    Hint {
+        key: "←→",
+        verbose: "fold",
+        grp: Grp::Open,
+        ctx: LOG | LOGS,
     },
     Hint {
         key: "s",
         verbose: "swap",
         grp: Grp::Rev,
+        ctx: AGENTS,
     },
     Hint {
         key: "S",
         verbose: "snap",
         grp: Grp::Rev,
+        ctx: AGENTS,
     },
     Hint {
         key: "r",
         verbose: "rebase",
         grp: Grp::Rev,
+        ctx: AGENTS,
     },
     Hint {
         key: "R",
         verbose: "onto",
         grp: Grp::Rev,
+        ctx: AGENTS,
     },
     Hint {
         key: "d",
         verbose: "desc",
         grp: Grp::Rev,
+        ctx: ALL,
+    },
+    Hint {
+        key: "c",
+        verbose: "copy",
+        grp: Grp::Rev,
+        ctx: ALL,
+    },
+    Hint {
+        key: "e",
+        verbose: "edit",
+        grp: Grp::Rev,
+        ctx: LOG | LOGS,
+    },
+    Hint {
+        key: "v",
+        verbose: "diff",
+        grp: Grp::Rev,
+        ctx: LOG | LOGS,
+    },
+    Hint {
+        key: "z",
+        verbose: "squash",
+        grp: Grp::Rev,
+        ctx: LOG | LOGS,
     },
     Hint {
         key: "a",
         verbose: "accept",
         grp: Grp::Train,
+        ctx: AGENTS,
     },
     Hint {
         key: "A",
         verbose: "abort",
         grp: Grp::Train,
+        ctx: AGENTS | LOG,
     },
     Hint {
         key: "x",
         verbose: "rm",
         grp: Grp::Del,
+        ctx: AGENTS,
     },
     Hint {
         key: "X",
         verbose: "drop",
         grp: Grp::Del,
+        ctx: AGENTS,
+    },
+    Hint {
+        key: "/",
+        verbose: "find",
+        grp: Grp::App,
+        ctx: ALL,
     },
     Hint {
         key: "⇥",
         verbose: "view",
         grp: Grp::App,
+        ctx: AGENTS | LOG,
     },
     Hint {
         key: "q",
         verbose: "quit",
         grp: Grp::App,
+        ctx: ALL,
     },
     Hint {
         key: "?",
         verbose: "keys",
         grp: Grp::App,
+        ctx: ALL,
     },
     Hint {
         key: "!",
         verbose: "log",
         grp: Grp::App,
+        ctx: ALL,
     },
 ];
 
@@ -326,8 +508,6 @@ struct Caps {
     /// A pane-less row Enter can still act on: the workspace outlived the agent, so `↵`
     /// starts or revives one in it rather than reporting "no session".
     revivable: bool,
-    /// The log view is showing: nothing task-shaped is selected.
-    log: bool,
 }
 
 /// Clip a line to `width` columns, replacing the final column with `…` so it reads as
@@ -452,6 +632,7 @@ impl App {
     fn new(repo: PathBuf, cmd_tx: Sender<Cmd>, msg_rx: Receiver<Msg>) -> App {
         let mut app = App {
             repo,
+            mode: Mode::Faff,
             view: View::default(),
             cmd_tx,
             msg_rx,
@@ -460,7 +641,11 @@ impl App {
             notices: notify::Notices::default(),
             overlay: Overlay::None,
             body: Body::Agents,
-            log_selected: None,
+            log: logview::LogView::default(),
+            exec: None,
+            copy: None,
+            pull_due: None,
+            pulled: Vec::new(),
             spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
@@ -501,6 +686,16 @@ impl App {
                 // A resize (or any other terminal event) needs a redraw too.
                 dirty = true;
             }
+            if let Some(text) = self.copy.take() {
+                copy_to_clipboard(&text);
+            }
+            if let Some(argv) = self.exec.take() {
+                if let Err(e) = run_suspended(term, &argv, &self.repo) {
+                    self.notices.err(format!("{} failed: {e}", argv.join(" ")));
+                }
+                dirty = true;
+            }
+            self.pull_in();
         }
     }
 
@@ -525,9 +720,10 @@ impl App {
 
     /// Swap in a fresh view, keeping the selection on the same task by identity. A task
     /// the engine just created (`n`/`N`) wins, so the new row is highlighted.
-    fn apply_view(&mut self, view: View) {
+    fn apply_view(&mut self, mut view: View) {
         let prev = self.view.task_order.get(self.selected).copied();
-        let prev_log_pos = self.log_selected_pos();
+        let prev_log_pos = self.log.position();
+        let select_rev = view.select_rev.take();
         self.view = view;
         self.selected = self
             .view
@@ -541,54 +737,35 @@ impl App {
 
         // The log view follows its revision by change id. A vanished revision hands the
         // selection to whatever took its row; a first view starts on your working copy.
-        let ids: Vec<String> = self
-            .log_node_ids()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let kept = self.log_selected.take().filter(|id| ids.contains(id));
-        let fallback = || match prev_log_pos {
-            Some(p) => ids.get(p.min(ids.len().saturating_sub(1))).cloned(),
-            None => self
-                .view
-                .working_copy
-                .clone()
-                .filter(|id| ids.contains(id))
-                .or(ids.first().cloned()),
-        };
-        self.log_selected = kept.or_else(fallback);
-    }
-
-    /// The log view's selectable revisions, top to bottom — one per node row.
-    fn log_node_ids(&self) -> Vec<&str> {
-        self.view
-            .log_rows
-            .iter()
-            .filter_map(|r| r.change_id.as_deref())
-            .collect()
-    }
-
-    fn log_selected_pos(&self) -> Option<usize> {
-        let sel = self.log_selected.as_deref()?;
-        self.log_node_ids().iter().position(|id| *id == sel)
-    }
-
-    fn move_log_selection(&mut self, delta: isize) {
-        let ids = self.log_node_ids();
-        if ids.is_empty() {
-            return;
+        let log = &self.view.log;
+        self.log.set_model(
+            log.nodes.clone(),
+            log.node_tasks.clone(),
+            &log.meta,
+            &log.workspaces,
+        );
+        match select_rev {
+            // A fresh squash: show it, even if that means dropping the search it was made
+            // from.
+            Some(rev) => {
+                if self.log.search().is_some() {
+                    self.clear_search();
+                }
+                self.log.selected = Some(rev);
+            }
+            // While filtering the selection only ever sits on a hit; one that arrived with
+            // this view (a branch pulled in) takes it if it had none.
+            None => self.log.land_on_hit(),
         }
-        let n = ids.len() as isize;
-        let cur = self.log_selected_pos().unwrap_or(0) as isize;
-        let next = ids[(cur + delta).rem_euclid(n) as usize].to_string();
-        self.log_selected = Some(next);
+        self.log
+            .settle_selection(prev_log_pos, self.view.working_copy.as_deref());
     }
 
     /// The revision `n`/`N` act on: the log view's selection, or `None` in the agent view
     /// (where they act on the fork point / your `@` as always).
     fn log_revision(&self) -> Option<String> {
         match self.body {
-            Body::Log => self.log_selected.clone(),
+            Body::Log => self.log.selected.clone(),
             Body::Agents => None,
         }
     }
@@ -596,8 +773,8 @@ impl App {
     /// The task whose agent sits on the log view's selected revision. Read across the
     /// node's whole block: a combined HEAD+agent node hangs its task on the line below.
     fn log_selected_task(&self) -> Option<Task> {
-        let sel = self.log_selected.as_deref()?;
-        let rows = &self.view.log_rows;
+        let sel = self.log.selected.as_deref()?;
+        let rows = self.log.rows();
         let start = rows
             .iter()
             .position(|r| r.change_id.as_deref() == Some(sel))?;
@@ -606,8 +783,20 @@ impl App {
         };
         let id = (start..rows.len())
             .take_while(in_block)
-            .find_map(|i| self.view.log_task_of.get(i).copied().flatten())?;
+            .find_map(|i| self.log.row_task().get(i).copied().flatten())?;
         self.view.tasks.iter().find(|t| t.id == id).cloned()
+    }
+
+    /// The revision the selected row stands for: the log view's selection, or the
+    /// selected task's revision in the agent view.
+    fn selected_revision(&self) -> Option<String> {
+        if self.body == Body::Log {
+            return self.log.selected.clone();
+        }
+        let id = self.view.task_order.get(self.selected)?;
+        let rows = &self.view.rows;
+        let at = self.view.task_of_node.iter().position(|t| t.as_ref() == Some(id))?;
+        rows[..=at].iter().rev().find_map(|r| r.change_id.clone())
     }
 
     /// `d` in the log view. On an agent's revision, ask that agent (as the agent view
@@ -616,7 +805,7 @@ impl App {
     fn describe_log_selection(&mut self) {
         if let Some(t) = self.log_selected_task() {
             self.describe_task(t);
-        } else if let Some(rev) = self.log_selected.clone() {
+        } else if let Some(rev) = self.log.selected.clone() {
             self.send(
                 format!("describing {}", short_id(&rev)),
                 Cmd::DescribeRev(rev),
@@ -676,29 +865,44 @@ impl App {
             }
             return;
         }
-        // The log view selects revisions, not tasks, so the keys that act on the selected
-        // task have nothing to act on there. Refuse them rather than reach for the agent
-        // view's (hidden) selection.
-        let acts_on_task = matches!(
-            action,
-            Action::ToggleSession
-                | Action::Remove
-                | Action::RemoveDiscard
-                | Action::Swap
-                | Action::Snapshot
-                | Action::Rebase
-                | Action::RebaseParent
-                | Action::Accept
-        );
-        if self.body == Body::Log && acts_on_task {
-            self.notices
-                .warn("the log view has no task selected — tab back to agents");
+        // The search line takes the keys while it's being typed into; once locked it keeps
+        // only the few that steer it, and the rest act on the selected hit as usual.
+        if self.body == Body::Log {
+            if self.log.search().is_some_and(|s| s.typing) {
+                self.search_key(key);
+                return;
+            }
+            if self.log.search().is_some() {
+                match key.code {
+                    KeyCode::Char('+') | KeyCode::Char('=') => return self.log.adjust_context(1),
+                    KeyCode::Char('-') => return self.log.adjust_context(-1),
+                    KeyCode::Esc => return self.clear_search(),
+                    _ => {}
+                }
+            }
+        }
+        // A key only acts where the toolbar lists it. The log view selects revisions, not
+        // tasks, so the keys that act on the selected task have nothing to act on there:
+        // refuse them rather than reach for the agent view's (hidden) selection.
+        if let Some(k) = input::hint_key(action)
+            && !self.hint_in_ctx(k)
+        {
+            let agents_only = HINTS.iter().any(|h| h.key == k && h.ctx == AGENTS);
+            match (self.ctx(), action) {
+                // Bare arrows mean nothing in the agents view; staying quiet beats a warning
+                // on every stray press.
+                (_, Action::Expand | Action::Collapse) => {}
+                (Ctx::Log, _) if agents_only => self
+                    .notices
+                    .warn("the log view has no task selected — tab back to agents"),
+                _ => self.notices.warn(format!("{k} does nothing here")),
+            }
             return;
         }
         match action {
             Action::Quit => self.quit(),
-            Action::Up if self.body == Body::Log => self.move_log_selection(-1),
-            Action::Down if self.body == Body::Log => self.move_log_selection(1),
+            Action::Up if self.body == Body::Log => self.log.step(-1),
+            Action::Down if self.body == Body::Log => self.log.step(1),
             Action::Up => self.move_selection(-1),
             Action::Down => self.move_selection(1),
             Action::ToggleView => {
@@ -716,7 +920,7 @@ impl App {
             },
             Action::Handoff => match self.log_revision() {
                 Some(rev) => {
-                    let doing = format!("handing off {}", short_id(&rev));
+                    let doing = format!("spawning an agent on {}", short_id(&rev));
                     self.send(doing, Cmd::New(Base::Continue(rev)));
                 }
                 None => self.send("handing off", Cmd::New(Base::Handoff)),
@@ -747,8 +951,161 @@ impl App {
                 self.notices.mark_seen();
             }
             Action::Help => self.overlay = Overlay::Help,
+            Action::Search => {
+                // The agents view selects tasks, so it couldn't land on a hit: search in
+                // the log view instead.
+                self.body = Body::Log;
+                self.log.open_search();
+            }
+            Action::Expand => {
+                self.log.expand();
+            }
+            Action::Collapse => {
+                self.log.collapse();
+            }
+            Action::Copy => self.copy_selected(),
+            Action::Edit => {
+                if let Some(rev) = self.log.selected.clone() {
+                    self.send(format!("editing {}", short_id(&rev)), Cmd::Edit(rev));
+                }
+            }
+            Action::SqDiff => self.sq_diff_selected(),
+            Action::Squash => self.squash_selected(),
             Action::None => {}
         }
+    }
+
+    /// A key while the search line is being typed into.
+    fn search_key(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        let mut query = self
+            .log
+            .search()
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        match key.code {
+            KeyCode::Esc => self.clear_search(),
+            KeyCode::Enter => self.log.lock_search(),
+            KeyCode::Up => self.log.step(-1),
+            KeyCode::Down => self.log.step(1),
+            KeyCode::Backspace => {
+                query.pop();
+                self.set_query(query);
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                query.push(c);
+                self.set_query(query);
+            }
+            _ => {}
+        }
+    }
+
+    fn set_query(&mut self, query: String) {
+        self.log.set_query(query);
+        self.pull_due = Some(Instant::now() + PULL_PAUSE);
+    }
+
+    /// Esc: drop the search (and, in `faff logs`, the branches it pulled in).
+    fn clear_search(&mut self) {
+        self.log.clear_search();
+        self.pull_due = Some(Instant::now());
+    }
+
+    /// Once typing pauses, load the unloaded bookmarks the query matches best, so a branch
+    /// outside the log view's revset can still be found. Asks only when the set changes.
+    fn pull_in(&mut self) {
+        if self.pull_due.is_none_or(|t| Instant::now() < t) {
+            return;
+        }
+        self.pull_due = None;
+        let wanted: Vec<String> = if self.log.filtering() {
+            let unloaded = self
+                .view
+                .bookmarks
+                .iter()
+                .filter(|b| !self.log.has(&b.change_id))
+                .map(|b| (b.label(), b.revset()))
+                .collect::<Vec<_>>();
+            let mut revsets = self
+                .log
+                .rank(unloaded.iter().map(|(l, r)| (l.as_str(), r.clone())));
+            revsets.truncate(PULL_MAX);
+            revsets
+        } else {
+            Vec::new()
+        };
+        if wanted != self.pulled {
+            self.pulled = wanted.clone();
+            // Quiet: it's not a user command, so it isn't tracked as in flight.
+            let _ = self.cmd_tx.send(Cmd::PullIn(wanted));
+        }
+    }
+
+    /// `c`: the selected revision's change id, to the clipboard.
+    fn copy_selected(&mut self) {
+        match self.selected_revision() {
+            Some(rev) => {
+                self.notices.ok(format!("copied {}", short_id(&rev)));
+                self.copy = Some(rev);
+            }
+            None => self.notices.warn("no revision selected to copy"),
+        }
+    }
+
+    /// Where the selected branch's squash starts (`v`, `z`): where it forked off trunk. A
+    /// revision already in trunk is its own fork point; a merge there starts from its first
+    /// parent instead, so a merged PR shows what it brought in. (A plain trunk revision
+    /// keeps the bare fork point: `z` refuses it, and `v` falls back to its own diff.)
+    fn squash_base(&self, rev: &str) -> String {
+        let fork = format!("fork_point({rev} | trunk())");
+        match self.log.node(rev).map(|n| n.parents.len()) {
+            Some(n) if n > 1 => format!("coalesce({fork} ~ {rev}, first_parent({rev}))"),
+            _ => fork,
+        }
+    }
+
+    /// `v`: the selected branch as one diff, from where it forked up to the selection, in
+    /// the pager. A revision already in trunk is its own fork point, so it shows its own
+    /// diff instead. Read without snapshotting, like every read faff makes: a snapshot here
+    /// could land in the middle of your `jj git fetch`.
+    fn sq_diff_selected(&mut self) {
+        let Some(rev) = self.log.selected.clone() else {
+            return;
+        };
+        let base = self.squash_base(&rev);
+        let from = format!("coalesce(({base}) ~ {rev}, {rev}-)");
+        let repo = self.repo.to_string_lossy().into_owned();
+        self.exec = Some(
+            [
+                "jj",
+                "-R",
+                &repo,
+                "--ignore-working-copy",
+                "diff",
+                "--from",
+                &from,
+                "--to",
+                &rev,
+            ]
+            .map(str::to_string)
+            .to_vec(),
+        );
+    }
+
+    /// `z`: squash the selected branch into one new revision beside it, for review.
+    fn squash_selected(&mut self) {
+        let Some(rev) = self.log.selected.clone() else {
+            return;
+        };
+        let base = self.squash_base(&rev);
+        let name = logview::squash_name(self.view.log.meta.get(&rev), &rev);
+        self.send(
+            format!("squashing {name}"),
+            Cmd::Squash { rev, base, name },
+        );
     }
 
     /// `q`: quit once the engine is idle, so a half-finished create or remove is never
@@ -948,9 +1305,11 @@ impl App {
     fn render(&self, f: &mut Frame) {
         let train_h = self.merge_train_height();
         let notice_h = self.notice_height(f.area().width);
+        let search_h = u16::from(self.body == Body::Log && self.log.search().is_some());
         let mut constraints = vec![
             Constraint::Length(1),        // header
             Constraint::Min(1),           // revision graph
+            Constraint::Length(search_h), // search line
             Constraint::Length(notice_h), // notice line
             Constraint::Length(1),        // key row
         ];
@@ -966,10 +1325,13 @@ impl App {
         if self.overlay != Overlay::None {
             self.render_overlay(f, chunks[1]);
         }
-        self.render_notice(f, chunks[2]);
-        self.render_keys(f, chunks[3]);
+        if search_h > 0 {
+            self.render_search(f, chunks[2]);
+        }
+        self.render_notice(f, chunks[3]);
+        self.render_keys(f, chunks[4]);
         if train_h > 0 {
-            self.render_merge_train(f, chunks[4]);
+            self.render_merge_train(f, chunks[5]);
         }
     }
 
@@ -1020,6 +1382,36 @@ impl App {
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
 
+    /// The search line: the query (with a cursor while it's being typed), then where the
+    /// selection sits among the hits and how much context each keeps.
+    fn render_search(&self, f: &mut Frame, area: Rect) {
+        let Some(search) = self.log.search() else {
+            return;
+        };
+        let hits = self.log.hits();
+        let at = self
+            .log
+            .selected
+            .as_ref()
+            .and_then(|s| hits.iter().position(|h| h == s))
+            .map_or(String::from("-"), |i| (i + 1).to_string());
+        let mut spans = vec![
+            Span::styled(" / ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(search.query.clone()),
+        ];
+        if search.typing {
+            spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+        }
+        if !search.query.is_empty() {
+            let noun = if hits.len() == 1 { "hit" } else { "hits" };
+            spans.push(Span::styled(
+                format!("   {} {noun} · {at}/{} · ±{}", hits.len(), hits.len(), search.context),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
     fn render_header(&self, f: &mut Frame, area: Rect) {
         let working = self
             .view
@@ -1038,10 +1430,21 @@ impl App {
             (Some(doing), 1) => format!(" · ⋯ {doing}"),
             (Some(doing), n) => format!(" · ⋯ {doing} (+{})", n - 1),
         };
-        let text = format!(
-            " faff · {} · {working} working{session}{busy} ",
-            repo_name(&self.repo),
-        );
+        let text = match self.mode {
+            Mode::Faff => format!(
+                " faff · {} · {working} working{session}{busy} ",
+                repo_name(&self.repo),
+            ),
+            Mode::Logs => {
+                let activity = self
+                    .view
+                    .activity
+                    .as_ref()
+                    .map(|a| format!(" · {a}"))
+                    .unwrap_or_default();
+                format!(" faff logs · {}{busy}{activity} ", repo_name(&self.repo))
+            }
+        };
         let style = Style::default().add_modifier(Modifier::REVERSED);
         f.render_widget(Paragraph::new(text).style(style), area);
         // Which body Tab has switched to, pinned to the far right; drawn second so a long
@@ -1080,7 +1483,7 @@ impl App {
         let task_of = &self.view.task_of_node;
         let is_sel = |i: usize| selected.is_some() && task_of.get(i).copied().flatten() == selected;
         let (mut lines, mut sel_lines) =
-            self.graph_lines(&self.view.rows, task_of, &is_sel, text_w);
+            self.graph_lines(&self.view.rows, task_of, &is_sel, text_w, None);
         // Detached tasks (workspace inlined into HEAD, or a stale row) have no
         // distinct node — list them below so they stay visible and selectable.
         if !self.view.detached.is_empty() {
@@ -1143,8 +1546,8 @@ impl App {
         let text_w = area.width.saturating_sub(1) as usize;
         // Highlight the selected revision's node row and any continuation rows under it
         // (a combined HEAD+agent node is two lines); link rows between nodes stay plain.
-        let rows = &self.view.log_rows;
-        let sel = self.log_selected.as_deref();
+        let rows = self.log.rows();
+        let sel = self.log.selected.as_deref();
         let mut sel_rows = vec![false; rows.len()];
         let mut in_sel = false;
         for (i, row) in rows.iter().enumerate() {
@@ -1156,9 +1559,31 @@ impl App {
             sel_rows[i] = in_sel;
         }
         let is_sel = |i: usize| sel_rows[i];
-        let (lines, sel_lines) = self.graph_lines(rows, &self.view.log_task_of, &is_sel, text_w);
+        let (lines, sel_lines) =
+            self.graph_lines(rows, self.log.row_task(), &is_sel, text_w, Some(&self.log));
+        // Splice in a `~ N hidden ~` line wherever the search skipped revisions.
+        let gaps = self.log.gaps();
+        let mut out = Vec::with_capacity(lines.len() + gaps.len());
+        let mut sel_out: Option<(usize, usize)> = None;
+        let gap_line = |n: usize| {
+            Line::from(Span::styled(
+                format!("~ {n} hidden ~"),
+                Style::default().fg(Color::DarkGray),
+            ))
+        };
+        let mut g = gaps.iter().peekable();
+        for (i, line) in lines.into_iter().enumerate() {
+            while let Some(gap) = g.next_if(|gap| gap.at == i) {
+                out.push(gap_line(gap.count));
+            }
+            if sel_lines.is_some_and(|(a, b)| (a..=b).contains(&i)) {
+                mark_line(&mut sel_out, out.len());
+            }
+            out.push(line);
+        }
+        out.extend(g.map(|gap| gap_line(gap.count)));
         let block = Block::default().borders(Borders::RIGHT);
-        render_viewport(f, area, block, lines, sel_lines);
+        render_viewport(f, area, block, out, sel_out);
     }
 
     /// The spinner frame for now, shown on a row a headless claude is describing.
@@ -1168,14 +1593,17 @@ impl App {
     }
 
     /// Paint laid-out graph rows: tinted gutter glyphs, the `[id]` column, the clipped
-    /// label. Shared by both views; `is_sel` says which rows are highlighted, and the
-    /// highlighted lines' first..=last index comes back with the lines for the viewport.
+    /// label, then the bookmark, author and age columns. Shared by both views; `is_sel`
+    /// says which rows are highlighted, and the highlighted lines' first..=last index comes
+    /// back with the lines for the viewport. `log` (the log view) adds its folds' `(+N)`
+    /// and the search's highlights.
     fn graph_lines(
         &self,
         rows: &[GraphRow],
         task_of: &[Option<TaskId>],
         is_sel: &dyn Fn(usize) -> bool,
         text_w: usize,
+        log: Option<&logview::LogView>,
     ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
         let open = self.open_task_id();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
@@ -1193,6 +1621,8 @@ impl App {
             .max()
             .unwrap_or(0)
             + 2;
+        let cols = Columns::fit(self, rows, text_w.saturating_sub(gutter_w + id_col));
+        let search = log.filter(|l| l.filtering());
         // Which node rows carry the docked (focused) session, so their revision id
         // can be greened. A combined HEAD+agent node hangs its task on a continuation line
         // below the bracketed HEAD row, so attribute each row to the nearest node row at
@@ -1229,18 +1659,18 @@ impl App {
                 Some(cid) => {
                     // Tint one node glyph in the gutter (bold), leaving every other gutter
                     // character at the base style. The current fork point — where new agents
-                    // branch from — is a cyan `◆`, or a cyan `@` when it coincides with the
-                    // working copy; a non-fork working-copy `@` is green, like jj log.
+                    // branch from — is cyan; a working-copy `@` that isn't it is green, like
+                    // jj log.
                     let gutter = format!("{:<gutter_w$}", row.gutter);
                     let is_fork = self.view.fork_point.as_deref() == Some(cid.as_str());
-                    let highlight = if is_fork {
-                        gutter
-                            .find('◆')
-                            .map(|at| (at, '◆', Color::Cyan))
-                            .or_else(|| gutter.find('@').map(|at| (at, '@', Color::Cyan)))
-                    } else {
-                        gutter.find('@').map(|at| (at, '@', Color::Green))
-                    };
+                    let highlight = gutter
+                        .char_indices()
+                        .find(|(_, c)| NODE_GLYPHS.contains(c))
+                        .and_then(|(at, ch)| match ch {
+                            _ if is_fork => Some((at, ch, Color::Cyan)),
+                            '@' => Some((at, ch, Color::Green)),
+                            _ => None,
+                        });
                     match highlight {
                         Some((at, ch, color)) => {
                             spans.push(Span::styled(gutter[..at].to_string(), base));
@@ -1264,8 +1694,8 @@ impl App {
                     // brackets *and* the id's non-unique remainder go green + bold, else
                     // both stay the muted dark-gray frame. Two thin bracket glyphs alone
                     // are easy to miss; the remainder gives the green some width. The
-                    // unique prefix keeps its cyan either way — green and blue inside one
-                    // id would read as noise. A fixed left-column indicator survives
+                    // unique prefix keeps its magenta either way — green and magenta inside
+                    // one id would read as noise. A fixed left-column indicator survives
                     // description truncation that a trailing marker would not. The docked
                     // style starts from `Style::default()`, NOT `base`: on the highlighted
                     // row `base` carries REVERSED, which would swap fg/bg and paint the
@@ -1280,11 +1710,12 @@ impl App {
                     spans.push(Span::styled("[", frame));
                     spans.push(Span::styled(
                         prefix,
-                        base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        base.fg(Color::Magenta).add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(rest, frame));
                     spans.push(Span::styled("] ", frame));
-                    let mut avail = text_w.saturating_sub(gutter_w + id_w);
+                    let desc_w = cols.desc_w(text_w.saturating_sub(gutter_w + id_w));
+                    let mut avail = desc_w;
                     if self.view.describing.contains(cid) {
                         spans.push(Span::styled(
                             format!("{} ", self.spinner_frame()),
@@ -1292,12 +1723,27 @@ impl App {
                         ));
                         avail = avail.saturating_sub(2);
                     }
-                    push_row_content(
-                        &mut spans,
-                        truncate_first_line(&row.content, avail),
-                        base,
-                        row_status,
-                    );
+                    let fold = log
+                        .and_then(|l| l.folded(cid))
+                        .map(|n| format!(" (+{n})"))
+                        .unwrap_or_default();
+                    avail = avail.saturating_sub(fold.chars().count());
+                    let text = truncate_first_line(&row.content, avail);
+                    // The spinner and fold took `desc_w - avail` between them.
+                    let used = desc_w - avail + text.chars().count();
+                    match search {
+                        Some(l) if row_status.is_none() => {
+                            push_highlighted(&mut spans, &text, base, &l.highlight(&text));
+                        }
+                        _ => push_row_content(&mut spans, text, base, row_status),
+                    }
+                    if !fold.is_empty() {
+                        spans.push(Span::styled(fold, base.fg(Color::DarkGray)));
+                    }
+                    if cols.any() {
+                        spans.push(Span::styled(" ".repeat(desc_w.saturating_sub(used)), base));
+                        cols.push(self, &mut spans, cid, base, search);
+                    }
                 }
                 // Link row (no content): gutter only.
                 None if row.content.is_empty() => {
@@ -1380,22 +1826,44 @@ impl App {
             has_pane: t.as_ref().is_some_and(|t| t.pane_id.is_some()),
             train: !self.view.merge_train.is_empty(),
             revivable: t.as_ref().is_some_and(|t| self.view.revivable.contains(&t.id)),
-            log: self.body == Body::Log,
+        }
+    }
+
+    /// Which key context is showing.
+    fn ctx(&self) -> Ctx {
+        match (self.mode, self.body) {
+            (Mode::Logs, _) => Ctx::Logs,
+            (Mode::Faff, Body::Log) => Ctx::Log,
+            (Mode::Faff, Body::Agents) => Ctx::Agents,
+        }
+    }
+
+    /// Whether `key` applies in the showing context at all.
+    fn hint_in_ctx(&self, key: &str) -> bool {
+        let bit = self.ctx().bit();
+        HINTS.iter().any(|h| h.key == key && h.ctx & bit != 0)
+    }
+
+    /// A key's label where it's showing: `N` spawns an agent on the log view's selected
+    /// revision rather than handing off your own.
+    fn hint_label(&self, h: &Hint) -> &'static str {
+        match h.key {
+            "↵" => self.enter_hint(),
+            "N" if self.ctx() == Ctx::Log => "spawn",
+            _ => h.verbose,
         }
     }
 
     /// Whether `key` is usable on the selected row. See [`Caps`] on why this is an
-    /// approximation.
-    fn hint_available(key: &str, c: &Caps) -> bool {
+    /// approximation. The log views select revisions, which every revision key applies to.
+    fn hint_available(key: &str, c: &Caps, ctx: Ctx) -> bool {
         match key {
-            "↵" | "s" | "S" | "r" | "R" | "a" | "x" | "X" if c.log => false,
-            // Every revision can be described: by its agent, else by a headless claude.
-            "d" if c.log => true,
+            "A" => c.train,
+            _ if ctx != Ctx::Agents => true,
             // A lost instance has no pane, but Enter still has something to do with it.
             "↵" => c.has_pane || c.revivable,
             "s" | "S" => c.has_ws,
             "r" | "R" | "d" | "a" => c.has_ws && c.has_pane,
-            "A" => c.train,
             _ => true,
         }
     }
@@ -1427,21 +1895,39 @@ impl App {
     /// the two forms cannot drift apart.
     fn keys_line(&self, verbose: bool) -> Line<'static> {
         let caps = self.caps();
-        let enter = self.enter_hint();
+        let ctx = self.ctx();
         let mut spans: Vec<Span<'static>> = Vec::new();
+        // A search steers with keys of its own. While typing they're all there is; once
+        // locked they lead, and the context's own keys follow for acting on a hit.
+        if let Some(search) = self.log.search().filter(|_| self.body == Body::Log) {
+            let keys: &[(&str, &str)] = if search.typing {
+                &[("↑↓", "hits"), ("↵", "lock"), ("esc", "clear")]
+            } else {
+                &[("↑↓", "hits"), ("+-", "context"), ("/", "edit"), ("esc", "clear")]
+            };
+            let style = Style::default().fg(Color::Yellow);
+            spans.push(Span::raw(" "));
+            for (i, (k, label)) in keys.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(if verbose { "  " } else { " " }));
+                }
+                spans.push(Span::styled(k.to_string(), style.add_modifier(Modifier::BOLD)));
+                if verbose {
+                    spans.push(Span::styled(format!(" {label}"), style));
+                }
+            }
+            if search.typing {
+                return Line::from(spans);
+            }
+            spans.push(Span::styled(" │", Style::default().fg(Color::DarkGray)));
+        }
         let mut cur: Option<Grp> = None;
         // The `!` key doubles as the unseen-notice badge, coloured by the worst unseen
         // level so a red `!3` is visible without opening anything.
         let unseen = self.notices.unseen();
         let badge = self.notices.max_unseen_level().map(|l| l.color());
-        for h in HINTS {
-            let label = match h.key {
-                "↵" => enter,
-                // In the log view `N` edits the selected revision rather than handing off
-                // your own.
-                "N" if self.body == Body::Log => "edit",
-                _ => h.verbose,
-            };
+        for h in HINTS.iter().filter(|h| h.ctx & ctx.bit() != 0) {
+            let label = self.hint_label(h);
             if cur != Some(h.grp) {
                 if cur.is_some() {
                     spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
@@ -1457,9 +1943,9 @@ impl App {
                 cur = Some(h.grp);
             } else if verbose {
                 spans.push(Span::raw("  "));
-            } else if h.grp == Grp::App {
-                // The app group's keys are unrelated to each other, unlike the `nN`/`xX`
-                // pairs, and the badge would otherwise jam into `?` as `q?!3`.
+            } else if h.grp == Grp::App && matches!(h.key, "q" | "?" | "!") {
+                // `q ? !` are unrelated to each other, unlike the `nN`/`xX` pairs (or the
+                // `/⇥` view keys), and the badge would otherwise jam into `?` as `q?!3`.
                 spans.push(Span::raw(" "));
             }
             let key_text = if h.key == "!" && unseen > 0 {
@@ -1474,7 +1960,7 @@ impl App {
             };
             // Unavailable keys stay in place and dim, so nothing ever shifts sideways.
             let mut style = Style::default().fg(badge_color.unwrap_or(h.grp.color()));
-            if !Self::hint_available(h.key, &caps) {
+            if !Self::hint_available(h.key, &caps, ctx) {
                 style = style.add_modifier(Modifier::DIM);
             }
             if verbose {
@@ -1562,8 +2048,21 @@ impl App {
             Span::styled("↑/↓ j/k ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled("select", Style::default().fg(Color::DarkGray)),
         ])];
+        let ctx = self.ctx();
+        if ctx != Ctx::Agents {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:<8}", "search"),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    "/ ↵ lock  +/- context  esc clear",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
         let mut cur: Option<Grp> = None;
-        for h in HINTS {
+        for h in HINTS.iter().filter(|h| h.ctx & ctx.bit() != 0) {
             if cur != Some(h.grp) {
                 lines.push(Line::from(vec![Span::styled(
                     format!(" {:<8}", h.grp.label()),
@@ -1579,7 +2078,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
             row.spans.push(Span::styled(
-                format!("{:<9}", h.verbose),
+                format!("{:<9}", self.hint_label(h)),
                 Style::default().fg(h.grp.color()),
             ));
         }
@@ -1647,6 +2146,226 @@ fn push_row_content(
     }
 }
 
+/// The glyphs a node row's gutter can draw the node itself with — faff's (`◻`, `●`/`○`
+/// for agents) and jj's (`◆` immutable, `○` mutable), plus `@` and the conflict `×`.
+const NODE_GLYPHS: [char; 6] = ['@', '◆', '○', '●', '◻', '×'];
+
+/// Below this the description stops giving up width, and the columns give way instead.
+const DESC_MIN: usize = 20;
+
+/// Widest the bookmark column grows before a row's bookmarks shrink to `first +N`.
+const MARKS_MAX: usize = 32;
+
+/// Widest the author column grows.
+const AUTHOR_MAX: usize = 14;
+
+/// The columns right of the description — bookmarks, author, age — sized once per frame
+/// for every row together, so they line up. The description takes whatever the terminal
+/// has left; when that's too little, the age goes first, then the author, then each
+/// row's bookmarks shrink to their first plus a count.
+struct Columns {
+    marks_w: usize,
+    /// Each row shows only its first bookmark and `+N`.
+    shrink: bool,
+    author_w: usize,
+    age_w: usize,
+    now: i64,
+}
+
+impl Columns {
+    /// Fit the columns for `rows` into `room`: the width right of the id column.
+    fn fit(app: &App, rows: &[GraphRow], room: usize) -> Columns {
+        let now = chrono::Utc::now().timestamp();
+        let meta = |r: &GraphRow| app.view.log.meta.get(r.change_id.as_ref()?);
+        let ws = &app.view.log.workspaces;
+        let mut marks_w = 0;
+        let mut short_w = 0;
+        let mut author_w = 0;
+        let mut age_w = 0;
+        for m in rows.iter().filter_map(meta) {
+            let marks = logview::marks(m, ws);
+            marks_w = marks_w.max(marks_width(&marks));
+            short_w = short_w.max(short_marks_width(&marks));
+            author_w = author_w.max(logview::author(m).chars().count());
+            if m.timestamp > 0 {
+                age_w = age_w.max(logview::age(now, m.timestamp).chars().count());
+            }
+        }
+        let mut c = Columns {
+            marks_w: marks_w.min(MARKS_MAX),
+            shrink: marks_w > MARKS_MAX,
+            author_w: author_w.min(AUTHOR_MAX),
+            age_w,
+            now,
+        };
+        if c.marks_w < marks_w {
+            c.marks_w = short_w.min(MARKS_MAX);
+        }
+        if room.saturating_sub(c.width()) < DESC_MIN {
+            c.age_w = 0;
+        }
+        if room.saturating_sub(c.width()) < DESC_MIN {
+            c.author_w = 0;
+        }
+        if room.saturating_sub(c.width()) < DESC_MIN && !c.shrink {
+            c.shrink = true;
+            c.marks_w = short_w.min(MARKS_MAX);
+        }
+        c
+    }
+
+    fn any(&self) -> bool {
+        self.width() > 0
+    }
+
+    /// Their total width, separators included.
+    fn width(&self) -> usize {
+        let col = |w: usize, sep: usize| if w > 0 { w + sep } else { 0 };
+        col(self.marks_w, 2) + col(self.author_w, 2) + col(self.age_w, 1)
+    }
+
+    /// The description's share of `room` (the width right of this row's id).
+    fn desc_w(&self, room: usize) -> usize {
+        room.saturating_sub(self.width())
+    }
+
+    /// Append `cid`'s bookmark, author and age cells.
+    fn push(
+        &self,
+        app: &App,
+        spans: &mut Vec<Span<'static>>,
+        cid: &str,
+        base: Style,
+        search: Option<&logview::LogView>,
+    ) {
+        let meta = app.view.log.meta.get(cid);
+        if self.marks_w > 0 {
+            spans.push(Span::styled("  ", base));
+            let marks = meta
+                .map(|m| logview::marks(m, &app.view.log.workspaces))
+                .unwrap_or_default();
+            let used = push_marks(spans, &marks, self.marks_w, self.shrink, base, search);
+            spans.push(Span::styled(" ".repeat(self.marks_w - used), base));
+        }
+        let grey = base.fg(Color::Gray);
+        if self.author_w > 0 {
+            let who = meta.map(logview::author).unwrap_or_default();
+            let who: String = who.chars().take(self.author_w).collect();
+            spans.push(Span::styled(
+                format!("  {who:<w$}", w = self.author_w),
+                grey,
+            ));
+        }
+        if self.age_w > 0 {
+            let age = meta
+                .filter(|m| m.timestamp > 0)
+                .map(|m| logview::age(self.now, m.timestamp))
+                .unwrap_or_default();
+            spans.push(Span::styled(format!(" {age:>w$}", w = self.age_w), grey));
+        }
+    }
+}
+
+/// Every bookmark on a row, space-separated.
+fn marks_width(marks: &[logview::Mark]) -> usize {
+    marks.iter().map(|m| m.width() + 1).sum::<usize>().saturating_sub(1)
+}
+
+/// A row's bookmarks shrunk to the first and a count of the rest.
+fn short_marks_width(marks: &[logview::Mark]) -> usize {
+    match marks {
+        [] => 0,
+        [one] => one.width(),
+        [first, rest @ ..] => first.width() + format!(" +{}", rest.len()).len(),
+    }
+}
+
+/// Draw a row's bookmarks into at most `width` columns, returning the width used: local
+/// bookmarks bold blue with the remotes that agree with them dimmer, remote-only ones dim
+/// blue, other workspaces' working copies dim green. What doesn't fit becomes `+N`.
+fn push_marks(
+    spans: &mut Vec<Span<'static>>,
+    marks: &[logview::Mark],
+    width: usize,
+    shrink: bool,
+    base: Style,
+    search: Option<&logview::LogView>,
+) -> usize {
+    let local = base.fg(Color::Blue).add_modifier(Modifier::BOLD);
+    let remote = base.fg(Color::Blue).add_modifier(Modifier::DIM);
+    let workspace = base.fg(Color::Green).add_modifier(Modifier::DIM);
+    let count = |n: usize| format!(" +{n}");
+    let mut used = 0;
+    for (i, m) in marks.iter().enumerate() {
+        if i > 0 {
+            // Out of room (or shrunk): count what's left instead.
+            if shrink || used + 1 + marks_width(&marks[i..]) > width {
+                let tail = count(marks.len() - i);
+                if used + tail.len() <= width {
+                    spans.push(Span::styled(tail.clone(), base.fg(Color::DarkGray)));
+                    used += tail.len();
+                }
+                return used;
+            }
+            spans.push(Span::styled(" ", base));
+            used += 1;
+        }
+        // Leave room for the count when the ones after this won't all fit.
+        let after = &marks[i + 1..];
+        let reserve = if !after.is_empty()
+            && (shrink || used + m.width() + 1 + marks_width(after) > width)
+        {
+            count(after.len()).len()
+        } else {
+            0
+        };
+        let room = width.saturating_sub(used + reserve);
+        let (name, style, tail) = match m {
+            logview::Mark::Local(n, rs) => (
+                n.clone(),
+                local,
+                rs.iter().map(|r| format!(" @{r}")).collect::<String>(),
+            ),
+            logview::Mark::Remote(n) => (n.clone(), remote, String::new()),
+            logview::Mark::Workspace(n) => (format!("{n}@"), workspace, String::new()),
+        };
+        let name: String = name.chars().take(room).collect();
+        let tail: String = tail
+            .chars()
+            .take(room - name.chars().count())
+            .collect();
+        let idx = search.map(|l| l.highlight(&name)).unwrap_or_default();
+        push_highlighted(spans, &name, style, &idx);
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail.clone(), remote));
+        }
+        used += name.chars().count() + tail.chars().count();
+    }
+    used
+}
+
+/// Push `text` in `style`, with the characters at `idx` (a search's matches) picked out.
+fn push_highlighted(spans: &mut Vec<Span<'static>>, text: &str, style: Style, idx: &[usize]) {
+    if idx.is_empty() {
+        spans.push(Span::styled(text.to_string(), style));
+        return;
+    }
+    let hit = style.fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut run = String::new();
+    let mut run_hit = false;
+    for (i, c) in text.chars().enumerate() {
+        let h = idx.binary_search(&i).is_ok();
+        if h != run_hit && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), if run_hit { hit } else { style }));
+        }
+        run_hit = h;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if run_hit { hit } else { style }));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,6 +2387,7 @@ mod tests {
         let (_msg_tx, msg_rx) = mpsc::channel();
         let app = App {
             repo: PathBuf::from("/tmp/repo"),
+            mode: Mode::Faff,
             view: View::default(),
             cmd_tx,
             msg_rx,
@@ -1676,7 +2396,11 @@ mod tests {
             notices: notify::Notices::default(),
             overlay: Overlay::None,
             body: Body::Agents,
-            log_selected: None,
+            log: logview::LogView::default(),
+            exec: None,
+            copy: None,
+            pull_due: None,
+            pulled: Vec::new(),
             spin_epoch: Instant::now(),
             should_quit: false,
             quit_now: false,
@@ -1806,7 +2530,8 @@ mod tests {
         // Guards against adding a binding to input.rs that never surfaces in the UI —
         // exactly how `R` went undocumented.
         for key in [
-            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "⇥", "q",
+            "n", "N", "↵", "s", "S", "r", "R", "d", "a", "A", "x", "X", "⇥", "q", "/", "←→",
+            "c", "e", "v", "z",
         ] {
             assert!(
                 HINTS.iter().any(|h| h.key == key),
@@ -1844,11 +2569,11 @@ mod tests {
         app.selected = 0;
         let c = app.caps();
         assert!(!c.has_ws, "fixture has no workspace");
-        assert!(!App::hint_available("s", &c), "swap needs a workspace");
-        assert!(!App::hint_available("S", &c), "snapshot needs a workspace");
-        assert!(App::hint_available("n", &c), "new task is always available");
+        assert!(!App::hint_available("s", &c, Ctx::Agents), "swap needs a workspace");
+        assert!(!App::hint_available("S", &c, Ctx::Agents), "snapshot needs a workspace");
+        assert!(App::hint_available("n", &c, Ctx::Agents), "new task is always available");
         assert!(
-            !App::hint_available("A", &c),
+            !App::hint_available("A", &c, Ctx::Agents),
             "abort needs a non-empty train"
         );
     }
@@ -2507,7 +3232,7 @@ mod tests {
         for (dx, needle) in "ab".chars().enumerate() {
             let cell = &buf.content[gy * w + x0 + 1 + dx];
             assert_eq!(cell.symbol(), needle.to_string(), "unique prefix at +{dx}");
-            assert_eq!(cell.fg, Color::Cyan, "unique prefix char {needle:?} stays cyan");
+            assert_eq!(cell.fg, Color::Magenta, "unique prefix char {needle:?} stays magenta");
         }
     }
 
@@ -2788,7 +3513,8 @@ mod tests {
         let mut app = test_app();
         app.overlay = Overlay::Help;
         let text = buffer_text(&draw(&mut app, 46, 20));
-        for verbose in HINTS.iter().map(|h| h.verbose) {
+        let ctx = app.ctx().bit();
+        for verbose in HINTS.iter().filter(|h| h.ctx & ctx != 0).map(|h| h.verbose) {
             assert!(
                 text.contains(verbose),
                 "`{verbose}` clipped at 46 cols:\n{text}"
@@ -2805,19 +3531,19 @@ mod tests {
             id_prefix: id.chars().take(1).collect(),
             id_rest: id.chars().skip(1).collect(),
             description: desc.into(),
+            ..Default::default()
         }
     }
 
     /// Hand the app the view the engine would publish for `revs`.
     fn apply_revs(app: &mut App, revs: Vec<jj::RevInfo>, ws: &[jj::Workspace]) {
-        let g = engine::Graphs::build(revs, ws, &app.view.tasks);
+        let g = engine::Graphs::build(revs.clone(), &revs, ws, &app.view.tasks);
         app.apply_view(View {
             tasks: app.view.tasks.clone(),
             task_order: app.view.task_order.clone(),
             rows: g.rows,
             task_of_node: g.task_of_node,
-            log_rows: g.log_rows,
-            log_task_of: g.log_task_of,
+            log: g.log,
             working_copy: g.working_copy,
             id_display: g.id_display,
             fork_point: g.fork_point,
@@ -2888,19 +3614,19 @@ mod tests {
     fn log_selection_starts_on_the_working_copy_and_walks_every_revision() {
         let mut app = app_with_log_history();
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.log_selected.as_deref(), Some("mp"));
+        assert_eq!(app.log.selected.as_deref(), Some("mp"));
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        assert_eq!(app.log.selected.as_deref(), Some("fk"));
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.log_selected.as_deref(), Some("base"));
+        assert_eq!(app.log.selected.as_deref(), Some("base"));
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(
-            app.log_selected.as_deref(),
+            app.log.selected.as_deref(),
             Some("mp"),
             "wraps like the agent view"
         );
         press(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.log_selected.as_deref(), Some("base"));
+        assert_eq!(app.log.selected.as_deref(), Some("base"));
     }
 
     #[test]
@@ -2908,7 +3634,7 @@ mod tests {
         let mut app = app_with_log_history();
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        assert_eq!(app.log.selected.as_deref(), Some("fk"));
         // A new revision lands on top: the selection follows `fk`, not its old row.
         let revs = vec![
             log_rev("nw", &["mp"], true, false, "newer"),
@@ -2917,7 +3643,7 @@ mod tests {
             log_rev("base", &[], false, false, "base commit"),
         ];
         apply_revs(&mut app, revs, &default_ws("nw"));
-        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        assert_eq!(app.log.selected.as_deref(), Some("fk"));
         // …and a vanished one falls back to the row that took its place.
         let revs = vec![
             log_rev("nw", &["mp"], true, false, "newer"),
@@ -2925,27 +3651,23 @@ mod tests {
             log_rev("base", &[], false, false, "base commit"),
         ];
         apply_revs(&mut app, revs, &default_ws("nw"));
-        assert_eq!(app.log_selected.as_deref(), Some("base"));
+        assert_eq!(app.log.selected.as_deref(), Some("base"));
     }
 
     #[test]
-    fn task_keys_are_dimmed_and_refused_in_the_log_view() {
+    fn task_keys_are_hidden_and_refused_in_the_log_view() {
         let (mut app, rx) = test_app_with_engine_rx();
         task_with_pane(&mut app, "do the thing");
         press(&mut app, KeyCode::Tab);
-        let caps = app.caps();
         for k in ["↵", "s", "S", "r", "R", "a", "x", "X"] {
-            assert!(
-                !App::hint_available(k, &caps),
-                "{k} should dim in the log view"
-            );
+            assert!(!app.hint_in_ctx(k), "{k} isn't in the log view");
         }
-        for k in ["n", "N", "d", "⇥", "q", "?", "!"] {
-            assert!(
-                App::hint_available(k, &caps),
-                "{k} still applies in the log view"
-            );
+        for k in ["n", "N", "d", "c", "e", "v", "z", "←→", "/", "⇥", "q", "?", "!"] {
+            assert!(app.hint_in_ctx(k), "{k} applies in the log view");
         }
+        let keys = app.keys_line(true).to_string();
+        assert!(!keys.contains("swap") && !keys.contains("snap"), "{keys}");
+        assert!(keys.contains("N spawn"), "{keys}");
         press(&mut app, KeyCode::Char('x'));
         assert!(sent(&rx).is_empty(), "x asked the engine for nothing");
         assert_eq!(latest(&app).0, notify::Level::Warn);
@@ -2963,7 +3685,7 @@ mod tests {
         apply_revs(&mut app, revs, &default_ws("mp"));
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.log_selected.as_deref(), Some("fk"));
+        assert_eq!(app.log.selected.as_deref(), Some("fk"));
         (app, rx)
     }
 
@@ -3024,7 +3746,7 @@ mod tests {
         ];
         apply_revs(&mut app, revs, &ws);
         press(&mut app, KeyCode::Tab);
-        while app.log_selected.as_deref() != Some("ag") {
+        while app.log.selected.as_deref() != Some("ag") {
             press(&mut app, KeyCode::Char('j'));
         }
         press(&mut app, KeyCode::Char('d'));
@@ -3407,5 +4129,229 @@ mod tests {
         let text = buffer_text(&draw(&mut app, 70, 16));
         assert!(text.contains("history 0"), "pinned to the top:\n{text}");
         assert!(text.contains("↓ ") && text.contains(" more"), "down marker:\n{text}");
+    }
+
+    /// A merged PR (`m` = main `p` + side `s1`) above `p`, with `@` (`wc`) on top; the
+    /// merge carries `main`, the side branch a remote bookmark, and authors and times.
+    fn merged_history() -> Vec<jj::RevInfo> {
+        let mut wc = log_rev("wc", &["m"], true, true, "");
+        wc.timestamp = 1;
+        let mut m = log_rev("m", &["p", "s1"], false, false, "Merge #4: nix flake");
+        m.immutable = true;
+        m.bookmarks = vec!["main".into()];
+        m.remote_bookmarks = vec!["main@origin".into()];
+        m.author = "Jezza".into();
+        m.timestamp = chrono::Utc::now().timestamp() - 7_200;
+        let mut s1 = log_rev("s1", &["p"], false, false, "add a nix flake");
+        s1.immutable = true;
+        s1.remote_bookmarks = vec!["hh/nix-flake@origin".into()];
+        s1.author = "Hamish".into();
+        let mut p = log_rev("p", &[], false, false, "base");
+        p.immutable = true;
+        vec![wc, m, s1, p]
+    }
+
+    fn log_app(mode: Mode) -> (App, Receiver<Cmd>) {
+        let (mut app, rx) = test_app_with_engine_rx();
+        app.mode = mode;
+        app.body = Body::Log;
+        apply_revs(&mut app, merged_history(), &default_ws("wc"));
+        (app, rx)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn log_rows_show_bookmarks_author_and_age_in_columns() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        let text = buffer_text(&draw(&mut app, 100, 12));
+        let row = text.lines().find(|l| l.contains("Merge #4")).expect("merge row");
+        assert!(row.contains("(+1)"), "the PR folds to its merge: {row}");
+        assert!(row.contains("main @origin"), "{row}");
+        assert!(row.contains("Jezza"), "{row}");
+        assert!(row.trim_end_matches(['│', ' ']).ends_with("2h"), "{row}");
+        assert!(!text.contains("add a nix flake"), "the side commit is folded away");
+        // Opened, the side commit's author lines up under the merge's.
+        app.log.selected = Some("m".into());
+        press(&mut app, KeyCode::Right);
+        let text = buffer_text(&draw(&mut app, 100, 12));
+        let col = |needle: &str| {
+            let line = text.lines().find(|l| l.contains(needle)).unwrap();
+            line[..line.find(needle).unwrap()].chars().count()
+        };
+        assert_eq!(col("Jezza"), col("Hamish"), "columns line up:\n{text}");
+    }
+
+    #[test]
+    fn narrow_panes_drop_age_then_author_before_the_description() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        let text = buffer_text(&draw(&mut app, 52, 12));
+        let row = text.lines().find(|l| l.contains("Merge")).expect("merge row");
+        assert!(!row.contains("2h") && !row.contains("Jezza"), "{row}");
+        assert!(row.contains("main"), "bookmarks hold on longest: {row}");
+    }
+
+    #[test]
+    fn the_unique_prefix_is_magenta() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        let term = draw(&mut app, 100, 12);
+        let buf = term.backend().buffer();
+        let text = buffer_text(&term);
+        let (y, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("[m]"))
+            .expect("merge id");
+        let x = line.chars().position(|c| c == '[').unwrap() + 1;
+        assert_eq!(buf[(x as u16, y as u16)].fg, Color::Magenta);
+    }
+
+    #[test]
+    fn right_opens_a_folded_merge_and_left_folds_it_back() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        app.log.selected = Some("m".into());
+        press(&mut app, KeyCode::Right);
+        assert!(buffer_text(&draw(&mut app, 100, 12)).contains("add a nix flake"));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.log.selected.as_deref(), Some("s1"));
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.log.selected.as_deref(), Some("m"));
+        assert!(!buffer_text(&draw(&mut app, 100, 12)).contains("add a nix flake"));
+    }
+
+    #[test]
+    fn slash_in_the_agents_view_searches_the_log_view() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        app.body = Body::Agents;
+        press(&mut app, KeyCode::Char('/'));
+        assert_eq!(app.body, Body::Log);
+        // Typing goes into the query, even letters that are keys elsewhere.
+        type_text(&mut app, "nix-flake");
+        assert_eq!(app.log.search().unwrap().query, "nix-flake");
+        assert_eq!(app.log.selected.as_deref(), Some("s1"), "lands on the hit");
+        let text = buffer_text(&draw(&mut app, 100, 14));
+        assert!(text.contains("add a nix flake"), "the hit opens its pair:\n{text}");
+        assert!(text.contains("1 hit · 1/1 · ±1"), "{text}");
+        assert!(text.contains("~ 1 hidden ~"), "{text}");
+        // Enter locks it; `+`/`-` steer the context, the view's keys act on the hit.
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.log.search().unwrap().typing);
+        press(&mut app, KeyCode::Char('+'));
+        assert_eq!(app.log.search().unwrap().context, 2);
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.copy.as_deref(), Some("s1"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.log.search().is_none());
+        assert_eq!(app.log.selected.as_deref(), Some("s1"), "selection kept");
+    }
+
+    #[test]
+    fn e_edits_the_selected_revision_and_only_in_a_log_view() {
+        let (mut app, rx) = log_app(Mode::Faff);
+        app.log.selected = Some("p".into());
+        press(&mut app, KeyCode::Char('e'));
+        assert_eq!(sent(&rx), vec![Cmd::Edit("p".into())]);
+        app.body = Body::Agents;
+        press(&mut app, KeyCode::Char('e'));
+        assert!(sent(&rx).is_empty());
+        assert_eq!(latest(&app).0, notify::Level::Warn);
+    }
+
+    #[test]
+    fn v_diffs_a_merge_from_its_mainline_and_a_branch_from_its_fork_point() {
+        let (mut app, _rx) = log_app(Mode::Faff);
+        app.log.selected = Some("m".into());
+        press(&mut app, KeyCode::Char('v'));
+        let argv = app.exec.take().expect("a pager to run");
+        assert_eq!(argv[3], "--ignore-working-copy", "a read never snapshots");
+        assert_eq!(
+            argv[4..],
+            [
+                "diff",
+                "--from",
+                "coalesce((coalesce(fork_point(m | trunk()) ~ m, first_parent(m))) ~ m, m-)",
+                "--to",
+                "m"
+            ]
+        );
+        app.log.selected = Some("wc".into());
+        press(&mut app, KeyCode::Char('v'));
+        let argv = app.exec.take().unwrap();
+        assert_eq!(argv[6], "coalesce((fork_point(wc | trunk())) ~ wc, wc-)");
+    }
+
+    #[test]
+    fn z_squashes_in_either_log_view_but_not_the_agents_view() {
+        for mode in [Mode::Logs, Mode::Faff] {
+            let (mut app, rx) = log_app(mode);
+            app.log.selected = Some("wc".into());
+            press(&mut app, KeyCode::Char('z'));
+            assert_eq!(
+                sent(&rx),
+                vec![Cmd::Squash {
+                    rev: "wc".into(),
+                    base: "fork_point(wc | trunk())".into(),
+                    name: "wc".into(),
+                }]
+            );
+        }
+        let (mut app, rx) = log_app(Mode::Faff);
+        app.body = Body::Agents;
+        press(&mut app, KeyCode::Char('z'));
+        assert!(sent(&rx).is_empty());
+    }
+
+    #[test]
+    fn faff_logs_shows_only_its_own_keys() {
+        let (app, _rx) = log_app(Mode::Logs);
+        let keys = app.keys_line(true).to_string();
+        for k in ["d desc", "c copy", "e edit", "v diff", "z squash", "/ find", "←→ fold"] {
+            assert!(keys.contains(k), "{k} in {keys}");
+        }
+        for k in ["new", "spawn", "view", "abort"] {
+            assert!(!keys.contains(k), "{k} not in {keys}");
+        }
+    }
+
+    #[test]
+    fn the_log_view_pulls_in_matching_bookmarks_once_typing_pauses() {
+        let (mut app, rx) = log_app(Mode::Faff);
+        app.view.bookmarks = vec![
+            jj::BookmarkRef {
+                name: "pr-77".into(),
+                remote: Some("origin".into()),
+                change_id: "unloaded".into(),
+            },
+            jj::BookmarkRef {
+                name: "main".into(),
+                remote: None,
+                change_id: "m".into(),
+            },
+        ];
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "pr-77");
+        app.pull_in();
+        assert!(sent(&rx).is_empty(), "not while typing");
+        app.pull_due = Some(Instant::now());
+        app.pull_in();
+        let want = r#"remote_bookmarks(exact:"pr-77", exact:"origin")"#.to_string();
+        assert_eq!(sent(&rx), vec![Cmd::PullIn(vec![want])]);
+        press(&mut app, KeyCode::Esc);
+        app.pull_due = Some(Instant::now());
+        app.pull_in();
+        assert_eq!(sent(&rx), vec![Cmd::PullIn(Vec::new())], "dropped with the search");
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"wwkvpqku"), "d3drdnBxa3U=");
     }
 }

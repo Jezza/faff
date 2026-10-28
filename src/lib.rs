@@ -13,5 +13,6 @@ pub mod proc;
 pub mod scheduler;
 pub mod store;
 pub mod tui;
+pub mod watch;
 pub mod wezterm;
 pub mod workspace;

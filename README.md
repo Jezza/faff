@@ -46,12 +46,13 @@ From your repo root, inside WezTerm:
 ```sh
 faff
 faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
+faff logs                        # just the live log view (see `faff logs` below)
 ```
 
 | Key | Action |
 |---|---|
 | `n` | new task (in the [log view](#the-log-view): forked from the selected revision) |
-| `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes (in the log view: an agent that edits the selected revision) |
+| `N` | hand off: spawn an agent onto your current revision (it continues your work), and reset your own workspace to the fork point from before your changes (in the log view, *spawn*: an agent that edits the selected revision) |
 | `↑`/`↓` or `k`/`j` | move selection |
 | `Tab` | switch between the agent view and the [log view](#the-log-view) |
 | `Enter` | dock the selected task's claude pane beside faff, or detach it back to its own tab; on a task whose pane has died, bring the agent back (see [Reviving a lost agent](#reviving-a-lost-agent)) |
@@ -64,6 +65,11 @@ faff tui --repo /path/to/repo    # explicit repo instead of discovery from cwd
 | `A` | abort the merge train: dequeue everything still pending (already-merged revisions stay) |
 | `x` | remove the selected task (keeps its revision as history) |
 | `X` | remove the selected task *and* abandon its revision (discards the work) |
+| `c` | copy the selected revision's change id to the clipboard |
+| `/` | search (in the agent view, switches to the log view first) |
+| `e` | log view: `jj edit` the selected revision (moves your `@` onto it) |
+| `v` | log view: the selected branch as one diff, from where it forked, in your pager |
+| `→`/`←` | log view: open / fold a folded merge |
 | `q` | quit |
 
 One session is docked at a time. Docking another detaches the current one.
@@ -82,7 +88,7 @@ revisions                                                │ ┃   from postcard
 · #5 Add OAuth login ✓                                   │ ┃
                                                          │ ┃ >
  · ready                                                   ┃
- new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ ⇥ q ? ! ┃
+ new nN │ open ↵ │ rev sSrRdc │ train aA │ del xX │ /⇥ q ? !┃
 ```
 
 When the merge train is non-empty a panel appears below the toolbar, one row per queued
@@ -356,34 +362,105 @@ removable there.
 ### The log view
 
 `Tab` switches the body between the agent view above and the log view; the header names
-the active one (`agents` or `log`) at its far right. The log is drawn from the same `jj log`
-faff already loads on each refresh, so switching is instant, but nothing is curated: empty
-commits get a row of their own (`(empty) (no description set)`, as jj labels them), agent
-branches stay in jj's order instead of being lifted onto their fork points, and nothing is
-folded away. Agent revisions keep their `#<id> <status> :: <title>` label, so they're still
-easy to spot.
+the active one (`agents` or `log`) at its far right. The agent view loads every workspace's
+`@` and its ancestors; the log view loads your own `revsets.log` instead (plus every
+workspace's `@`, so agents always show). faff reloads both whenever jj records an operation
+— yours, an agent's, anyone's — so switching is instant. The log isn't curated the way the
+agent view is: empty commits get a row of their own (`(empty) (no description set)`,
+as jj labels them), agent branches stay in jj's order instead of being lifted onto their
+fork points, and the glyphs are jj's (`◆` immutable, `○` mutable, `@`, `×` conflicted).
+Agent revisions keep their `#<id> <status> :: <title>` label, so they're still easy to spot.
 
-`j`/`k` move over revisions rather than tasks, and the log scrolls exactly like the agent
-view (same `↑ N more` / `↓ N more` markers). Each view keeps its own selection, and the
-log's follows its revision across refreshes.
+Both views show each revision's bookmarks, author and age in columns right of the
+description. Local bookmarks are bold blue, with the remotes that agree with them after
+them (`main @origin`); remote-only bookmarks are dim blue, and other workspaces' working
+copies dim green (`agent-3@`). The description takes whatever width the terminal has left;
+when that gets tight, the age goes first, then the author, then each row's bookmarks
+shrink to the first plus a count (`main +2`).
 
-Three keys act on the selected revision instead:
+```
+@    [wwkvpqku] (no description set)                                     Jezza  1w
+○    [zuwtnnpt] Set faff's own terminal title                            Jezza  1w
+◆    [sqlqskkp] Order revisions as jj's graph does         main @origin  Jezza  1w
+◆    [srsmunsk] Merge #41: nest graph lanes (+3)                         Jezza  2w
+```
+
+**Merges fold.** A merge whose side branch is a plain run of commits that forked off the
+mainline (and carries no bookmark, working copy or agent) shows as the merge alone, with
+`(+N)` for the commits it hides. `→` on it opens it, `←` folds it again (from the merge or
+any of its side commits).
+
+**Search.** `/` opens a search line (in the agent view too, which switches to the log view
+first: only the log view can land on a hit). What you type is fuzzy-matched (nucleo, so `'word`
+asks for it verbatim) against every loaded revision's change and commit ids, description,
+author, bookmarks and workspaces. Everything else folds away except the revisions either
+side of each hit (`~ 12 hidden ~` marks the gaps), merges holding a hit open up, and the
+selection lands on the best match. `↑`/`↓` jump between hits, even while typing. `↵` locks
+the query; then `+`/`-` widen or narrow the context around each hit (like `grep -C`), `/`
+edits the query again, and the other keys act on the selected hit. `Esc` clears it.
+
+Search reaches past the revset: when the query matches bookmarks (local or remote) that
+aren't loaded, the best few are pulled in once typing pauses, with their branch from its
+fork point off trunk, so a contributor's PR branch shows up where it sits. They drop out
+when the search does.
+
+`j`/`k` move over revisions rather than tasks (over hits while searching), and the log
+scrolls exactly like the agent view (same `↑ N more` / `↓ N more` markers). Each view keeps
+its own selection, and the log's follows its revision across refreshes.
+
+These keys act on the selected revision:
 
 - `n` starts a new task forked from it: the agent's workspace is an empty child of the
   selected revision rather than of the fork point.
-- `N` starts a new task that edits it: the agent's workspace sits on the revision itself
-  and continues that commit. Your own `@` is left alone, unless the revision *is* your `@`,
-  in which case this is the usual hand-off. faff refuses a revision another workspace is
-  already on, and an immutable one. If the revision is below your `@`, the agent's edits
-  rebase your `@` as they land, as any rewrite in jj would.
+- `N` (*spawn*) starts a new task that edits it: the agent's workspace sits on the revision
+  itself and continues that commit. Your own `@` is left alone, unless the revision *is*
+  your `@`, in which case this is the usual hand-off. faff refuses a revision another
+  workspace is already on, and an immutable one. If the revision is below your `@`, the
+  agent's edits rebase your `@` as they land, as any rewrite in jj would.
 - `d` describes it. On an agent's revision it asks that agent, exactly as in the agent view
   (describing its working copy from outside would leave its workspace stale). On any other
   revision faff hands the diff to a one-shot `claude -p` in the background and sets what
   comes back with `jj describe`. While claude thinks, the revision's row shows a spinner,
   in both views; the result, or why it failed, lands on the notice line.
+- `c` copies its change id to the clipboard (an OSC 52 escape, so it works over SSH too).
+- `e` runs `jj edit` on it, moving your `@` there. Refused while another jj command that
+  could rewrite commits is running in the repo.
+- `v` shows the branch as one diff, from where it forked off trunk up to the selected
+  revision (`jj diff --from 'fork_point(<rev> | trunk())' --to <rev>`), in your pager. On a
+  merge already in trunk it's what the merge brought in (from its first parent); on any
+  other revision already in trunk, its own diff. It reads without snapshotting. A key press
+  returns you to the log.
+- `z` squashes the branch for review: a new revision on the fork point holding everything
+  up to the selected revision, called `squashed: <bookmark>`. No working copy moves; the
+  new revision is selected, and `e` edits it. On a merge already in trunk it squashes what
+  the merge brought in; on any other revision already in trunk it's refused.
 
-The other keys that act on a task (`↵` `s` `S` `r` `R` `a` `x` `X`) are dimmed in the log
-view and refused if pressed; `Tab` back to the agent view to use them.
+The keys that act on a task (`↵` `s` `S` `r` `R` `a` `x` `X`) don't apply in the log view,
+so it doesn't show them; `Tab` back to the agent view to use them.
+
+### `faff logs`
+
+```sh
+faff logs                        # your `revsets.log`, in the cwd's checkout
+faff logs -r 'trunk()::@'        # any revset
+```
+
+faff's log view on its own, meant to replace `watch jj peek` in a spare pane: the same
+revisions, rows, search, folds and keys, just without `Tab` to the agent view. It reads
+faff's database (read-only) so agents' rows carry their labels and status, and `d` on an
+agent's revision asks that agent; but it creates no tasks (`n`, `N`) and drives no merge
+train (`A`), so it runs happily beside faff (or another `faff logs`).
+
+- Like faff, it reloads the moment jj records an operation, by watching the repo's op
+  heads, with a slow poll as a backstop. Reads never snapshot.
+- Unlike faff, it snapshots the checkout it was started in when files change (ignoring
+  `.jj`, `.git` and gitignored paths), a second after they go quiet. It never snapshots
+  while a jj
+  command that could rewrite commits is running in the checkout (`git fetch`, a rebase, a
+  `describe` waiting on its editor, …) — that race is what makes changes go divergent. The
+  header says what it's waiting on (`snapshot deferred: jj git fetch`). Read-only commands
+  (`log`, `diff`, `st`, aliases that run them like `peek`, and `util exec`) don't hold it up.
+Its keys are `←→` `d` `c` `e` `v` `z` `/` `q` `?` `!`.
 
 ### Notices and the toolbar
 
@@ -412,15 +489,18 @@ worst unseen level. Any key closes the log.
 `?` opens the full keymap, including `j`/`k` and `R`.
 
 The toolbar groups keys by what they do, and colours each group: **new** (`n` `N`),
-**open** (`↵`), **rev** (`s` `S` `r` `R` `d`), **train** (`a` `A`), **del** (`x` `X`),
-then `⇥` `q` `?` `!`. Keys that don't apply to the selected row are dimmed rather than
-hidden, so nothing ever moves. When faff is docked beside a session and the pane is too
-narrow for the full labels, the toolbar drops to its compact form — same groups, same
-order, just the letters:
+**open** (`↵`, or `←→` in a log view), **rev** (`s` `S` `r` `R` `d` `c`, plus `e` `v` and
+`z` in a log view), **train** (`a` `A`), **del** (`x` `X`), then `/` `⇥` `q` `?` `!`. Each
+view shows only the keys that apply in it; within a view, keys that don't apply to the
+selected row are dimmed rather than hidden, so nothing moves as the selection does. When
+faff is docked beside a session and the pane is too narrow for the full labels, the toolbar
+drops to its compact form — same groups, same order, just the letters:
 
 ```
- new nN │ open ↵ │ rev sSrRd │ train aA │ del xX │ ⇥ q ? !
+ new nN │ open ↵ │ rev sSrRdc │ train aA │ del xX │ /⇥ q ? !
 ```
+
+While searching, the toolbar leads with the search's own keys.
 
 ## How state moves
 
@@ -430,7 +510,9 @@ injected hooks → faff report-event → SQLite + socket nudge → TUI refresh
 
 `report-event` writes the database, then nudges the socket
 (`$XDG_RUNTIME_DIR/faf-<hash>.sock`) so a running TUI refreshes sooner. Events still land
-with the TUI closed. Refresh is throttled to ~1s idle, 400ms floor while events arrive.
+with the TUI closed. Refresh is throttled to ~1s idle, 400ms floor while events arrive; jj
+itself is only asked again once it has recorded an operation (faff watches the repo's op
+heads), or every 10s as a backstop.
 
 Hooks injected per workspace:
 
@@ -464,6 +546,10 @@ scheme.
 | `events` | event enum and Unix-socket transport |
 | `scheduler` | applies events to the store |
 | `cli` | argument parsing and the `report-event` subcommand |
+| `watch` | `faff logs`' watchers (op heads, files minus ignores) and the running-jj guard |
 | `tui` | ratatui app: state, event loop, rendering, actions |
+| `tui::logview` | the log view's folds, search and selection, shared by faff and `faff logs` |
+| `tui::logs` | `faff logs`' engine: load, reload, snapshot |
+| `tui::revops` | what both engines share: the log view's revset, and its `e`/`z` writes |
 | `tui::train` | the merge train: accepted-revision set, per-member stage, membership ops |
 | `tui::session` | pure session decisions: the `Enter` toggle, revivability, and the `claude` launch argv |

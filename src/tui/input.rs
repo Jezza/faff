@@ -48,7 +48,52 @@ pub enum Action {
     /// Tab: switch the body between the agent view (the curated revision graph) and the
     /// log view (every loaded revision, nothing collapsed or lifted).
     ToggleView,
+    /// `/`: search the log view (switching to it from the agents view).
+    Search,
+    /// `→`: open the selected folded merge.
+    Expand,
+    /// `←`: fold the selected merge (or the one the selected side commit belongs to).
+    Collapse,
+    /// `c`: copy the selected revision's change id to the clipboard.
+    Copy,
+    /// `e`: `jj edit` the selected revision — move your working copy onto it.
+    Edit,
+    /// `v`: show the selected branch, from where it forked, as one diff in the pager.
+    SqDiff,
+    /// `z` (`faff logs`): squash the selected branch into one new revision for review,
+    /// without moving your working copy.
+    Squash,
     None,
+}
+
+/// The toolbar key an action is listed under, so the UI can tell whether it applies in
+/// the showing context. Movement and `None` aren't listed.
+pub fn hint_key(action: Action) -> Option<&'static str> {
+    Some(match action {
+        Action::Quit => "q",
+        Action::Up | Action::Down | Action::None => return None,
+        Action::NewTask => "n",
+        Action::Handoff => "N",
+        Action::ToggleSession => "↵",
+        Action::Remove => "x",
+        Action::RemoveDiscard => "X",
+        Action::Swap => "s",
+        Action::Snapshot => "S",
+        Action::Rebase => "r",
+        Action::RebaseParent => "R",
+        Action::Describe => "d",
+        Action::Accept => "a",
+        Action::AbortTrain => "A",
+        Action::ShowLog => "!",
+        Action::Help => "?",
+        Action::ToggleView => "⇥",
+        Action::Search => "/",
+        Action::Expand | Action::Collapse => "←→",
+        Action::Copy => "c",
+        Action::Edit => "e",
+        Action::SqDiff => "v",
+        Action::Squash => "z",
+    })
 }
 
 /// Map a key event to an Action in the normal (non-modal) view.
@@ -72,6 +117,13 @@ pub fn map_key(key: KeyEvent) -> Action {
         KeyCode::Char('!') => Action::ShowLog,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Tab => Action::ToggleView,
+        KeyCode::Char('/') => Action::Search,
+        KeyCode::Right => Action::Expand,
+        KeyCode::Left => Action::Collapse,
+        KeyCode::Char('c') => Action::Copy,
+        KeyCode::Char('e') => Action::Edit,
+        KeyCode::Char('v') => Action::SqDiff,
+        KeyCode::Char('z') => Action::Squash,
         _ => Action::None,
     }
 }
@@ -112,6 +164,13 @@ mod tests {
         assert_eq!(map_key(k(KeyCode::Char('!'))), Action::ShowLog);
         assert_eq!(map_key(k(KeyCode::Char('?'))), Action::Help);
         assert_eq!(map_key(k(KeyCode::Tab)), Action::ToggleView);
-        assert_eq!(map_key(k(KeyCode::Char('z'))), Action::None);
+        assert_eq!(map_key(k(KeyCode::Char('/'))), Action::Search);
+        assert_eq!(map_key(k(KeyCode::Right)), Action::Expand);
+        assert_eq!(map_key(k(KeyCode::Left)), Action::Collapse);
+        assert_eq!(map_key(k(KeyCode::Char('c'))), Action::Copy);
+        assert_eq!(map_key(k(KeyCode::Char('e'))), Action::Edit);
+        assert_eq!(map_key(k(KeyCode::Char('v'))), Action::SqDiff);
+        assert_eq!(map_key(k(KeyCode::Char('z'))), Action::Squash);
+        assert_eq!(map_key(k(KeyCode::Char('Z'))), Action::None);
     }
 }
