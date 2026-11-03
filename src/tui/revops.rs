@@ -277,8 +277,9 @@ pub fn add_workspace(
 /// `x` / `X` in the log views: remove the workspace on `rev` as an agent's is removed —
 /// forget it, delete its directory, and abandon its own revisions, `x` only if all are
 /// empty. They start above the fork point its agent's task recorded, else the one `f` /
-/// `F` noted, else `N`'s. Refuses the checkout at `root`. Returns whether it went.
-pub fn remove_workspace(
+/// `F` noted, else `N`'s. Refuses the checkout at `root`. With no workspace on `rev`, `rev`
+/// alone is abandoned, `x` only if it is empty. Returns whether it went.
+pub fn remove_rev(
     root: &Path,
     aliases: &Aliases,
     rev: &str,
@@ -293,7 +294,12 @@ pub fn remove_workspace(
     let removed = (|| {
         let w = jj::resolve_change_id(root, rev)?;
         let Some((name, dir)) = workspace::holder(root, &w)? else {
-            anyhow::bail!("no workspace is on it");
+            // Nothing on it: the revision alone goes, `x` only if it is empty.
+            if !discard && jj::any_revision(root, &format!("({w}) ~ empty()"))? {
+                anyhow::bail!("it has changes: X discards them");
+            }
+            jj::abandon(root, &w)?;
+            return Ok(format!("abandoned {}", short(rev)));
         };
         let here = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
         if here(&dir) == here(root) {
@@ -315,15 +321,15 @@ pub fn remove_workspace(
         } else {
             workspace::teardown(root, &name, &dir, &fork_point)?;
         }
-        Ok(name)
+        Ok(if discard {
+            format!("removed {name} and discarded its revisions")
+        } else {
+            format!("removed {name}")
+        })
     })();
     match removed {
-        Ok(name) if discard => {
-            notices.ok(format!("removed {name} and discarded its revisions"));
-            true
-        }
-        Ok(name) => {
-            notices.ok(format!("removed {name}"));
+        Ok(done) => {
+            notices.ok(done);
             true
         }
         Err(e) => {

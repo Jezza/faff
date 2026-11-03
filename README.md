@@ -65,8 +65,8 @@ faff logs                        # just the live log view (see `faff logs` below
 | `d` | describe: tell the agent to set a short 4-7 word jj description of the revision's end result (in the log view, any revision: a background `claude -p` writes it) |
 | `a` | accept: toggle the selected revision into/out of the merge train (drained into your `@` one at a time) |
 | `A` | abort the merge train: dequeue everything still pending (already-merged revisions stay) |
-| `x` | remove the selected task (keeps its revision as history); in the log view, the workspace on the selected revision |
-| `X` | remove the selected task *and* abandon its revision (discards the work); in the log view, likewise for the workspace on the selected revision |
+| `x` | remove the selected task (keeps its revision as history); in the log view, the workspace on the selected revision, else the revision itself if it's empty |
+| `X` | remove the selected task *and* abandon its revision (discards the work); in the log view, likewise for the workspace on the selected revision, else the revision itself, changes and all |
 | `c` | copy the selected revision's change id to the clipboard |
 | `/` | search (in the agent view, switches to the log view first) |
 | `e` | log view: `jj edit` the selected revision (moves your `@` onto it) |
@@ -277,7 +277,8 @@ In the log view, `x` and `X` remove the workspace on the selected revision the s
 workspace but your own: an agent's goes with its task and pane. Its own commits start above
 the fork point its task recorded, else the one `f` / `F` noted when they made it, else the
 newest revision with changes below its `@`. The workspace the repo lives in (where `jj git
-init` ran) is never removed.
+init` ran) is never removed. A revision with no workspace on it is abandoned by itself: `x`
+only if it's empty (it tells you `X` discards the changes), `X` regardless.
 
 ### Reviving a lost agent
 
@@ -476,8 +477,9 @@ These keys act on the selected revision:
   new revision is selected, and `e` edits it. On a merge already in trunk it squashes what
   the merge brought in; on any other revision already in trunk it's refused.
 - `x` / `X` remove the workspace on it, as they remove a task (see
-  [Removing a task](#removing-a-task)); an agent's goes with its task. Refused on your own
-  `@`, or while a jj command that could rewrite commits runs in the repo or that workspace.
+  [Removing a task](#removing-a-task)); an agent's goes with its task. With no workspace on
+  it, the revision itself is abandoned, `x` only if it's empty. Refused on your own `@`, or
+  while a jj command that could rewrite commits runs in the repo or that workspace.
 
 The keys that act on a task (`↵` `s` `S` `r` `R` `a`) don't apply in the log view,
 so it doesn't show them; `Tab` back to the agent view to use them.

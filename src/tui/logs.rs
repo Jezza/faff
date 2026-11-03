@@ -240,9 +240,9 @@ impl LogsEngine {
             }
             // An agent's task and pane are faff's: faff drops the task once it sees the
             // workspace gone.
-            Cmd::RemoveWorkspace { rev, discard } => {
+            Cmd::RemoveRev { rev, discard } => {
                 let tasks = self.tasks();
-                if revops::remove_workspace(
+                if revops::remove_rev(
                     &self.root,
                     &self.aliases,
                     &rev,
@@ -580,11 +580,11 @@ mod tests {
             heads.push((dir, id(&root, &format!("{name}@"))));
         }
         let (mut e, _rx) = engine(root.clone(), "all()");
-        e.handle(Cmd::RemoveWorkspace {
+        e.handle(Cmd::RemoveRev {
             rev: heads[0].1.clone(),
             discard: false,
         });
-        e.handle(Cmd::RemoveWorkspace {
+        e.handle(Cmd::RemoveRev {
             rev: heads[1].1.clone(),
             discard: true,
         });
@@ -600,11 +600,52 @@ mod tests {
     }
 
     #[test]
+    fn x_abandons_an_empty_bare_revision_and_keeps_one_with_changes_until_shift_x() {
+        let (_tmp, root) = repo();
+        // Two revisions above `feature` with no workspace on either: an empty one, and one
+        // with a file, left behind by moving `@` back to `main`.
+        jj(&root, &["new", "feature", "--no-edit"]);
+        jj(&root, &["new", "feature"]);
+        std::fs::write(root.join("h"), "work\n").unwrap();
+        jj(&root, &["new", "main"]);
+        let empty = id(&root, "feature+ & empty()");
+        let changed = id(&root, "feature+ ~ empty()");
+        let live = |rev: &str| !id(&root, &format!("present({rev})")).trim().is_empty();
+        let (mut e, rx) = engine(root.clone(), "all()");
+        e.handle(Cmd::RemoveRev {
+            rev: empty.clone(),
+            discard: false,
+        });
+        e.handle(Cmd::RemoveRev {
+            rev: changed.clone(),
+            discard: false,
+        });
+        assert!(!live(&empty), "x abandons an empty revision");
+        assert!(live(&changed), "x keeps a revision with changes");
+        assert!(
+            rx.try_iter().any(|m| matches!(
+                m,
+                Msg::Notice(_, t) if t.contains("changes") && t.contains('X')
+            )),
+            "x says X discards the changes"
+        );
+        e.handle(Cmd::RemoveRev {
+            rev: changed.clone(),
+            discard: true,
+        });
+        assert!(!live(&changed), "X discards it");
+        assert!(
+            jj(&root, &["workspace", "list"]).contains("default"),
+            "the checkout stays"
+        );
+    }
+
+    #[test]
     fn x_refuses_the_workspace_it_runs_in() {
         let (_tmp, root) = repo();
         let at = id(&root, "@");
         let (mut e, rx) = engine(root.clone(), "all()");
-        e.handle(Cmd::RemoveWorkspace {
+        e.handle(Cmd::RemoveRev {
             rev: at,
             discard: true,
         });

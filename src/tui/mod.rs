@@ -1283,14 +1283,15 @@ impl App {
     /// `x` / `X`: remove the selected task. `x` keeps its real work as ordinary jj history;
     /// `X` discards the revision too (see `workspace::teardown_discarding_revision`).
     fn remove_selected(&mut self, discard: bool) {
-        // The log views remove the workspace on the selected revision instead.
+        // The log views remove what is on the selected revision instead: its workspace,
+        // else the revision itself.
         if self.body == Body::Log {
             let Some(rev) = self.log.selected.clone() else {
                 return self.notices.warn("no revision selected");
             };
             return self.send(
-                format!("removing the workspace on {}", short_id(&rev)),
-                Cmd::RemoveWorkspace { rev, discard },
+                format!("removing {}", short_id(&rev)),
+                Cmd::RemoveRev { rev, discard },
             );
         }
         let Some(t) = self.selected_task() else {
@@ -4848,7 +4849,7 @@ mod tests {
     }
 
     #[test]
-    fn x_and_shift_x_remove_the_workspace_on_the_selection_in_both_log_views() {
+    fn x_and_shift_x_remove_the_selection_in_both_log_views() {
         for mode in [Mode::Logs, Mode::Faff] {
             let (mut app, rx) = log_app(mode);
             app.log.selected = Some("wc".into());
@@ -4857,11 +4858,11 @@ mod tests {
             assert_eq!(
                 sent(&rx),
                 vec![
-                    Cmd::RemoveWorkspace {
+                    Cmd::RemoveRev {
                         rev: "wc".into(),
                         discard: false
                     },
-                    Cmd::RemoveWorkspace {
+                    Cmd::RemoveRev {
                         rev: "wc".into(),
                         discard: true
                     },

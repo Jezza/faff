@@ -80,8 +80,8 @@ pub enum Cmd {
     /// `x` / `X`.
     Remove { id: TaskId, discard: bool },
     /// `x` / `X` in the log views: remove the workspace on `rev` (its agent's task with
-    /// it, in faff).
-    RemoveWorkspace { rev: String, discard: bool },
+    /// it, in faff), else `rev` itself.
+    RemoveRev { rev: String, discard: bool },
     /// `s`, already confirmed if the agent was working.
     Swap(TaskId),
     /// `S`.
@@ -498,7 +498,7 @@ impl Engine {
             Cmd::New(base) => self.new_task(base),
             Cmd::Toggle(id) => self.toggle_session(id),
             Cmd::Remove { id, discard } => self.remove(id, discard),
-            Cmd::RemoveWorkspace { rev, discard } => self.remove_workspace(rev, discard),
+            Cmd::RemoveRev { rev, discard } => self.remove_rev(rev, discard),
             Cmd::Swap(id) => self.perform_swap(id),
             Cmd::Snapshot(id) => self.snapshot_task(id),
             Cmd::Rebase { id, freeze } => self.perform_rebase(id, freeze),
@@ -923,8 +923,9 @@ impl Engine {
     }
 
     /// `x` / `X` in the log view: an agent's workspace goes with its task, pane and all, as
-    /// from the agents view; any other alone (see [`revops::remove_workspace`]).
-    fn remove_workspace(&mut self, rev: String, discard: bool) {
+    /// from the agents view; any other alone, and a revision nothing sits on by itself (see
+    /// [`revops::remove_rev`]).
+    fn remove_rev(&mut self, rev: String, discard: bool) {
         let owner = workspace::holder(&self.repo, &rev)
             .ok()
             .flatten()
@@ -937,7 +938,7 @@ impl Engine {
         if let Some(id) = owner {
             return self.remove(id, discard);
         }
-        if revops::remove_workspace(
+        if revops::remove_rev(
             &self.repo,
             &self.aliases,
             &rev,
