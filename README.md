@@ -472,6 +472,18 @@ These keys act on the selected revision:
   pager (or closing an external diff tool) returns you to the log; if it was over within
   200ms (a pager like `less -F` exiting by itself on a short diff) or failed, faff waits for a
   key first so you can read it.
+
+  To use one of your jj `merge-tools` instead of the pager, name it in jj's config. A
+  `faff.*` key rather than `ui.diff-formatter`, so your agents' `jj diff` keeps its default:
+
+  ```toml
+  [faff]
+  diff-tool = "zed"      # v runs `jj diff --tool zed`
+  diff-tool-gui = true   # it opens its own window: run it beside faff, which stays live
+  ```
+
+  Without `diff-tool-gui`, the tool gets the terminal as the pager would. faff reads these
+  on every `v`, so a change applies straight away.
 - `z` squashes the branch for review: a new revision on the fork point holding everything
   up to the selected revision, called `squashed: <bookmark>`. No working copy moves; the
   new revision is selected, and `e` edits it. On a merge already in trunk it squashes what

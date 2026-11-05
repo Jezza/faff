@@ -262,6 +262,11 @@ contributor's PR branch.
 | `z` | sq: squash the branch into one new revision *without moving `@`*, then select it | `jj new --no-edit 'fork_point(<rev> \| trunk())' -m "squashed: <name>"` then `jj restore --from <rev> --into <new>` |
 | `v` | sq-diff: view the branch as one diff in the pager, return to the log on exit | `jj diff --from 'fork_point(<rev> \| trunk())' --to <rev>` with the TUI suspended |
 
+- `v` uses the jj `merge-tools` entry named by `faff.diff-tool` in jj config, if set, via
+  `jj diff --tool <name>` (the user's call: a faff-only key, so agents' `jj diff` keeps the
+  default). With `faff.diff-tool-gui = true` the tool runs in the background with the TUI
+  live, and faff reports a failure as a notice once it exits; otherwise it's suspended like
+  the pager. Read on each `v`.
 - `z` and `v` cover the fork point up to and including the **selected** revision, not the
   branch tip (the user's call). Selecting a mid-branch commit gives a partial squash.
 - `<name>` is the selected revision's first local bookmark, else its first remote one, else

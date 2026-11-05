@@ -189,6 +189,79 @@ fn run_suspended(term: &mut Term, argv: &[String], dir: &Path) -> Result<()> {
     }
 }
 
+/// How `v` shows a diff, from the user's jj config. `faff.diff-tool` names one of their
+/// `merge-tools` for `jj diff --tool`; a `faff.*` key rather than `ui.diff-formatter`, so
+/// the agents' own `jj diff` keeps its default. `faff.diff-tool-gui = true` says the tool
+/// opens its own window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DiffTool {
+    name: Option<String>,
+    gui: bool,
+}
+
+fn diff_tool(repo: &Path) -> DiffTool {
+    DiffTool {
+        name: crate::jj::config_get(repo, "faff.diff-tool"),
+        gui: crate::jj::config_get(repo, "faff.diff-tool-gui").as_deref() == Some("true"),
+    }
+}
+
+/// How to run `v`'s `jj diff`.
+#[derive(Debug, PartialEq, Eq)]
+enum DiffLaunch {
+    /// With the terminal handed over: the pager, or a tool that draws in the terminal.
+    Suspended(Vec<String>),
+    /// Beside faff, which stays live: a GUI tool. jj has to outlive the tool (it deletes
+    /// the directories it diffs once the tool exits), so it runs in the background too.
+    Background(Vec<String>),
+}
+
+/// `argv` with the configured tool added. A GUI flag without a tool is ignored: the pager
+/// needs the terminal.
+fn diff_launch(mut argv: Vec<String>, tool: &DiffTool) -> DiffLaunch {
+    let Some(name) = &tool.name else {
+        return DiffLaunch::Suspended(argv);
+    };
+    argv.extend(["--tool".to_string(), name.clone()]);
+    if tool.gui {
+        DiffLaunch::Background(argv)
+    } else {
+        DiffLaunch::Suspended(argv)
+    }
+}
+
+/// Start `argv` with no terminal, and a thread that waits for it to exit. The thread's
+/// result is the command's stderr if it failed.
+fn spawn_background(
+    argv: &[String],
+    dir: &Path,
+) -> std::io::Result<std::thread::JoinHandle<Result<(), String>>> {
+    use std::process::Stdio;
+    let child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let what = argv.join(" ");
+    Ok(std::thread::spawn(move || {
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("{what} failed: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        let err = err.trim();
+        Err(if err.is_empty() {
+            format!("{what} exited with {}", out.status)
+        } else {
+            format!("{what} failed: {err}")
+        })
+    }))
+}
+
 /// Put `text` on the clipboard with an OSC 52 escape, which the terminal (wezterm,
 /// and most others) acts on — over SSH too, where no local clipboard tool could.
 fn copy_to_clipboard(text: &str) {
@@ -279,9 +352,12 @@ struct App {
     /// The log view: its selection (kept by change id, so it survives a new view), folds
     /// and search.
     log: logview::LogView,
-    /// A command to run with the terminal handed over to it (`v`'s pager), taken by the
-    /// event loop, which owns the terminal.
-    exec: Option<Vec<String>>,
+    /// `v`'s `jj diff`, taken by the event loop, which owns the terminal. It adds the
+    /// user's `faff.diff-tool`, if any, and runs it: see [`DiffLaunch`].
+    diff: Option<Vec<String>>,
+    /// Diffs open in a GUI tool (`faff.diff-tool-gui`), each waited on by its own thread.
+    /// The event loop reaps them and reports a failure.
+    bg_diffs: Vec<std::thread::JoinHandle<Result<(), String>>>,
     /// Text to put on the clipboard (`c`), written by the event loop.
     copy: Option<String>,
     /// When the search query last changed, so the log view reaches for unloaded bookmarks
@@ -707,7 +783,8 @@ impl App {
             overlay: Overlay::None,
             body: Body::Agents,
             log: logview::LogView::default(),
-            exec: None,
+            diff: None,
+            bg_diffs: Vec::new(),
             copy: None,
             pull_due: None,
             pulled: Vec::new(),
@@ -756,15 +833,43 @@ impl App {
             if let Some(text) = self.copy.take() {
                 copy_to_clipboard(&text);
             }
-            if let Some(argv) = self.exec.take() {
-                if let Err(e) = run_suspended(term, &argv, &self.repo) {
-                    self.notices.err(format!("{} failed: {e}", argv.join(" ")));
+            if let Some(argv) = self.diff.take() {
+                // Reads jj config, so `v` follows a change to it without a restart. It
+                // shells out, but only right after `v`, which is about to anyway.
+                match diff_launch(argv, &diff_tool(&self.repo)) {
+                    DiffLaunch::Suspended(argv) => {
+                        if let Err(e) = run_suspended(term, &argv, &self.repo) {
+                            self.notices.err(format!("{} failed: {e}", argv.join(" ")));
+                        }
+                    }
+                    DiffLaunch::Background(argv) => match spawn_background(&argv, &self.repo) {
+                        Ok(h) => self.bg_diffs.push(h),
+                        Err(e) => self.notices.err(format!("{} failed: {e}", argv.join(" "))),
+                    },
                 }
                 dirty = true;
             }
+            dirty |= self.reap_bg_diffs();
             self.pull_in();
             self.load_ahead(term.size()?.height as usize);
         }
+    }
+
+    /// Collect the background diffs that have closed, noting any that failed. Returns
+    /// whether one did.
+    fn reap_bg_diffs(&mut self) -> bool {
+        let (done, open) = std::mem::take(&mut self.bg_diffs)
+            .into_iter()
+            .partition::<Vec<_>, _>(|h| h.is_finished());
+        self.bg_diffs = open;
+        let mut failed = false;
+        for h in done {
+            if let Ok(Err(e)) = h.join() {
+                self.notices.err(e);
+                failed = true;
+            }
+        }
+        failed
     }
 
     /// Apply everything the engine has sent since the last pass. Returns whether anything
@@ -1188,7 +1293,7 @@ impl App {
     }
 
     /// `v`: the selected branch as one diff, from where it forked up to the selection, in
-    /// the pager. A revision already in trunk is its own fork point, so it shows its own
+    /// the pager or the user's `faff.diff-tool`. A revision already in trunk is its own fork point, so it shows its own
     /// diff instead. In the agents view, what the selected agent added: from its task's
     /// fork point to its workspace's `@`. Read without snapshotting, like every read faff
     /// makes: a snapshot here could land in the middle of your `jj git fetch`.
@@ -1209,7 +1314,7 @@ impl App {
             (format!("coalesce(({base}) ~ {rev}, {rev}-)"), rev)
         };
         let repo = self.repo.to_string_lossy().into_owned();
-        self.exec = Some(
+        self.diff = Some(
             [
                 "jj",
                 "-R",
@@ -2704,7 +2809,8 @@ mod tests {
             overlay: Overlay::None,
             body: Body::Agents,
             log: logview::LogView::default(),
-            exec: None,
+            diff: None,
+            bg_diffs: Vec::new(),
             copy: None,
             pull_due: None,
             pulled: Vec::new(),
@@ -4765,7 +4871,7 @@ mod tests {
         let (mut app, _rx) = test_app_with_engine_rx();
         task_with_pane(&mut app, "do the thing");
         press(&mut app, KeyCode::Char('v'));
-        let argv = app.exec.take().expect("a pager to run");
+        let argv = app.diff.take().expect("a pager to run");
         assert_eq!(argv[3], "--ignore-working-copy", "a read never snapshots");
         assert_eq!(
             argv[4..],
@@ -4779,7 +4885,7 @@ mod tests {
         let (mut app, _rx) = log_app(Mode::Faff);
         app.log.selected = Some("m".into());
         press(&mut app, KeyCode::Char('v'));
-        let argv = app.exec.take().expect("a pager to run");
+        let argv = app.diff.take().expect("a pager to run");
         assert_eq!(argv[3], "--ignore-working-copy", "a read never snapshots");
         assert_eq!(
             argv[4..],
@@ -4793,8 +4899,42 @@ mod tests {
         );
         app.log.selected = Some("wc".into());
         press(&mut app, KeyCode::Char('v'));
-        let argv = app.exec.take().unwrap();
+        let argv = app.diff.take().unwrap();
         assert_eq!(argv[6], "coalesce((fork_point(wc | trunk())) ~ wc, wc-)");
+    }
+
+    #[test]
+    fn v_uses_the_configured_diff_tool_in_the_background_only_when_it_is_a_gui() {
+        let argv = || vec!["jj".to_string(), "diff".to_string()];
+        let with_tool = ["jj", "diff", "--tool", "zed"].map(str::to_string).to_vec();
+        assert_eq!(
+            diff_launch(argv(), &DiffTool::default()),
+            DiffLaunch::Suspended(argv()),
+            "no tool: the pager"
+        );
+        assert_eq!(
+            diff_launch(
+                argv(),
+                &DiffTool {
+                    name: None,
+                    gui: true
+                }
+            ),
+            DiffLaunch::Suspended(argv()),
+            "a GUI flag without a tool changes nothing"
+        );
+        let zed = |gui| DiffTool {
+            name: Some("zed".into()),
+            gui,
+        };
+        assert_eq!(
+            diff_launch(argv(), &zed(false)),
+            DiffLaunch::Suspended(with_tool.clone())
+        );
+        assert_eq!(
+            diff_launch(argv(), &zed(true)),
+            DiffLaunch::Background(with_tool)
+        );
     }
 
     #[test]
